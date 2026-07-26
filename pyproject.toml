@@ -1,0 +1,11 @@
+[tool.uv.workspace]
+members = ["python"]
+
+[dependency-groups]
+dev = [
+  "pytest>=8.4",
+  "ruff>=0.12",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["foundation_tests", "python/tests"]

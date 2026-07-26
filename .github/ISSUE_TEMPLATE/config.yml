@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/rogerchucker/palonexus-sdk/security/advisories/new
+    about: Read SECURITY.md and report vulnerabilities privately.
+  - name: Support question
+    url: https://github.com/rogerchucker/palonexus-sdk/discussions
+    about: Ask usage questions after reviewing SUPPORT.md.

@@ -1,0 +1,17 @@
+# Default ownership
+* @rogerchucker
+
+# Normative protocol and conformance artifacts
+/protocol/ @rogerchucker
+/conformance/ @rogerchucker
+
+# Release automation and package metadata
+/.github/workflows/ @rogerchucker
+/packaging/ @rogerchucker
+/pyproject.toml @rogerchucker
+/python/pyproject.toml @rogerchucker
+
+# Security-sensitive enforcement and host integrations
+/guard/ @rogerchucker
+/plugins/ @rogerchucker
+/SECURITY.md @rogerchucker

@@ -1,0 +1,44 @@
+[build-system]
+requires = ["hatchling>=1.27", "hatch-vcs>=0.4"]
+build-backend = "hatchling.build"
+
+[project]
+name = "palonexus"
+dynamic = ["version"]
+description = "Python SDK for the PaloNexus agent control plane"
+readme = "../README.md"
+requires-python = ">=3.12"
+license = "MIT"
+authors = [
+  { name = "PaloNexus maintainers" },
+]
+classifiers = [
+  "Development Status :: 2 - Pre-Alpha",
+  "License :: OSI Approved :: MIT License",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3.12",
+  "Programming Language :: Python :: 3.13",
+]
+
+[project.urls]
+Homepage = "https://github.com/rogerchucker/palonexus-sdk"
+Repository = "https://github.com/rogerchucker/palonexus-sdk"
+Issues = "https://github.com/rogerchucker/palonexus-sdk/issues"
+Changelog = "https://github.com/rogerchucker/palonexus-sdk/blob/main/CHANGELOG.md"
+
+[tool.hatch.version]
+source = "vcs"
+
+[tool.hatch.version.raw-options]
+search_parent_directories = true
+fallback_version = "0.0.0"
+
+[tool.hatch.build.hooks.vcs]
+version-file = "src/palonexus/_version.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/palonexus"]
+
+# The distribution metadata is established before package sources are added.
+[tool.uv]
+package = false

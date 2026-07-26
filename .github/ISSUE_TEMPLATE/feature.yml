@@ -1,0 +1,45 @@
+name: Feature request
+description: Propose an SDK, guard, plugin, or protocol improvement
+title: "[Feature]: "
+labels:
+  - enhancement
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For protocol changes, include compatibility and migration details. Report vulnerabilities through SECURITY.md.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What user problem or integration need should be addressed?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: Describe the desired behavior and alternatives considered.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - Python SDK
+        - Guard
+        - Protocol
+        - Claude Code plugin
+        - Codex plugin
+        - Documentation
+        - Other
+    validations:
+      required: true
+  - type: textarea
+    id: compatibility
+    attributes:
+      label: Compatibility and security
+      description: Describe migration, protocol, privacy, and security implications.
+    validations:
+      required: true
