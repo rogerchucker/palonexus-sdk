@@ -248,7 +248,7 @@ evidence.
 
 - [ ] **Step 2: Run and observe incomplete-matrix failure**
 
-Run: `uv run pytest foundation_tests/test_gate0_complete.py -q`  
+Run: `uv run pytest foundation_tests/test_gate0_complete.py -q`
 Expected: FAIL until both host matrices and sentinel evidence are complete.
 
 - [ ] **Step 3: Implement the verifier**

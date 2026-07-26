@@ -199,7 +199,7 @@ gh repo create rogerchucker/palonexus-sdk \
 - [ ] Configure `pypi` and `github-release` environments.
 - [ ] Set default workflow permission read-only and allow only pinned actions.
 - [ ] Verify all settings through `gh api`; save redacted evidence.
-- [ ] Run: `uv run pytest foundation_tests/test_github_settings_evidence.py -q`  
+- [ ] Run: `uv run pytest foundation_tests/test_github_settings_evidence.py -q`
       Expected: PASS only when evidence proves public visibility, default branch,
       security features, rules, environments, and read-only workflow defaults.
 
@@ -220,7 +220,7 @@ gh repo create rogerchucker/palonexus-sdk \
 - [ ] Run the public README quickstart without the source checkout.
 - [ ] Record public URLs and evidence in `docs/evidence/0.2.0a1.md`.
 - [ ] Commit any evidence update through the normal PR path.
-- [ ] Run: `uv run python scripts/verify_public_release.py v0.2.0a1`  
+- [ ] Run: `uv run python scripts/verify_public_release.py v0.2.0a1`
       Expected: PASS after downloading and exercising every public artifact.
 
 ### Task 12: Completion audit

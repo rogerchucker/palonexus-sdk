@@ -104,12 +104,12 @@ class PaloNexusError(Exception):
       unavailable-backend failure, no plaintext default, and an
       `EphemeralKeyStore` constructor that requires explicit
       `testing_only=True`.
-- [ ] Run: `uv run pytest python/tests/test_keystore.py -q`  
+- [ ] Run: `uv run pytest python/tests/test_keystore.py -q`
       Expected: FAIL because `palonexus.keystore` does not exist.
 - [ ] Implement the protocol and test-only in-memory backend. Production SDK
       construction without an injected supported store fails closed rather
       than generating or writing a key.
-- [ ] Run: `uv run pytest python/tests/test_keystore.py python/tests/test_credentials_redaction_retry.py -q`  
+- [ ] Run: `uv run pytest python/tests/test_keystore.py python/tests/test_credentials_redaction_retry.py -q`
       Expected: PASS.
 - [ ] Commit: `feat(python): define secure key store boundary`.
 
