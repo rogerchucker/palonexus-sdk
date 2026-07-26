@@ -1,0 +1,15 @@
+destination,source_repository,source_commit,source_path,owner,contributors_reviewed,migration_method,result_license,reviewer
+docs/legal/RELICENSING.md,rogerchucker/palonexus-sdk,WORKTREE,docs/legal/RELICENSING.md,PaloNexus,yes,new,MIT,rogerchucker
+docs/legal/PROVENANCE.csv,rogerchucker/palonexus-sdk,WORKTREE,docs/legal/PROVENANCE.csv,PaloNexus,yes,new,MIT,rogerchucker
+docs/legal/THIRD_PARTY.md,rogerchucker/palonexus-sdk,WORKTREE,docs/legal/THIRD_PARTY.md,PaloNexus,yes,new,MIT,rogerchucker
+scripts/verify_legal.py,rogerchucker/palonexus-sdk,WORKTREE,scripts/verify_legal.py,PaloNexus,yes,new,MIT,rogerchucker
+foundation_tests/test_legal.py,rogerchucker/palonexus-sdk,WORKTREE,foundation_tests/test_legal.py,PaloNexus,yes,new,MIT,rogerchucker
+python/pyproject.toml,rogerchucker/palonexus-sdk,WORKTREE,python/pyproject.toml,PaloNexus,yes,new,MIT,rogerchucker
+LICENSE,rogerchucker/palonexus-sdk,WORKTREE,LICENSE,PaloNexus,yes,new,MIT,rogerchucker
+README.md,rogerchucker/palonexus-sdk,WORKTREE,README.md,PaloNexus,yes,new,MIT,rogerchucker
+docs/legal/OWNER_AUTHORIZATION.md,rogerchucker/palonexus-sdk,WORKTREE,docs/legal/OWNER_AUTHORIZATION.md,PaloNexus,yes,new,MIT,rogerchucker
+docs/legal/SOURCE_TREE.txt,rogerchucker/palonexus-sdk,GENERATED,scripts/verify_legal.py,PaloNexus,yes,generated,MIT,rogerchucker
+foundation_tests/test_repository_metadata.py,rogerchucker/palonexus-sdk,WORKTREE,foundation_tests/test_repository_metadata.py,PaloNexus,yes,new,MIT,rogerchucker
+pyproject.toml,rogerchucker/palonexus-sdk,WORKTREE,pyproject.toml,PaloNexus,yes,new,MIT,rogerchucker
+ruff.toml,rogerchucker/palonexus-sdk,WORKTREE,ruff.toml,PaloNexus,yes,new,MIT,rogerchucker
+uv.lock,rogerchucker/palonexus-sdk,GENERATED,pyproject.toml,PaloNexus,yes,generated,MIT,rogerchucker
