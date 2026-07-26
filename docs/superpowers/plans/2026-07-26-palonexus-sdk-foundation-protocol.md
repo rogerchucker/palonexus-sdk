@@ -138,6 +138,7 @@ git commit -m "docs: record sdk relicensing and provenance policy"
 - Create: `plugins/claude-code/tests/fixtures/host-version.json`
 - Create: `plugins/claude-code/tests/fixtures/pretooluse/`
 - Create: `plugins/claude-code/tests/fixtures/expected-capabilities.json`
+- Create: `plugins/claude-code/tests/fixtures/official-contract.json`
 - Create: `scripts/capture_claude_fixtures.py`
 - Test: `foundation_tests/test_claude_gate0.py`
 - Create: `docs/compatibility.md`
@@ -145,8 +146,9 @@ git commit -m "docs: record sdk relicensing and provenance policy"
 - [ ] **Step 1: Write a failing fixture completeness test**
 
 The test requires versioned payloads for Bash, Read, Edit, Write, WebFetch,
-WebSearch, and MCP plus evidence that denial prevents a sentinel command or file
-mutation.
+WebSearch, and MCP plus evidence that denial, guard failure, and a real
+`approval_required` guard result rendered as denial prevent a sentinel command
+or file mutation.
 
 - [ ] **Step 2: Run against an empty fixture directory**
 
@@ -159,6 +161,13 @@ Use a disposable home and repository. Record installed version `2.1.219` as the
 first tested candidate without claiming it is the eventual minimum. Never record
 tokens, prompts, user paths, or repository secrets.
 
+Fetch the current official hooks/plugin contract, store its URL, retrieval
+timestamp, content digest, documented minimum when present, and relevant
+blocking semantics in `official-contract.json`. Determine the minimum supported
+version through release/changelog evidence plus executable fixture tests; do
+not infer it from the installed candidate alone. Test both that minimum and the
+latest available stable host before Gate 0 completes.
+
 - [ ] **Step 4: Prove no-op allow and blocking denial**
 
 The fixture harness must distinguish:
@@ -166,6 +175,8 @@ The fixture harness must distinguish:
 - Hook emits `{}`: host continues native permission behavior.
 - Hook emits deny: sentinel does not execute.
 - Hook exits `2`: sentinel does not execute.
+- Fake guard returns `approval_required`: hook renders denial containing the
+  approval ID, and the sentinel does not execute.
 
 - [ ] **Step 5: Update compatibility evidence and commit**
 
@@ -181,6 +192,7 @@ git commit -m "test: record Claude Code blocking hook contract"
 - Create: `plugins/codex/tests/fixtures/host-version.json`
 - Create: `plugins/codex/tests/fixtures/pretooluse/`
 - Create: `plugins/codex/tests/fixtures/expected-capabilities.json`
+- Create: `plugins/codex/tests/fixtures/official-contract.json`
 - Create: `scripts/capture_codex_fixtures.py`
 - Test: `foundation_tests/test_codex_gate0.py`
 - Modify: `docs/compatibility.md`
@@ -188,7 +200,9 @@ git commit -m "test: record Claude Code blocking hook contract"
 - [ ] **Step 1: Write a failing fixture completeness test**
 
 Require recorded payloads for shell/unified execution, apply-patch/file change,
-MCP, and every additional local function tool claimed by the plugin.
+MCP, and every additional local function tool claimed by the plugin. Require a
+real `approval_required` fake-guard result to render as host denial and prevent
+the sentinel effect.
 
 - [ ] **Step 2: Run against missing fixtures**
 
@@ -200,10 +214,15 @@ Expected: FAIL.
 Use a disposable home with `codex-cli 0.145.0`. Record hosted or specialized
 tools absent from `PreToolUse` as unsupported rather than fabricating fixtures.
 
+Fetch and digest the current official Codex hooks/plugin contract. Establish
+the exact minimum through official version evidence and executable tests, then
+test both minimum and latest stable Codex. Record unsupported hook families.
+
 - [ ] **Step 4: Prove denial and failure block**
 
 Run sentinel shell and file-change cases. Capture hook response and verify the
-sentinel effect does not occur for deny or exit `2`.
+sentinel effect does not occur for deny, exit `2`, or an
+`approval_required` result rendered as denial.
 
 - [ ] **Step 5: Commit**
 
@@ -211,6 +230,47 @@ sentinel effect does not occur for deny or exit `2`.
 uv run pytest foundation_tests/test_codex_gate0.py -q
 git add plugins/codex/tests/fixtures scripts/capture_codex_fixtures.py docs/compatibility.md foundation_tests/test_codex_gate0.py
 git commit -m "test: record Codex blocking hook contract"
+```
+
+### Task 4B: Machine-enforced Gate 0 completion
+
+**Files:**
+- Create: `scripts/verify_host_fixtures.py`
+- Test: `foundation_tests/test_gate0_complete.py`
+- Modify: `docs/compatibility.md`
+
+- [ ] **Step 1: Write the failing completion gate**
+
+Require nonempty exact minimum and latest-tested versions for both hosts,
+official-contract URL/digest/timestamp, every claimed payload fixture, no-op
+allow evidence, deny evidence, exit-2 evidence, and approval-as-deny sentinel
+evidence.
+
+- [ ] **Step 2: Run and observe incomplete-matrix failure**
+
+Run: `uv run pytest foundation_tests/test_gate0_complete.py -q`  
+Expected: FAIL until both host matrices and sentinel evidence are complete.
+
+- [ ] **Step 3: Implement the verifier**
+
+`scripts/verify_host_fixtures.py` validates fixture digests, version ordering,
+required scenarios, and compatibility cells. It exits nonzero if either host
+minimum/latest job was skipped or unsupported.
+
+- [ ] **Step 4: Run the non-skippable gate before Task 5**
+
+```bash
+uv run pytest foundation_tests/test_claude_gate0.py foundation_tests/test_codex_gate0.py foundation_tests/test_gate0_complete.py -q
+uv run python scripts/verify_host_fixtures.py
+```
+
+Expected: all tests PASS and both exact compatibility rows print.
+
+- [ ] **Step 5: Commit**
+
+```bash
+git add scripts/verify_host_fixtures.py foundation_tests/test_gate0_complete.py docs/compatibility.md plugins/*/tests/fixtures
+git commit -m "test: enforce complete coding-host feasibility gate"
 ```
 
 ### Task 5: Action and decision schemas
@@ -439,4 +499,3 @@ git add .github .gitleaks.toml scripts foundation_tests
 git commit -m "ci: gate protocol and repository foundation"
 git tag protocol-v1-freeze
 ```
-

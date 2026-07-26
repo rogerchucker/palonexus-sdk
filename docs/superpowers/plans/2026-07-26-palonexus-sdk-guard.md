@@ -10,6 +10,27 @@
 
 ---
 
+## Mandatory red/green command matrix
+
+Each red command must fail for the named missing behavior before implementation.
+Each green command must pass along with the affected package tests.
+
+| Task | Red command and expected result | Green command and expected result |
+|---|---|---|
+| 1 | `go test ./guard/internal/cli -run Test -count=1` → FAIL missing CLI | same → PASS |
+| 2 | `go test ./guard/internal/config ./guard/internal/routing -count=1` → FAIL missing config/routing | same → PASS |
+| 3 | `go test ./guard/internal/normalize ./guard/internal/redact -count=1` → FAIL missing normalization | same plus `uv run pytest protocol/tests/test_canonicalization.py -q` → PASS |
+| 4 | `go test ./guard/internal/keystore ./guard/internal/state -count=1` → FAIL missing secure stores | same → PASS |
+| 5 | `go test ./guard/internal/auth -count=1` → FAIL missing verified OIDC | same → PASS |
+| 6 | `go test ./guard/internal/decision -count=1` → FAIL missing decision client | same plus protocol decision tests → PASS |
+| 7 | `go test ./guard/internal/socket -count=1` → FAIL missing socket hardening | `go test -race ./guard/internal/socket -count=1` → PASS |
+| 8 | `go test ./guard/internal/guard -count=1` → FAIL missing pipeline | same plus decision/normalize tests → PASS |
+| 9 | `go test ./guard/internal/daemon -count=1` → FAIL missing lifecycle | same plus socket tests → PASS |
+| 10 | `go test ./guard/internal/reconcile -count=1` → FAIL missing queue | same plus protocol reconciliation tests → PASS |
+| 11 | `go test ./guard/internal/plugin -count=1` → FAIL missing installer | same plus CLI tests → PASS |
+| 12 | `go test ./guard/tests -run TestLocalDemo -count=1` → FAIL missing demo | same → PASS |
+| 13 | `uv run pytest foundation_tests/test_guard_release_matrix.py -q` → FAIL missing matrix/workflow | same then build and artifact verifier → PASS |
+
 ### Task 1: CLI skeleton and version
 
 **Files:**
@@ -103,8 +124,15 @@
 
 - [ ] Write failing tests for user-only runtime directory/socket, peer UID,
       framing, size limit, unknown major, malformed JSON, concurrent clients,
-      shutdown, and crash cleanup.
-- [ ] Implement one-request/one-response NDJSON framing.
+      shutdown, crash cleanup, a symlink at the socket path, a symlinked runtime
+      directory, a pre-existing regular/FIFO/device inode, attacker replacement
+      between validation and bind, and runtime-directory swap during cleanup.
+- [ ] Implement one-request/one-response NDJSON framing. Open/validate the
+      runtime directory through a directory file descriptor, reject symlinks
+      and non-directory ownership/mode mismatches, use no-follow semantics where
+      supported, bind only after exclusive path validation, verify the bound
+      inode before serving/removal, and never unlink a replacement inode during
+      cleanup.
 - [ ] Ensure error paths return deny-compatible structured results.
 - [ ] Commit.
 
@@ -185,7 +213,11 @@
 - [ ] Write failing tests for declared Go 1.25 toolchain, required runtime
       platforms, archive names, MIT license, version output, and checksums.
 - [ ] Run format, vet, staticcheck, race, and fuzz smoke.
-- [ ] Build Linux/macOS amd64/arm64; label cross-built-only combinations.
+- [ ] Add non-skippable runtime workflow jobs:
+      `ubuntu-24.04` amd64 and both supported macOS 14/15 arm64 runner images.
+      Each job runs `go test -race ./guard/...` and launches the built binary.
+- [ ] Build Linux/macOS amd64/arm64. Only Linux arm64 and macOS amd64 may be
+      labeled cross-built-only unless native runners are added; the required
+      Ubuntu amd64 and macOS arm64 runtime cells may not be skipped.
 - [ ] Verify archives in clean temporary directories.
 - [ ] Commit.
-

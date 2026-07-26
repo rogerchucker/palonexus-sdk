@@ -10,6 +10,30 @@
 
 ---
 
+## Mandatory red/green command matrix
+
+Every task runs its red command before implementation and records the named
+missing-module or missing-behavior failure. After implementation it runs the
+green command plus the affected shared suite. A passing red command is invalid.
+
+| Task | Red command and expected result | Green command and expected result |
+|---|---|---|
+| 1 | `uv run pytest python/tests/test_models_errors.py -q` → FAIL missing public models | same command plus `uv run mypy python/src` → PASS |
+| 2 | `uv run pytest python/tests/test_context_protocol.py -q` → FAIL missing context/builder | same plus `uv run pytest protocol/tests -q` → PASS |
+| 3 | `uv run pytest python/tests/test_credentials_redaction_retry.py -q` → FAIL missing policies | same plus `uv run pytest python/tests/test_context_protocol.py -q` → PASS |
+| 3B | `uv run pytest python/tests/test_keystore.py -q` → FAIL missing `KeyStore` | same plus credentials tests → PASS |
+| 4 | `uv run pytest python/tests/test_http_transport.py -q` → FAIL missing transport | same plus protocol tests → PASS |
+| 5 | `uv run pytest python/tests/test_client_parity.py -q` → FAIL missing clients | same plus model/transport tests → PASS |
+| 6 | `uv run pytest python/tests/test_approval_resume.py -q` → FAIL missing approval/resume | same plus client parity/protocol approval tests → PASS |
+| 7 | `uv run pytest python/tests/identity/test_did_vc.py python/tests/identity/test_delegation.py -q` → FAIL missing identity modules | same commands → PASS |
+| 8 | `uv run pytest python/tests/identity/test_oidc.py -q` → FAIL missing OIDC verifier | same plus keystore tests → PASS |
+| 9 | `uv run pytest python/tests/test_testing_tools.py -q` → FAIL missing testing package | same plus client parity → PASS |
+| 10 | `uv run pytest python/tests/integrations/test_langchain.py -q` → FAIL missing adapter | same plus client parity → PASS |
+| 11 | `uv run pytest python/tests/integrations/test_langgraph.py -q` → FAIL missing adapter | same plus approval/resume → PASS |
+| 12 | `uv run pytest python/tests/integrations/test_deepagents.py -q` → FAIL missing adapter | same plus context tests → PASS |
+| 13 | `uv run pytest python/tests/test_examples.py -q` → FAIL missing examples | same plus all integration tests → PASS |
+| 14 | `uv run pytest python/tests/test_package_metadata.py -q` → FAIL missing artifact policy | same then `uv build --package palonexus` and artifact verifier → PASS |
+
 ### Task 1: Public models, outcomes, and errors
 
 **Files:**
@@ -69,6 +93,25 @@ class PaloNexusError(Exception):
 - [ ] Implement `CredentialProvider`, `Redactor`, and `RetryPolicy`.
 - [ ] Ensure write/destructive/external retries require authorization idempotency.
 - [ ] Run tests and commit.
+
+### Task 3B: Production key-store contract
+
+**Files:**
+- Create: `python/src/palonexus/keystore.py`
+- Test: `python/tests/test_keystore.py`
+
+- [ ] Write failing tests for a `KeyStore` protocol with load/store/delete,
+      unavailable-backend failure, no plaintext default, and an
+      `EphemeralKeyStore` constructor that requires explicit
+      `testing_only=True`.
+- [ ] Run: `uv run pytest python/tests/test_keystore.py -q`  
+      Expected: FAIL because `palonexus.keystore` does not exist.
+- [ ] Implement the protocol and test-only in-memory backend. Production SDK
+      construction without an injected supported store fails closed rather
+      than generating or writing a key.
+- [ ] Run: `uv run pytest python/tests/test_keystore.py python/tests/test_credentials_redaction_retry.py -q`  
+      Expected: PASS.
+- [ ] Commit: `feat(python): define secure key store boundary`.
 
 ### Task 4: HTTP sync and async transports
 
@@ -232,4 +275,3 @@ class PaloNexusError(Exception):
 - [ ] Install each artifact in a fresh `uv venv` outside the checkout and run
       imports/examples.
 - [ ] Commit.
-

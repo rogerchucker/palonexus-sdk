@@ -10,6 +10,22 @@
 
 ---
 
+## Mandatory red/green command matrix
+
+| Task | Red command and expected result | Green command and expected result |
+|---|---|---|
+| 1 | `go test ./guard/pkg/hookclient -count=1` → FAIL missing hook client | same → PASS |
+| 2 | `go test ./plugins/claude-code/internal/normalize -count=1` → FAIL missing normalizer | same plus protocol canonicalization tests → PASS |
+| 3 | `go test ./plugins/claude-code/internal/render -count=1` → FAIL missing renderer | same → PASS |
+| 4 | `uv run pytest plugins/claude-code/tests/test_manifest.py -q` → FAIL missing manifest | same → PASS |
+| 5 | `uv run pytest plugins/claude-code/tests/test_host_integration.py -q` → FAIL missing integration | same with minimum/latest host jobs → PASS |
+| 6 | `go test ./plugins/codex/internal/normalize -count=1` → FAIL missing normalizer | same plus protocol canonicalization tests → PASS |
+| 7 | `go test ./plugins/codex/internal/render -count=1` → FAIL missing renderer | same → PASS |
+| 8 | `uv run pytest plugins/codex/tests/test_manifest.py -q` → FAIL missing manifest | same → PASS |
+| 9 | `uv run pytest plugins/codex/tests/test_host_integration.py -q` → FAIL missing integration | same with minimum/latest host jobs → PASS |
+| 10 | `uv run pytest conformance/tests/test_plugin_parity.py -q` → FAIL divergent/missing adapters | same plus both Go adapter suites → PASS |
+| 11 | `uv run pytest foundation_tests/test_plugin_bundles.py -q` → FAIL missing bundles | same then bundle verifier → PASS |
+
 ### Task 1: Shared hook client and renderer contract
 
 **Files:**
@@ -72,8 +88,10 @@
 - [ ] Write subprocess tests using a disposable home for install, allow/native
       permission preservation, deny sentinel, approval sentinel, timeout,
       malformed input, outage, upgrade, and uninstall.
-- [ ] Run only when compatible Claude CLI is present; scheduled CI treats
-      absence separately, but release CI requires the exact tested host.
+- [ ] Add required workflow jobs for the exact Gate 0 minimum and current latest
+      Claude Code versions. These jobs install the named version, run the exact
+      command above, assert the discovered version, and fail rather than skip
+      when the CLI or a claimed hook family is unavailable.
 - [ ] Commit fixtures and tests.
 
 ### Task 6: Codex normalizer
@@ -123,6 +141,9 @@
       deny sentinel, approval sentinel, timeout, malformed input, unavailable
       guard, upgrade, and uninstall.
 - [ ] Prove no `permissionDecision: "ask"` path can continue execution.
+- [ ] Add required workflow jobs for the exact Gate 0 minimum and current latest
+      Codex versions. Assert installed version and fail rather than skip if the
+      CLI or a claimed hook path is unavailable.
 - [ ] Commit.
 
 ### Task 10: Shared plugin conformance
@@ -150,5 +171,7 @@
       version, checksum, no secrets, and clean install from archive.
 - [ ] Build separate Claude and Codex bundles from the same source commit.
 - [ ] Verify each bundle in disposable host configuration.
+- [ ] Make all four minimum/latest host integration jobs required release
+      checks; scheduled drift jobs may add newer versions but cannot replace
+      these release cells.
 - [ ] Commit.
-

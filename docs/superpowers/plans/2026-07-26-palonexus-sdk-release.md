@@ -10,6 +10,23 @@
 
 ---
 
+## Mandatory red/green command matrix
+
+| Task | Red command and expected result | Green command and expected result |
+|---|---|---|
+| 1 | `uv run pytest conformance/tests/test_cross_adapter.py -q` → FAIL missing artifact adapters | same with `PALONEXUS_RELEASE_MANIFEST` → PASS |
+| 2 | `uv run pytest conformance/tests/test_local_e2e.py -q` → FAIL missing mock flow | same → PASS |
+| 3 | `uv run pytest conformance/tests/test_offline_examples.py -q` → FAIL missing installed examples | same against release manifest → PASS |
+| 4 | `uv run pytest conformance/tests/test_public_hygiene.py -q` → FAIL on seeded forbidden fixture | same plus archive scan → PASS |
+| 5 | `uv run pytest foundation_tests/test_release_manifest.py -q` → FAIL missing SBOM/signature/provenance fields | same plus manifest verifier → PASS |
+| 6 | `uv run pytest foundation_tests/test_python_release_workflow.py -q` → FAIL missing workflow policy | same → PASS |
+| 7 | `uv run pytest foundation_tests/test_asset_release_workflow.py -q` → FAIL missing asset workflow | same → PASS |
+| 8 | `uv run pytest foundation_tests/test_docs.py -q` → FAIL missing docs/snippets | same → PASS |
+| 9 | `scripts/verify` → FAIL on first incomplete required component | same on clean release worktree → PASS |
+| 10 | `uv run pytest foundation_tests/test_github_settings_evidence.py -q` → FAIL before public settings evidence | same after redacted API evidence → PASS |
+| 11 | `uv run python scripts/verify_public_release.py v0.2.0a1` → FAIL before public artifacts | same after publication → PASS |
+| 12 | `uv run pytest foundation_tests/test_completion_audit.py -q` → FAIL with unlinked criteria | same after complete evidence map → PASS |
+
 ### Task 1: Cross-adapter conformance runner
 
 **Files:**
@@ -22,9 +39,17 @@
 
 - [ ] Write failing tests that require every adapter to process all applicable
       action/decision/error/approval/reconciliation vectors.
-- [ ] Implement subprocess adapters over built or source commands.
+- [ ] Build a release-candidate manifest first. Implement adapters that consume
+      only:
+      - a fresh `uv` environment containing the exact wheel path from the manifest,
+      - the extracted guard binary archive from the manifest,
+      - the extracted Claude plugin bundle from the manifest,
+      - the extracted Codex plugin bundle from the manifest.
+      Source commands, editable installs, checkout imports, and fallback to
+      `go run` are errors.
 - [ ] Compare canonical requests, outcomes, reason codes, IDs, and redaction.
-- [ ] Fail on skipped required adapters.
+- [ ] Record and assert each artifact SHA-256 and source commit. Fail on skipped
+      adapters, hash mismatch, source-tree import, or missing promoted artifact.
 - [ ] Commit.
 
 ### Task 2: Local end-to-end decision and approval flow
@@ -137,6 +162,8 @@
 - Create: `docs/evidence/local-release-candidate.md`
 
 - [ ] Run every master verification command on a clean integration worktree.
+- [ ] Build the immutable release-candidate manifest before conformance; export
+      its path as `PALONEXUS_RELEASE_MANIFEST` for Tasks 1–3.
 - [ ] Run independent spec-compliance and security/code-quality reviews.
 - [ ] Record commands, versions, commit, counts, artifacts, and limitations.
 - [ ] Fix all findings and rerun from the beginning.
@@ -147,6 +174,10 @@
 **External state:**
 - Create: `https://github.com/rogerchucker/palonexus-sdk`
 - Configure: repository features, security, ruleset, environments, topics
+**Files:**
+- Create: `scripts/capture_github_settings.py`
+- Create: `foundation_tests/test_github_settings_evidence.py`
+- Create: `docs/evidence/github-settings.json`
 
 - [ ] Confirm `gh auth status` uses `rogerchucker` with repository scope.
 - [ ] Reconfirm the repository name is not occupied.
@@ -168,6 +199,9 @@ gh repo create rogerchucker/palonexus-sdk \
 - [ ] Configure `pypi` and `github-release` environments.
 - [ ] Set default workflow permission read-only and allow only pinned actions.
 - [ ] Verify all settings through `gh api`; save redacted evidence.
+- [ ] Run: `uv run pytest foundation_tests/test_github_settings_evidence.py -q`  
+      Expected: PASS only when evidence proves public visibility, default branch,
+      security features, rules, environments, and read-only workflow defaults.
 
 ### Task 11: Publish and verify prerelease
 
@@ -175,6 +209,8 @@ gh repo create rogerchucker/palonexus-sdk \
 - Tag: `v0.2.0a1`
 - GitHub prerelease
 - PyPI prerelease `palonexus==0.2.0a1`
+**Files:**
+- Create: `scripts/verify_public_release.py`
 
 - [ ] Sign and push the tag from the exact audited commit.
 - [ ] Wait for release workflows and inspect every check.
@@ -184,15 +220,17 @@ gh repo create rogerchucker/palonexus-sdk \
 - [ ] Run the public README quickstart without the source checkout.
 - [ ] Record public URLs and evidence in `docs/evidence/0.2.0a1.md`.
 - [ ] Commit any evidence update through the normal PR path.
+- [ ] Run: `uv run python scripts/verify_public_release.py v0.2.0a1`  
+      Expected: PASS after downloading and exercising every public artifact.
 
 ### Task 12: Completion audit
 
 **Files:**
 - Create: `docs/evidence/completion-audit.md`
+- Create: `foundation_tests/test_completion_audit.py`
 
 - [ ] Enumerate every design success criterion and plan checkbox.
 - [ ] Link each to authoritative source, test, CI run, GitHub setting, public
       artifact, or runtime output.
 - [ ] Treat missing or indirect evidence as incomplete.
 - [ ] Confirm no required work remains before marking the goal complete.
-
