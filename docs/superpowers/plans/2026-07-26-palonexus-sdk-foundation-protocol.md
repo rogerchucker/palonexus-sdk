@@ -238,6 +238,7 @@ git commit -m "test: record Codex blocking hook contract"
 - Create: `scripts/verify_host_fixtures.py`
 - Test: `foundation_tests/test_gate0_complete.py`
 - Modify: `docs/compatibility.md`
+- Create: `docs/compatibility.json`
 
 - [ ] **Step 1: Write the failing completion gate**
 

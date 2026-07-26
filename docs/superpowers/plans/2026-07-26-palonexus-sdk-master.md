@@ -141,8 +141,11 @@ git diff --exit-code
 ### Phase 5: Conformance and public release
 
 - [ ] Execute every task in the release plan.
+- [ ] Build and hash the immutable release candidate before any conformance run.
 - [ ] Pass shared vectors against Python, guard, Claude, and Codex.
-- [ ] Run all offline examples from built artifacts.
+- [ ] Run all conformance and offline examples only from that release candidate.
+- [ ] Enrich the verified manifest with SBOMs, signatures, and attestations
+      without rebuilding its artifacts.
 - [ ] Scan source history and archives for secrets and private fixtures.
 - [ ] Create `rogerchucker/palonexus-sdk` as public.
 - [ ] Push reviewed `main`.
@@ -186,4 +189,3 @@ The script exits nonzero on a skipped required component.
 - [ ] Clean machines install and run the public Python and plugin artifacts.
 - [ ] README limitations match tested hook coverage.
 - [ ] No control-plane implementation, private endpoint, partner fixture, token, or proprietary-only file is present.
-

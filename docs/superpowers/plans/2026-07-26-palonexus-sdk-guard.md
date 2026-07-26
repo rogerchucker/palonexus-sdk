@@ -17,19 +17,19 @@ Each green command must pass along with the affected package tests.
 
 | Task | Red command and expected result | Green command and expected result |
 |---|---|---|
-| 1 | `go test ./guard/internal/cli -run Test -count=1` → FAIL missing CLI | same → PASS |
-| 2 | `go test ./guard/internal/config ./guard/internal/routing -count=1` → FAIL missing config/routing | same → PASS |
-| 3 | `go test ./guard/internal/normalize ./guard/internal/redact -count=1` → FAIL missing normalization | same plus `uv run pytest protocol/tests/test_canonicalization.py -q` → PASS |
-| 4 | `go test ./guard/internal/keystore ./guard/internal/state -count=1` → FAIL missing secure stores | same → PASS |
-| 5 | `go test ./guard/internal/auth -count=1` → FAIL missing verified OIDC | same → PASS |
-| 6 | `go test ./guard/internal/decision -count=1` → FAIL missing decision client | same plus protocol decision tests → PASS |
-| 7 | `go test ./guard/internal/socket -count=1` → FAIL missing socket hardening | `go test -race ./guard/internal/socket -count=1` → PASS |
-| 8 | `go test ./guard/internal/guard -count=1` → FAIL missing pipeline | same plus decision/normalize tests → PASS |
-| 9 | `go test ./guard/internal/daemon -count=1` → FAIL missing lifecycle | same plus socket tests → PASS |
-| 10 | `go test ./guard/internal/reconcile -count=1` → FAIL missing queue | same plus protocol reconciliation tests → PASS |
-| 11 | `go test ./guard/internal/plugin -count=1` → FAIL missing installer | same plus CLI tests → PASS |
-| 12 | `go test ./guard/tests -run TestLocalDemo -count=1` → FAIL missing demo | same → PASS |
-| 13 | `uv run pytest foundation_tests/test_guard_release_matrix.py -q` → FAIL missing matrix/workflow | same then build and artifact verifier → PASS |
+| 1 | `go test ./guard/internal/cli -run Test -count=1` exits 1: missing CLI | `go test ./guard/internal/cli -run Test -count=1` exits 0 |
+| 2 | `go test ./guard/internal/config ./guard/internal/routing -count=1` exits 1: missing config/routing | `go test ./guard/internal/config ./guard/internal/routing -count=1` exits 0 |
+| 3 | `go test ./guard/internal/normalize ./guard/internal/redact -count=1` exits 1: missing normalization | `go test ./guard/internal/normalize ./guard/internal/redact -count=1 && uv run pytest protocol/tests/test_canonicalization.py -q` exits 0 |
+| 4 | `go test ./guard/internal/keystore ./guard/internal/state -count=1` exits 1: missing secure stores | `go test ./guard/internal/keystore ./guard/internal/state -count=1` exits 0 |
+| 5 | `go test ./guard/internal/auth -count=1` exits 1: missing verified OIDC | `go test ./guard/internal/auth -count=1` exits 0 |
+| 6 | `go test ./guard/internal/decision -count=1` exits 1: missing decision client | `go test ./guard/internal/decision -count=1 && uv run pytest protocol/tests/test_action_decision_schema.py -q` exits 0 |
+| 7 | `go test ./guard/internal/socket -count=1` exits 1: missing socket hardening | `go test -race ./guard/internal/socket -count=1` exits 0 |
+| 8 | `go test ./guard/internal/guard -count=1` exits 1: missing pipeline | `go test ./guard/internal/guard ./guard/internal/decision ./guard/internal/normalize -count=1` exits 0 |
+| 9 | `go test ./guard/internal/daemon -count=1` exits 1: missing lifecycle | `go test ./guard/internal/daemon ./guard/internal/socket -count=1` exits 0 |
+| 10 | `go test ./guard/internal/reconcile -count=1` exits 1: missing queue | `go test ./guard/internal/reconcile -count=1 && uv run pytest protocol/tests/test_reconciliation.py -q` exits 0 |
+| 11 | `go test ./guard/internal/plugin -count=1` exits 1: missing installer | `go test ./guard/internal/plugin ./guard/internal/cli -count=1` exits 0 |
+| 12 | `go test ./guard/tests -run TestLocalDemo -count=1` exits 1: missing demo | `go test ./guard/tests -run TestLocalDemo -count=1` exits 0 |
+| 13 | `uv run pytest foundation_tests/test_guard_release_matrix.py -q` exits 1: missing matrix/workflow | `uv run pytest foundation_tests/test_guard_release_matrix.py -q && uv run python packaging/build_guard.py && uv run python scripts/verify_guard_artifacts.py` exits 0 |
 
 ### Task 1: CLI skeleton and version
 

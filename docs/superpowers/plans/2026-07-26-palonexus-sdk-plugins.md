@@ -14,17 +14,18 @@
 
 | Task | Red command and expected result | Green command and expected result |
 |---|---|---|
-| 1 | `go test ./guard/pkg/hookclient -count=1` → FAIL missing hook client | same → PASS |
-| 2 | `go test ./plugins/claude-code/internal/normalize -count=1` → FAIL missing normalizer | same plus protocol canonicalization tests → PASS |
-| 3 | `go test ./plugins/claude-code/internal/render -count=1` → FAIL missing renderer | same → PASS |
-| 4 | `uv run pytest plugins/claude-code/tests/test_manifest.py -q` → FAIL missing manifest | same → PASS |
-| 5 | `uv run pytest plugins/claude-code/tests/test_host_integration.py -q` → FAIL missing integration | same with minimum/latest host jobs → PASS |
-| 6 | `go test ./plugins/codex/internal/normalize -count=1` → FAIL missing normalizer | same plus protocol canonicalization tests → PASS |
-| 7 | `go test ./plugins/codex/internal/render -count=1` → FAIL missing renderer | same → PASS |
-| 8 | `uv run pytest plugins/codex/tests/test_manifest.py -q` → FAIL missing manifest | same → PASS |
-| 9 | `uv run pytest plugins/codex/tests/test_host_integration.py -q` → FAIL missing integration | same with minimum/latest host jobs → PASS |
-| 10 | `uv run pytest conformance/tests/test_plugin_parity.py -q` → FAIL divergent/missing adapters | same plus both Go adapter suites → PASS |
-| 11 | `uv run pytest foundation_tests/test_plugin_bundles.py -q` → FAIL missing bundles | same then bundle verifier → PASS |
+| 1 | `go test ./guard/pkg/hookclient -count=1` exits 1: missing hook client | `go test ./guard/pkg/hookclient -count=1` exits 0 |
+| 2 | `go test ./plugins/claude-code/internal/normalize -count=1` exits 1: missing normalizer | `go test ./plugins/claude-code/internal/normalize -count=1 && uv run pytest protocol/tests/test_canonicalization.py -q` exits 0 |
+| 3 | `go test ./plugins/claude-code/internal/render -count=1` exits 1: missing renderer | `go test ./plugins/claude-code/internal/render -count=1` exits 0 |
+| 4 | `uv run pytest plugins/claude-code/tests/test_manifest.py -q` exits 1: missing manifest | `uv run pytest plugins/claude-code/tests/test_manifest.py -q` exits 0 |
+| 5 | `CLAUDE_EXPECTED_VERSION="$(claude --version)" uv run pytest plugins/claude-code/tests/test_host_integration.py -q` exits 1: missing integration | `CLAUDE_EXPECTED_VERSION="$(claude --version)" uv run pytest plugins/claude-code/tests/test_host_integration.py -q` exits 0 |
+| 6 | `go test ./plugins/codex/internal/normalize -count=1` exits 1: missing normalizer | `go test ./plugins/codex/internal/normalize -count=1 && uv run pytest protocol/tests/test_canonicalization.py -q` exits 0 |
+| 7 | `go test ./plugins/codex/internal/render -count=1` exits 1: missing renderer | `go test ./plugins/codex/internal/render -count=1` exits 0 |
+| 8 | `uv run pytest plugins/codex/tests/test_manifest.py -q` exits 1: missing manifest | `uv run pytest plugins/codex/tests/test_manifest.py -q` exits 0 |
+| 9 | `CODEX_EXPECTED_VERSION="$(codex --version)" uv run pytest plugins/codex/tests/test_host_integration.py -q` exits 1: missing integration | `CODEX_EXPECTED_VERSION="$(codex --version)" uv run pytest plugins/codex/tests/test_host_integration.py -q` exits 0 |
+| 9B | `uv run pytest foundation_tests/test_plugin_host_matrix_workflow.py -q` exits 1: missing four required jobs | `uv run pytest foundation_tests/test_plugin_host_matrix_workflow.py -q && uv run python scripts/verify_plugin_host_matrix.py` exits 0 |
+| 10 | `uv run pytest conformance/tests/test_plugin_parity.py -q` exits 1: divergent/missing adapters | `uv run pytest conformance/tests/test_plugin_parity.py -q && go test ./plugins/claude-code/... ./plugins/codex/... -count=1` exits 0 |
+| 11 | `uv run pytest foundation_tests/test_plugin_bundles.py -q` exits 1: missing bundles | `uv run pytest foundation_tests/test_plugin_bundles.py -q && uv run python packaging/build_plugins.py && uv run python scripts/verify_plugin_bundles.py` exits 0 |
 
 ### Task 1: Shared hook client and renderer contract
 
@@ -88,10 +89,8 @@
 - [ ] Write subprocess tests using a disposable home for install, allow/native
       permission preservation, deny sentinel, approval sentinel, timeout,
       malformed input, outage, upgrade, and uninstall.
-- [ ] Add required workflow jobs for the exact Gate 0 minimum and current latest
-      Claude Code versions. These jobs install the named version, run the exact
-      command above, assert the discovered version, and fail rather than skip
-      when the CLI or a claimed hook family is unavailable.
+- [ ] Record the exact local host command and version. Task 9B owns the required
+      minimum/latest workflow jobs.
 - [ ] Commit fixtures and tests.
 
 ### Task 6: Codex normalizer
@@ -141,10 +140,42 @@
       deny sentinel, approval sentinel, timeout, malformed input, unavailable
       guard, upgrade, and uninstall.
 - [ ] Prove no `permissionDecision: "ask"` path can continue execution.
-- [ ] Add required workflow jobs for the exact Gate 0 minimum and current latest
-      Codex versions. Assert installed version and fail rather than skip if the
-      CLI or a claimed hook path is unavailable.
+- [ ] Record the exact local host command and version. Task 9B owns the required
+      minimum/latest workflow jobs.
 - [ ] Commit.
+
+### Task 9B: Required minimum/latest host workflow
+
+**Files:**
+- Create: `.github/workflows/plugins.yml`
+- Create: `scripts/verify_plugin_host_matrix.py`
+- Create: `foundation_tests/test_plugin_host_matrix_workflow.py`
+
+- [ ] Write the failing workflow test requiring four named jobs:
+      `claude-minimum`, `claude-latest`, `codex-minimum`, and `codex-latest`.
+      Each reads its exact version from `docs/compatibility.json`, installs that
+      version, asserts `--version`, and runs the corresponding host integration
+      test without skip markers.
+- [ ] Run: `uv run pytest foundation_tests/test_plugin_host_matrix_workflow.py -q`
+      Expected: exit 1 because the workflow is absent.
+- [ ] Implement the integration-owned workflow and verifier. The verifier rejects
+      floating minimum values, missing latest discovery, skipped tests, and
+      unpinned third-party actions.
+- [ ] Run:
+
+```bash
+uv run pytest foundation_tests/test_plugin_host_matrix_workflow.py -q
+uv run python scripts/verify_plugin_host_matrix.py
+```
+
+Expected: exit 0 and print all four required check names and exact versions.
+
+- [ ] Commit:
+
+```bash
+git add .github/workflows/plugins.yml scripts/verify_plugin_host_matrix.py foundation_tests/test_plugin_host_matrix_workflow.py
+git commit -m "ci: require minimum and latest coding hosts"
+```
 
 ### Task 10: Shared plugin conformance
 
@@ -164,7 +195,7 @@
 **Files:**
 - Create: `packaging/build_plugins.py`
 - Create: `scripts/verify_plugin_bundles.py`
-- Create: `.github/workflows/plugins.yml`
+- Modify: `.github/workflows/plugins.yml`
 - Test: `foundation_tests/test_plugin_bundles.py`
 
 - [ ] Write failing tests for manifest, hook executable, skill, README, LICENSE,

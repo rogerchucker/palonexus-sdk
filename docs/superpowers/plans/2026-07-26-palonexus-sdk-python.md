@@ -18,21 +18,21 @@ green command plus the affected shared suite. A passing red command is invalid.
 
 | Task | Red command and expected result | Green command and expected result |
 |---|---|---|
-| 1 | `uv run pytest python/tests/test_models_errors.py -q` → FAIL missing public models | same command plus `uv run mypy python/src` → PASS |
-| 2 | `uv run pytest python/tests/test_context_protocol.py -q` → FAIL missing context/builder | same plus `uv run pytest protocol/tests -q` → PASS |
-| 3 | `uv run pytest python/tests/test_credentials_redaction_retry.py -q` → FAIL missing policies | same plus `uv run pytest python/tests/test_context_protocol.py -q` → PASS |
-| 3B | `uv run pytest python/tests/test_keystore.py -q` → FAIL missing `KeyStore` | same plus credentials tests → PASS |
-| 4 | `uv run pytest python/tests/test_http_transport.py -q` → FAIL missing transport | same plus protocol tests → PASS |
-| 5 | `uv run pytest python/tests/test_client_parity.py -q` → FAIL missing clients | same plus model/transport tests → PASS |
-| 6 | `uv run pytest python/tests/test_approval_resume.py -q` → FAIL missing approval/resume | same plus client parity/protocol approval tests → PASS |
-| 7 | `uv run pytest python/tests/identity/test_did_vc.py python/tests/identity/test_delegation.py -q` → FAIL missing identity modules | same commands → PASS |
-| 8 | `uv run pytest python/tests/identity/test_oidc.py -q` → FAIL missing OIDC verifier | same plus keystore tests → PASS |
-| 9 | `uv run pytest python/tests/test_testing_tools.py -q` → FAIL missing testing package | same plus client parity → PASS |
-| 10 | `uv run pytest python/tests/integrations/test_langchain.py -q` → FAIL missing adapter | same plus client parity → PASS |
-| 11 | `uv run pytest python/tests/integrations/test_langgraph.py -q` → FAIL missing adapter | same plus approval/resume → PASS |
-| 12 | `uv run pytest python/tests/integrations/test_deepagents.py -q` → FAIL missing adapter | same plus context tests → PASS |
-| 13 | `uv run pytest python/tests/test_examples.py -q` → FAIL missing examples | same plus all integration tests → PASS |
-| 14 | `uv run pytest python/tests/test_package_metadata.py -q` → FAIL missing artifact policy | same then `uv build --package palonexus` and artifact verifier → PASS |
+| 1 | `uv run pytest python/tests/test_models_errors.py -q` exits 1: missing public models | `uv run pytest python/tests/test_models_errors.py -q && uv run mypy python/src` exits 0 |
+| 2 | `uv run pytest python/tests/test_context_protocol.py -q` exits 1: missing context/builder | `uv run pytest python/tests/test_context_protocol.py protocol/tests -q` exits 0 |
+| 3 | `uv run pytest python/tests/test_credentials_redaction_retry.py -q` exits 1: missing policies | `uv run pytest python/tests/test_credentials_redaction_retry.py python/tests/test_context_protocol.py -q` exits 0 |
+| 3B | `uv run pytest python/tests/test_keystore.py -q` exits 1: missing `KeyStore` | `uv run pytest python/tests/test_keystore.py python/tests/test_credentials_redaction_retry.py -q` exits 0 |
+| 4 | `uv run pytest python/tests/test_http_transport.py -q` exits 1: missing transport | `uv run pytest python/tests/test_http_transport.py protocol/tests -q` exits 0 |
+| 5 | `uv run pytest python/tests/test_client_parity.py -q` exits 1: missing clients | `uv run pytest python/tests/test_client_parity.py python/tests/test_models_errors.py python/tests/test_http_transport.py -q` exits 0 |
+| 6 | `uv run pytest python/tests/test_approval_resume.py -q` exits 1: missing approval/resume | `uv run pytest python/tests/test_approval_resume.py python/tests/test_client_parity.py protocol/tests/test_approval_error_schema.py -q` exits 0 |
+| 7 | `uv run pytest python/tests/identity/test_did_vc.py python/tests/identity/test_delegation.py -q` exits 1: missing identity modules | `uv run pytest python/tests/identity/test_did_vc.py python/tests/identity/test_delegation.py -q` exits 0 |
+| 8 | `uv run pytest python/tests/identity/test_oidc.py -q` exits 1: missing OIDC verifier | `uv run pytest python/tests/identity/test_oidc.py python/tests/test_keystore.py -q` exits 0 |
+| 9 | `uv run pytest python/tests/test_testing_tools.py -q` exits 1: missing testing package | `uv run pytest python/tests/test_testing_tools.py python/tests/test_client_parity.py -q` exits 0 |
+| 10 | `uv run pytest python/tests/integrations/test_langchain.py -q` exits 1: missing adapter | `uv run pytest python/tests/integrations/test_langchain.py python/tests/test_client_parity.py -q` exits 0 |
+| 11 | `uv run pytest python/tests/integrations/test_langgraph.py -q` exits 1: missing adapter | `uv run pytest python/tests/integrations/test_langgraph.py python/tests/test_approval_resume.py -q` exits 0 |
+| 12 | `uv run pytest python/tests/integrations/test_deepagents.py -q` exits 1: missing adapter | `uv run pytest python/tests/integrations/test_deepagents.py python/tests/test_context_protocol.py -q` exits 0 |
+| 13 | `uv run pytest python/tests/test_examples.py -q` exits 1: missing examples | `uv run pytest python/tests/test_examples.py python/tests/integrations -q` exits 0 |
+| 14 | `uv run pytest python/tests/test_package_metadata.py -q` exits 1: missing artifact policy | `uv run pytest python/tests/test_package_metadata.py -q && uv build --package palonexus && uv run python scripts/verify_python_artifacts.py` exits 0 |
 
 ### Task 1: Public models, outcomes, and errors
 

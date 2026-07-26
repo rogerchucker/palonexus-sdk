@@ -14,18 +14,52 @@
 
 | Task | Red command and expected result | Green command and expected result |
 |---|---|---|
-| 1 | `uv run pytest conformance/tests/test_cross_adapter.py -q` → FAIL missing artifact adapters | same with `PALONEXUS_RELEASE_MANIFEST` → PASS |
-| 2 | `uv run pytest conformance/tests/test_local_e2e.py -q` → FAIL missing mock flow | same → PASS |
-| 3 | `uv run pytest conformance/tests/test_offline_examples.py -q` → FAIL missing installed examples | same against release manifest → PASS |
-| 4 | `uv run pytest conformance/tests/test_public_hygiene.py -q` → FAIL on seeded forbidden fixture | same plus archive scan → PASS |
-| 5 | `uv run pytest foundation_tests/test_release_manifest.py -q` → FAIL missing SBOM/signature/provenance fields | same plus manifest verifier → PASS |
-| 6 | `uv run pytest foundation_tests/test_python_release_workflow.py -q` → FAIL missing workflow policy | same → PASS |
-| 7 | `uv run pytest foundation_tests/test_asset_release_workflow.py -q` → FAIL missing asset workflow | same → PASS |
-| 8 | `uv run pytest foundation_tests/test_docs.py -q` → FAIL missing docs/snippets | same → PASS |
-| 9 | `scripts/verify` → FAIL on first incomplete required component | same on clean release worktree → PASS |
-| 10 | `uv run pytest foundation_tests/test_github_settings_evidence.py -q` → FAIL before public settings evidence | same after redacted API evidence → PASS |
-| 11 | `uv run python scripts/verify_public_release.py v0.2.0a1` → FAIL before public artifacts | same after publication → PASS |
-| 12 | `uv run pytest foundation_tests/test_completion_audit.py -q` → FAIL with unlinked criteria | same after complete evidence map → PASS |
+| 0 | `uv run pytest foundation_tests/test_rc_manifest.py -q` exits 1: no immutable RC artifacts | `uv run python packaging/build_release_candidate.py --output dist/release-candidate && uv run pytest foundation_tests/test_rc_manifest.py -q && uv run python scripts/verify_rc_manifest.py dist/release-candidate/manifest.json` exits 0 |
+| 1 | `PALONEXUS_RELEASE_MANIFEST="$PWD/dist/release-candidate/manifest.json" uv run pytest conformance/tests/test_cross_adapter.py -q` exits 1: missing artifact adapters | `PALONEXUS_RELEASE_MANIFEST="$PWD/dist/release-candidate/manifest.json" uv run pytest conformance/tests/test_cross_adapter.py -q` exits 0 |
+| 2 | `PALONEXUS_RELEASE_MANIFEST="$PWD/dist/release-candidate/manifest.json" uv run pytest conformance/tests/test_local_e2e.py -q` exits 1: missing mock flow | `PALONEXUS_RELEASE_MANIFEST="$PWD/dist/release-candidate/manifest.json" uv run pytest conformance/tests/test_local_e2e.py -q` exits 0 |
+| 3 | `PALONEXUS_RELEASE_MANIFEST="$PWD/dist/release-candidate/manifest.json" uv run pytest conformance/tests/test_offline_examples.py -q` exits 1: missing installed examples | `PALONEXUS_RELEASE_MANIFEST="$PWD/dist/release-candidate/manifest.json" uv run pytest conformance/tests/test_offline_examples.py -q` exits 0 |
+| 4 | `uv run pytest conformance/tests/test_public_hygiene.py -q` exits 1 on seeded forbidden fixture | `uv run pytest conformance/tests/test_public_hygiene.py -q && uv run python scripts/verify_no_private_coupling.py --archives dist/release-candidate` exits 0 |
+| 5 | `uv run pytest foundation_tests/test_release_manifest.py -q` exits 1: missing SBOM/signature/provenance fields | `uv run pytest foundation_tests/test_release_manifest.py -q && uv run python scripts/verify_release_manifest.py dist/release-candidate/manifest.json` exits 0 |
+| 6 | `uv run pytest foundation_tests/test_python_release_workflow.py -q` exits 1: missing workflow policy | `uv run pytest foundation_tests/test_python_release_workflow.py -q` exits 0 |
+| 7 | `uv run pytest foundation_tests/test_asset_release_workflow.py -q` exits 1: missing asset workflow | `uv run pytest foundation_tests/test_asset_release_workflow.py -q` exits 0 |
+| 8 | `uv run pytest foundation_tests/test_docs.py -q` exits 1: missing docs/snippets | `uv run pytest foundation_tests/test_docs.py -q` exits 0 |
+| 9 | `scripts/verify` exits nonzero on the first incomplete required component | `PALONEXUS_RELEASE_MANIFEST="$PWD/dist/release-candidate/manifest.json" scripts/verify` exits 0 in a clean release worktree |
+| 10 | `uv run pytest foundation_tests/test_github_settings_evidence.py -q` exits 1 before public settings evidence | `uv run pytest foundation_tests/test_github_settings_evidence.py -q` exits 0 after redacted API evidence |
+| 11 | `uv run python scripts/verify_public_release.py v0.2.0a1` exits 1 before public artifacts | `uv run python scripts/verify_public_release.py v0.2.0a1` exits 0 after public download/runtime checks |
+| 12 | `uv run pytest foundation_tests/test_completion_audit.py -q` exits 1 with unlinked criteria | `uv run pytest foundation_tests/test_completion_audit.py -q` exits 0 after the evidence map is complete |
+
+### Task 0: Build the immutable release candidate
+
+**Files:**
+- Create: `packaging/build_release_candidate.py`
+- Create: `scripts/verify_rc_manifest.py`
+- Create: `foundation_tests/test_rc_manifest.py`
+- Create output: `dist/release-candidate/manifest.json`
+
+- [ ] Write the failing test requiring a wheel, sdist, guard archives, Claude
+      bundle, Codex bundle, source commit, protocol version, and SHA-256 for
+      every file. Reject editable/source paths.
+- [ ] Run: `uv run pytest foundation_tests/test_rc_manifest.py -q`
+      Expected: exit 1 because no release candidate exists.
+- [ ] Implement the build orchestrator. It invokes the already-reviewed Python,
+      guard, and plugin builders once, copies immutable outputs into
+      `dist/release-candidate`, and writes their hashes/source commit.
+- [ ] Run:
+
+```bash
+uv run python packaging/build_release_candidate.py --output dist/release-candidate
+uv run pytest foundation_tests/test_rc_manifest.py -q
+uv run python scripts/verify_rc_manifest.py dist/release-candidate/manifest.json
+```
+
+Expected: exit 0, clean source commit, and all artifact hashes verified.
+
+- [ ] Commit scripts/tests, not generated `dist/`:
+
+```bash
+git add packaging/build_release_candidate.py scripts/verify_rc_manifest.py foundation_tests/test_rc_manifest.py
+git commit -m "build: produce immutable sdk release candidate"
+```
 
 ### Task 1: Cross-adapter conformance runner
 
@@ -103,7 +137,9 @@
 - [ ] Write failing tests requiring source commit, protocol version, artifact
       SHA-256, SPDX/CycloneDX SBOM, signature reference, provenance reference,
       toolchain versions, and compatibility matrix.
-- [ ] Build artifacts once and generate the manifest.
+- [ ] Enrich the existing Task 0 manifest without rebuilding artifacts. Generate
+      SBOMs, checksum manifest, signature references, and attestations over the
+      exact verified hashes.
 - [ ] Configure keyless signing/attestation with minimal workflow permissions.
 - [ ] Commit.
 
@@ -162,8 +198,8 @@
 - Create: `docs/evidence/local-release-candidate.md`
 
 - [ ] Run every master verification command on a clean integration worktree.
-- [ ] Build the immutable release-candidate manifest before conformance; export
-      its path as `PALONEXUS_RELEASE_MANIFEST` for Tasks 1–3.
+- [ ] Reuse Task 0's immutable release-candidate manifest; export
+      `PALONEXUS_RELEASE_MANIFEST="$PWD/dist/release-candidate/manifest.json"`.
 - [ ] Run independent spec-compliance and security/code-quality reviews.
 - [ ] Record commands, versions, commit, counts, artifacts, and limitations.
 - [ ] Fix all findings and rerun from the beginning.
