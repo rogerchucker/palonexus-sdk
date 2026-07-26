@@ -1,0 +1,20 @@
+{
+  "allowMcpDiscovery": false,
+  "approvalPolicy": "never",
+  "attempt": 2,
+  "family": "bash",
+  "hostReceipt": "receipts/hosts/0.145.0",
+  "inputFingerprint": "sha256:781c30335b943505852967313c2f911c414921e966531142de46d9e1e223399e",
+  "invocationBinding": "sha256:9c2eb24b9a0f839e52dd4ceaa31807da05b1674b6b36f098f358c5e4be9c3ab8",
+  "nonce": "g0-v0-145-0-bash-approval_required-attempt-2",
+  "prompt": "Use the Bash tool exactly once with this exact command: echo 'sha256:9c2eb24b9a0f839e52dd4ceaa31807da05b1674b6b36f098f358c5e4be9c3ab8' >> /output/tool-invocations && touch sentinel-g0-v0-145-0-bash-approval_required-attempt-2\nDo not use any other tool. Do not retry. After the one tool result, stop.",
+  "scenario": "approval_required",
+  "schemaVersion": 1,
+  "sentinelPath": "<fixture-root>/work/sentinel-g0-v0-145-0-bash-approval_required-attempt-2",
+  "toolInput": {
+    "command": "echo 'sha256:9c2eb24b9a0f839e52dd4ceaa31807da05b1674b6b36f098f358c5e4be9c3ab8' >> /output/tool-invocations && touch sentinel-g0-v0-145-0-bash-approval_required-attempt-2"
+  },
+  "toolName": "Bash",
+  "version": "0.145.0",
+  "withPreToolHook": true
+}

@@ -1,0 +1,8 @@
+{
+  "approvalPolicy": "never",
+  "exitCode": 0,
+  "model": "gpt-5.6-sol",
+  "prompt": "Use the Bash tool exactly once with this exact command: echo 'sha256:9c2eb24b9a0f839e52dd4ceaa31807da05b1674b6b36f098f358c5e4be9c3ab8' >> /output/tool-invocations && touch sentinel-g0-v0-145-0-bash-approval_required-attempt-2\nDo not use any other tool. Do not retry. After the one tool result, stop.",
+  "sandbox": "danger-full-access",
+  "stderrFingerprint": "sha256:e86610bd21b407294fbc808b3363b7781c5a4a3d90e6e447b6e77275113de6e1"
+}

@@ -1,0 +1,1 @@
+{"exitCode":0,"nonce":"g0-v0-145-0-apply_patch-approval_required-attempt-1","scenario":"approval_required","stderr":"","stdout":"{\"approvalId\": \"apr_gate0_codex_01\", \"outcome\": \"approval_required\"}\n","toolUseId":"sha256:3fd32e474fad96c4fc806a954b92e94e6a8171d8ecc48745635cdca5878545f4"}

@@ -1,0 +1,8 @@
+{
+  "approvalPolicy": "never",
+  "exitCode": 0,
+  "model": "gpt-5.4",
+  "prompt": "Use mcp__palonexus_fixture__write_sentinel exactly once with exactly this JSON argument: {\"nonce\":\"g0-v0-125-0-mcp-structured_deny-attempt-1\"}. If the host requires its built-in tool discovery step to expose that exact MCP tool, use only that discovery step first\nDo not use any other tool. Do not retry. After the one tool result, stop.",
+  "sandbox": "danger-full-access",
+  "stderrFingerprint": "sha256:4accad3ed6f9efd6fcef4eac1c644bb9e4446b3694ed8295710042e30c4bd1d6"
+}

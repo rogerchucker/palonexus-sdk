@@ -13,3 +13,10 @@ foundation_tests/test_repository_metadata.py,rogerchucker/palonexus-sdk,WORKTREE
 pyproject.toml,rogerchucker/palonexus-sdk,WORKTREE,pyproject.toml,PaloNexus,yes,new,MIT,rogerchucker
 ruff.toml,rogerchucker/palonexus-sdk,WORKTREE,ruff.toml,PaloNexus,yes,new,MIT,rogerchucker
 uv.lock,rogerchucker/palonexus-sdk,GENERATED,pyproject.toml,PaloNexus,yes,generated,MIT,rogerchucker
+docs/compatibility.md,rogerchucker/palonexus-sdk,WORKTREE,docs/compatibility.md,PaloNexus,yes,new,MIT,rogerchucker
+foundation_tests/test_codex_gate0.py,rogerchucker/palonexus-sdk,WORKTREE,foundation_tests/test_codex_gate0.py,PaloNexus,yes,new,MIT,rogerchucker
+plugins/codex/tests/fixtures/expected-capabilities.json,rogerchucker/palonexus-sdk,WORKTREE,plugins/codex/tests/fixtures/expected-capabilities.json,PaloNexus,yes,new,MIT,rogerchucker
+plugins/codex/tests/fixtures/host-version.json,rogerchucker/palonexus-sdk,WORKTREE,plugins/codex/tests/fixtures/host-version.json,PaloNexus,yes,new,MIT,rogerchucker
+plugins/codex/tests/fixtures/official-contract.json,rogerchucker/palonexus-sdk,WORKTREE,plugins/codex/tests/fixtures/official-contract.json,PaloNexus,yes,new,MIT,rogerchucker
+plugins/codex/tests/fixtures/pretooluse/README.md,rogerchucker/palonexus-sdk,WORKTREE,plugins/codex/tests/fixtures/pretooluse/README.md,PaloNexus,yes,new,MIT,rogerchucker
+scripts/capture_codex_fixtures.py,rogerchucker/palonexus-sdk,WORKTREE,scripts/capture_codex_fixtures.py,PaloNexus,yes,new,MIT,rogerchucker

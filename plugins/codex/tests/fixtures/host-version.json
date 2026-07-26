@@ -1,0 +1,109 @@
+{
+  "gateComplete": false,
+  "latestStable": {
+    "coverageComplete": false,
+    "version": "0.145.0"
+  },
+  "minimumSupported": {
+    "status": "unresolved",
+    "version": null
+  },
+  "testedHosts": {
+    "0.124.0": {
+      "authMountReadOnly": true,
+      "baseImage": "docker.io/library/python@sha256:c18c7a910432dde3311fc54d02e5d5220f3ebe26fec43ff15745982863dd7b3b",
+      "baseImageId": "sha256:a0938838407c79b6ff4ea2635398c61b68a3bf58d9d71d0604ab7825086d506a",
+      "capDrop": "ALL",
+      "containerUser": "10001:10001",
+      "executableSha256": "sha256:29981b30e9d5f65843bc8fa1c012477290e7f1137674017420703f847c8d0b3e",
+      "mcpRegistered": true,
+      "noNewPrivileges": true,
+      "npmIntegrity": "sha512-1EVAuPyAQZ8zIVMw3bPJ6a4R8ifLAZ7LGsOyknj5c2he9AFXVRCmWx12WrdZJ25wcBvOEKt1n1Zx+QAj0EVGbQ==",
+      "npmIntegrityVerified": true,
+      "npmTarball": "https://registry.npmjs.org/@openai/codex/-/codex-0.124.0.tgz",
+      "npmVersion": "0.124.0",
+      "readOnlyRoot": true,
+      "receipt": "receipts/hosts/0.124.0",
+      "receiptDerived": true,
+      "receiptFiles": {
+        "artifact.json": "sha256:fb9c289ab12681ea853b226061f21abbd46e1a030edbd3d16e1db4c1b9b72809",
+        "mcp-registration.json": "sha256:f85b88ef1cdf7891c8c4fd2b2ea7f525c88af4de2133dd19e76f9bbe1034e773",
+        "npm-artifact.json": "sha256:e9f5faf84d03ef8354040979aa79d919aa028b10552ecbff7d5365a8cb5ad25c",
+        "npm-metadata.json": "sha256:5b0e5125350219a06db509e9e31ddac0d7df0005b77846d30511d37fabff71ca",
+        "release-metadata.json": "sha256:5f2e58fc6d692678e053f85edd184525bd5def7f77b6c89350274fffd68cd5e1",
+        "runtime-canary.json": "sha256:80087df0e98de089021e8edf6b8d2bf4951bd9a9ffeb89a820985fb78e78d135",
+        "version-process.json": "sha256:5ccb3665b2f19303f535a5440b34be9c23f048d93bbcbd197de37cff0e6cfb3b"
+      },
+      "releaseArtifactIntegrityVerified": true,
+      "releaseArtifactSha256": "sha256:1301b1624c9ee89c41a501b77b95107a8dc3c8c285624d72edcda7921be6332e",
+      "sourceWorkspaceMounted": false,
+      "trusted": true,
+      "version": "0.124.0",
+      "workspaceIsDisposable": true
+    },
+    "0.125.0": {
+      "authMountReadOnly": true,
+      "baseImage": "docker.io/library/python@sha256:c18c7a910432dde3311fc54d02e5d5220f3ebe26fec43ff15745982863dd7b3b",
+      "baseImageId": "sha256:a0938838407c79b6ff4ea2635398c61b68a3bf58d9d71d0604ab7825086d506a",
+      "capDrop": "ALL",
+      "containerUser": "10001:10001",
+      "executableSha256": "sha256:6ed7c4ff0d5cee65ae31b81194c0d4a28e6806b6813c7773925c3939660254b4",
+      "mcpRegistered": true,
+      "noNewPrivileges": true,
+      "npmIntegrity": "sha512-GiE9wlgL95u/5BRirY5d3EaRLU1tu7Y1R09R8lCHHVmcQdSmhS809FdPDWH3gIYHS7ZriAPqXwJ3aLA0WKl40Q==",
+      "npmIntegrityVerified": true,
+      "npmTarball": "https://registry.npmjs.org/@openai/codex/-/codex-0.125.0.tgz",
+      "npmVersion": "0.125.0",
+      "readOnlyRoot": true,
+      "receipt": "receipts/hosts/0.125.0",
+      "receiptDerived": true,
+      "receiptFiles": {
+        "artifact.json": "sha256:caeb9f3d5c020439c393a217a37f72fcd51b5ab84d1b16095b4cc3776834e5b4",
+        "mcp-registration.json": "sha256:f85b88ef1cdf7891c8c4fd2b2ea7f525c88af4de2133dd19e76f9bbe1034e773",
+        "npm-artifact.json": "sha256:48080c6d2f67762c0ad9eb0a5348f0277331d601ded7206d3ad70edd870f321e",
+        "npm-metadata.json": "sha256:e364d2dc74c4c979f47de2073e1daf8e332f0b64dd135826b883b0b971c8244e",
+        "release-metadata.json": "sha256:018177f072751391a28084d4e76d58aa8ca142c2ddecba94457e103425f47297",
+        "runtime-canary.json": "sha256:80087df0e98de089021e8edf6b8d2bf4951bd9a9ffeb89a820985fb78e78d135",
+        "version-process.json": "sha256:c9f772a64e793420be9a4aa894ce6bbb42842ec0f4b777607e0f4ee3f4578c04"
+      },
+      "releaseArtifactIntegrityVerified": true,
+      "releaseArtifactSha256": "sha256:700bc3b240963d6ae0f4f6078d4ede0eb07999ffc08d1348b8b091deac4b79c8",
+      "sourceWorkspaceMounted": false,
+      "trusted": true,
+      "version": "0.125.0",
+      "workspaceIsDisposable": true
+    },
+    "0.145.0": {
+      "authMountReadOnly": true,
+      "baseImage": "docker.io/library/python@sha256:c18c7a910432dde3311fc54d02e5d5220f3ebe26fec43ff15745982863dd7b3b",
+      "baseImageId": "sha256:a0938838407c79b6ff4ea2635398c61b68a3bf58d9d71d0604ab7825086d506a",
+      "capDrop": "ALL",
+      "containerUser": "10001:10001",
+      "executableSha256": "sha256:57d79900fe95df2ab854adf581a28ec46d7442f07445032d86453a44b577dced",
+      "mcpRegistered": true,
+      "noNewPrivileges": true,
+      "npmIntegrity": "sha512-/PSPSFujjjmiyVFvG2yu/grOFhsWdokTH8t2KGWhXSo/M5n/dIDsnbsnO82/7bLtIoDuzQf7ATBUMWqPWQINlQ==",
+      "npmIntegrityVerified": true,
+      "npmTarball": "https://registry.npmjs.org/@openai/codex/-/codex-0.145.0.tgz",
+      "npmVersion": "0.145.0",
+      "readOnlyRoot": true,
+      "receipt": "receipts/hosts/0.145.0",
+      "receiptDerived": true,
+      "receiptFiles": {
+        "artifact.json": "sha256:ee7adbc68814f5cba7d6c17763f6e0aa1be59a7012688840d7b071355fa8a554",
+        "mcp-registration.json": "sha256:f85b88ef1cdf7891c8c4fd2b2ea7f525c88af4de2133dd19e76f9bbe1034e773",
+        "npm-artifact.json": "sha256:ed1505b6d2f837c23c2da2d17b76834f5d4fb7065da23461935c5532156bca78",
+        "npm-metadata.json": "sha256:42481cfb7249f1b0ed9e3ef61bc39f9231d78875283bb7fa827a54592c2f73e6",
+        "release-metadata.json": "sha256:cd151703f7fb7e2225208eca0ff28e6cf13d28cc3768ab35b3bc7485d23cf5e9",
+        "runtime-canary.json": "sha256:80087df0e98de089021e8edf6b8d2bf4951bd9a9ffeb89a820985fb78e78d135",
+        "version-process.json": "sha256:0199c5d99dd67bfb9e66e2caf6b41a76815ce76f2563b9605bb6927124e7f69b"
+      },
+      "releaseArtifactIntegrityVerified": true,
+      "releaseArtifactSha256": "sha256:d384f90bc842450b42bd675feef06a12a46a3b1ca97efcb22566b270e4a11227",
+      "sourceWorkspaceMounted": false,
+      "trusted": true,
+      "version": "0.145.0",
+      "workspaceIsDisposable": true
+    }
+  }
+}

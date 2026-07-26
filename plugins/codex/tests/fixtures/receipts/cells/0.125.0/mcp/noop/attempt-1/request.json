@@ -1,0 +1,20 @@
+{
+  "allowMcpDiscovery": true,
+  "approvalPolicy": "never",
+  "attempt": 1,
+  "family": "mcp",
+  "hostReceipt": "receipts/hosts/0.125.0",
+  "inputFingerprint": "sha256:765e9ad550c27645e0aee3ba0c6c8bb6bb619d8d12ee32efd7dce12b483fcdb9",
+  "invocationBinding": "sha256:bd1343f375c2a266f9953fc7f8f5fd9e7655d051570cb61d7381432c31d88bfc",
+  "nonce": "g0-v0-125-0-mcp-noop-attempt-1",
+  "prompt": "Use mcp__palonexus_fixture__write_sentinel exactly once with exactly this JSON argument: {\"nonce\":\"g0-v0-125-0-mcp-noop-attempt-1\"}. If the host requires its built-in tool discovery step to expose that exact MCP tool, use only that discovery step first\nDo not use any other tool. Do not retry. After the one tool result, stop.",
+  "scenario": "noop",
+  "schemaVersion": 1,
+  "sentinelPath": "<fixture-root>/work/sentinel-g0-v0-125-0-mcp-noop-attempt-1",
+  "toolInput": {
+    "nonce": "g0-v0-125-0-mcp-noop-attempt-1"
+  },
+  "toolName": "mcp__palonexus_fixture__write_sentinel",
+  "version": "0.125.0",
+  "withPreToolHook": true
+}

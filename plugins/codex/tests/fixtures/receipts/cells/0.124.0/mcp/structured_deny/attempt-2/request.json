@@ -1,0 +1,20 @@
+{
+  "allowMcpDiscovery": true,
+  "approvalPolicy": "never",
+  "attempt": 2,
+  "family": "mcp",
+  "hostReceipt": "receipts/hosts/0.124.0",
+  "inputFingerprint": "sha256:3628b15675b84f48696bb245cec7ebd9580b07a9124e18711f596cf2c9f8b55a",
+  "invocationBinding": "sha256:64258a818c1dd0301bc56fc54f8344bdc704090bc289daf614f90d3190ca8d94",
+  "nonce": "g0-v0-124-0-mcp-structured_deny-attempt-2",
+  "prompt": "Use mcp__palonexus_fixture__write_sentinel exactly once with exactly this JSON argument: {\"nonce\":\"g0-v0-124-0-mcp-structured_deny-attempt-2\"}. If the host requires its built-in tool discovery step to expose that exact MCP tool, use only that discovery step first\nDo not use any other tool. Do not retry. After the one tool result, stop.",
+  "scenario": "structured_deny",
+  "schemaVersion": 1,
+  "sentinelPath": "<fixture-root>/work/sentinel-g0-v0-124-0-mcp-structured_deny-attempt-2",
+  "toolInput": {
+    "nonce": "g0-v0-124-0-mcp-structured_deny-attempt-2"
+  },
+  "toolName": "mcp__palonexus_fixture__write_sentinel",
+  "version": "0.124.0",
+  "withPreToolHook": true
+}

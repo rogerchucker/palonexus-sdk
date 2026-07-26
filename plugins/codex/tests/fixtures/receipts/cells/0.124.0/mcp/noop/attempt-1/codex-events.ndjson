@@ -1,0 +1,8 @@
+{"thread_id":"sha256:bbc7a206ee5884363be6cb056dd5c68cb085d05fa50d7d1df344902883a50a23","type":"thread.started"}
+{"type":"turn.started"}
+{"item":{"containsNonce":false,"id":"sha256:2f58b7d7725eac66c32ab446bb53a188688dc1d76fcc40cf31f5cf6509181ce8","textFingerprint":"sha256:a5ac910264be9e9bec72e072b8f4f540378ccbf16150c2ddbb9ed5623d7a6beb","type":"agent_message"},"type":"item.completed"}
+{"item":{"containsNonce":false,"id":"sha256:32012c4c32888ee2c4ba4331e3c77ece9acd811a4b3abb708363123591abfea2","textFingerprint":"sha256:070a6d9e82306ad0ed63aa19f96ca0661dc0ce1d554e7cccba729e2a92223eae","type":"agent_message"},"type":"item.completed"}
+{"item":{"arguments":{"nonce":"g0-v0-124-0-mcp-noop-attempt-1"},"error":null,"id":"sha256:6a9722cdf589a2a068832c955a8253b9df87983501c03dd92e95debae1f409da","result":null,"server":"palonexus_fixture","status":"in_progress","tool":"write_sentinel","type":"mcp_tool_call"},"type":"item.started"}
+{"item":{"arguments":{"nonce":"g0-v0-124-0-mcp-noop-attempt-1"},"error":null,"id":"sha256:6a9722cdf589a2a068832c955a8253b9df87983501c03dd92e95debae1f409da","result":{"observed":true},"server":"palonexus_fixture","status":"completed","tool":"write_sentinel","type":"mcp_tool_call"},"type":"item.completed"}
+{"item":{"containsNonce":false,"id":"sha256:4a317b6972e2f1834050485420bd71fe6fc2d87cd25d572cb4b8b327b37bc030","textFingerprint":"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","type":"agent_message"},"type":"item.completed"}
+{"type":"turn.completed","usage":{"cached_input_tokens":16512,"input_tokens":36668,"output_tokens":343}}

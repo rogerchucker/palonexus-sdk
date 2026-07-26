@@ -1,0 +1,1 @@
+{"exitCode":0,"stderr":"","stdout":"{\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \"permissionDecision\": \"deny\", \"permissionDecisionReason\": \"PaloNexus approval apr_gate0_codex_01 required for g0-v0-145-0-apply_patch-approval_required-attempt-1; retry after approval\"}}\n","toolUseId":"sha256:3fd32e474fad96c4fc806a954b92e94e6a8171d8ecc48745635cdca5878545f4"}

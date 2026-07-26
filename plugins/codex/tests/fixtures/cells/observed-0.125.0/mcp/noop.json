@@ -1,0 +1,52 @@
+{
+  "family": "mcp",
+  "hookExitCode": 0,
+  "hookInvocationCount": 1,
+  "hookPayload": {
+    "cwd": "<fixture-root>/work",
+    "hook_event_name": "PreToolUse",
+    "model": "gpt-5.4",
+    "permission_mode": "bypassPermissions",
+    "session_id": "sha256:261d53722e75d697dd63614fb86d559cfbafb941f92fe6cb2ea78adf4bc51d7e",
+    "tool_input": {
+      "nonce": "g0-v0-125-0-mcp-noop-attempt-1"
+    },
+    "tool_name": "mcp__palonexus_fixture__write_sentinel",
+    "tool_use_id": "sha256:926db44f401febf42baebc1e13ee6953442b2d13dbed03fca39f7543eb83eeb9",
+    "transcript_path": null,
+    "turn_id": "sha256:2715047decba1eae5ff9885a9654fec17273abf00b28998f2a1cee31187b6f9c"
+  },
+  "hookPayloadFingerprint": "sha256:80f2ca79f145f1bb54754ad2da733b0ca909dd3d738f80b586a01cf0e6bdac4c",
+  "hostEvidenceFingerprint": "sha256:6903f110e4e8da43a379f5ff664a3605e4cf49ec7ea2282c0b4fb81a86a3854e",
+  "hostItemId": "sha256:32012c4c32888ee2c4ba4331e3c77ece9acd811a4b3abb708363123591abfea2",
+  "hostReceipt": "receipts/hosts/0.125.0",
+  "hostRenderedEvidence": {
+    "eventType": "item.completed",
+    "itemId": "sha256:32012c4c32888ee2c4ba4331e3c77ece9acd811a4b3abb708363123591abfea2",
+    "status": "completed",
+    "text": null
+  },
+  "hostToolCallCount": 1,
+  "inputFingerprint": "sha256:765e9ad550c27645e0aee3ba0c6c8bb6bb619d8d12ee32efd7dce12b483fcdb9",
+  "invocationBinding": "sha256:bd1343f375c2a266f9953fc7f8f5fd9e7655d051570cb61d7381432c31d88bfc",
+  "nonce": "g0-v0-125-0-mcp-noop-attempt-1",
+  "promptFingerprint": "sha256:d0f6d689f7a0c1eaa2578937fd74c314a970c8ff223df60020df70a7c4de80c0",
+  "receipt": "receipts/cells/0.125.0/mcp/noop/attempt-1",
+  "receiptDerived": true,
+  "receiptFiles": {
+    "codex-events.ndjson": "sha256:ef0f59449f0e70ceff5a142b2c78bd8a8fc778dd7201bb8fd3ceec915e8b2c50",
+    "effect.json": "sha256:cb4ae7f3d5917a3015f024d7ef2901500273411851ab7bae48e1fc3b5e88764b",
+    "guard.ndjson": "sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
+    "hook-input.ndjson": "sha256:48c3dfe10a2e0df15638703ee716091238de3609dfa59fcd35dad23fc392d967",
+    "hook-run.ndjson": "sha256:4ec441555fc418f95a89a6af887d537ba7cf939f7a7be9ba0d15cbde0ab49ea8",
+    "mcp.ndjson": "sha256:1a36e939576cdded5e86b1669124b9616a57ee8f5f24b476dc6b3e018d39d36d",
+    "process.json": "sha256:2ba5b375fd00cb812f64bf3b30e6bdc15999ae4af02460b842e1c5c90c4698cb",
+    "request.json": "sha256:c9d033fd54a1fe392fbf7c42bfef76361e861b53ce16ed49b800526e266f27b3"
+  },
+  "scenario": "noop",
+  "sentinelExistsAfter": true,
+  "toolExecuted": true,
+  "toolUseId": "sha256:926db44f401febf42baebc1e13ee6953442b2d13dbed03fca39f7543eb83eeb9",
+  "trusted": true,
+  "version": "0.125.0"
+}

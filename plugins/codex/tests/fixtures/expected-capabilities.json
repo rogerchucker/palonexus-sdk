@@ -1,0 +1,38 @@
+{
+  "attemptedVersions": [
+    "0.124.0",
+    "0.125.0",
+    "0.145.0"
+  ],
+  "claimedToolFamilies": [],
+  "exactMinimum": null,
+  "gateComplete": false,
+  "latestStable": "0.145.0",
+  "limitation": "No tested version produced the complete structurally correlated blocking matrix. No supported tool family is claimed.",
+  "receiptDerivedObservedCells": {
+    "0.124.0": {
+      "mcp": [
+        "noop"
+      ]
+    },
+    "0.125.0": {
+      "mcp": [
+        "noop"
+      ]
+    },
+    "0.145.0": {
+      "mcp": [
+        "noop"
+      ]
+    }
+  },
+  "unsupportedToolFamilies": {
+    "hosted": [
+      "WebSearch",
+      "hosted connectors"
+    ],
+    "specialized": [
+      "handlers outside the local function-tool hook path"
+    ]
+  }
+}

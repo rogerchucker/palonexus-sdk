@@ -1,0 +1,5 @@
+{
+  "exitCode": 0,
+  "stderr": "",
+  "stdout": "Name               Command                 Args                    Env  Cwd  Status   Auth       \npalonexus_fixture  /usr/local/bin/python3  /fixture/mcp_server.py  -    -    enabled  Unsupported\n"
+}

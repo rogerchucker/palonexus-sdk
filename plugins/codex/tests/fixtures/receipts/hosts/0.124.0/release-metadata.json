@@ -1,0 +1,13 @@
+{
+  "asset": {
+    "digest": "sha256:1301b1624c9ee89c41a501b77b95107a8dc3c8c285624d72edcda7921be6332e",
+    "name": "codex-aarch64-unknown-linux-musl.tar.gz",
+    "size": 72136760,
+    "url": "https://github.com/openai/codex/releases/download/rust-v0.124.0/codex-aarch64-unknown-linux-musl.tar.gz"
+  },
+  "publishedAt": "2026-04-23T18:29:40Z",
+  "releaseNotesFingerprint": "sha256:5fc5576bf54247a3fcf74b8a3c788ed459783690405b92139775d64c6b96008b",
+  "releaseUrl": "https://github.com/openai/codex/releases/tag/rust-v0.124.0",
+  "tagCommit": "e9fb49366c93a1478ec71cc41ecee415a197d036",
+  "tagName": "rust-v0.124.0"
+}

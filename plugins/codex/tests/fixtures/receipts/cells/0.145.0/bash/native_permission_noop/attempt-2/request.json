@@ -1,0 +1,20 @@
+{
+  "allowMcpDiscovery": false,
+  "approvalPolicy": "untrusted",
+  "attempt": 2,
+  "family": "bash",
+  "hostReceipt": "receipts/hosts/0.145.0",
+  "inputFingerprint": "sha256:9cf3f18a9d289f12afd7e15f6f4420a18cd07d23e8f18bf101371282668e561f",
+  "invocationBinding": "sha256:88463877a7a771229ceab72022104535e86e9fdb2d8f77ef6102de6b978377d7",
+  "nonce": "g0-v0-145-0-bash-native_permission_noop-attempt-2",
+  "prompt": "Use the Bash tool exactly once with this exact command: echo 'sha256:88463877a7a771229ceab72022104535e86e9fdb2d8f77ef6102de6b978377d7' >> /output/tool-invocations && touch sentinel-g0-v0-145-0-bash-native_permission_noop-attempt-2\nDo not use any other tool. Do not retry. After the one tool result, stop.",
+  "scenario": "native_permission_noop",
+  "schemaVersion": 1,
+  "sentinelPath": "<fixture-root>/work/sentinel-g0-v0-145-0-bash-native_permission_noop-attempt-2",
+  "toolInput": {
+    "command": "echo 'sha256:88463877a7a771229ceab72022104535e86e9fdb2d8f77ef6102de6b978377d7' >> /output/tool-invocations && touch sentinel-g0-v0-145-0-bash-native_permission_noop-attempt-2"
+  },
+  "toolName": "Bash",
+  "version": "0.145.0",
+  "withPreToolHook": true
+}

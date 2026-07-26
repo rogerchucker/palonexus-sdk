@@ -1,0 +1,6 @@
+{
+  "executableSha256": "sha256:29981b30e9d5f65843bc8fa1c012477290e7f1137674017420703f847c8d0b3e",
+  "sha256": "sha256:1301b1624c9ee89c41a501b77b95107a8dc3c8c285624d72edcda7921be6332e",
+  "size": 72136760,
+  "tarballUrl": "https://github.com/openai/codex/releases/download/rust-v0.124.0/codex-aarch64-unknown-linux-musl.tar.gz"
+}

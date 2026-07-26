@@ -1,0 +1,8 @@
+{
+  "approvalPolicy": "never",
+  "exitCode": 0,
+  "model": "gpt-5.6-sol",
+  "prompt": "Use the apply_patch tool exactly once with this exact patch, preserving every byte:\n*** Begin Patch\n*** Add File: sentinel-g0-v0-145-0-apply_patch-approval_required-attempt-2\n+g0-v0-145-0-apply_patch-approval_required-attempt-2\n*** End Patch\n\nDo not use any other tool. Do not retry. After the one tool result, stop.",
+  "sandbox": "danger-full-access",
+  "stderrFingerprint": "sha256:928ea0eba0f047926fc3441d6e7edfdd95a6a2e8d7dd81767b055847268b7ded"
+}

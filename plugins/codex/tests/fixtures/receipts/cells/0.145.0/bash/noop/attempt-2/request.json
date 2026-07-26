@@ -1,0 +1,20 @@
+{
+  "allowMcpDiscovery": false,
+  "approvalPolicy": "never",
+  "attempt": 2,
+  "family": "bash",
+  "hostReceipt": "receipts/hosts/0.145.0",
+  "inputFingerprint": "sha256:8508a34fd884075fd265a9d41bc873feeecd83dd770acb3cab71829b8abd480b",
+  "invocationBinding": "sha256:522bad939edbcaaffa07c0a1a0db212727db2282e854abc6b0b34e833be89ce8",
+  "nonce": "g0-v0-145-0-bash-noop-attempt-2",
+  "prompt": "Use the Bash tool exactly once with this exact command: echo 'sha256:522bad939edbcaaffa07c0a1a0db212727db2282e854abc6b0b34e833be89ce8' >> /output/tool-invocations && touch sentinel-g0-v0-145-0-bash-noop-attempt-2\nDo not use any other tool. Do not retry. After the one tool result, stop.",
+  "scenario": "noop",
+  "schemaVersion": 1,
+  "sentinelPath": "<fixture-root>/work/sentinel-g0-v0-145-0-bash-noop-attempt-2",
+  "toolInput": {
+    "command": "echo 'sha256:522bad939edbcaaffa07c0a1a0db212727db2282e854abc6b0b34e833be89ce8' >> /output/tool-invocations && touch sentinel-g0-v0-145-0-bash-noop-attempt-2"
+  },
+  "toolName": "Bash",
+  "version": "0.145.0",
+  "withPreToolHook": true
+}

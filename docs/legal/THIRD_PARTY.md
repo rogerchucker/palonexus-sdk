@@ -17,6 +17,16 @@ the repository's source and binary release process. Approval records must use
 Generated software bills of materials and license reports are release evidence,
 not substitutes for this review.
 
+## External compatibility evidence
+
+Gate 0 records facts about Codex releases and public host contracts from
+OpenAI's official documentation, GitHub releases, immutable source-schema
+permalinks, and release-archive digests. The repository stores only URLs,
+timestamps, digests, version identifiers, and short factual summaries. It does
+not redistribute OpenAI documentation, schemas, binaries, or release notes.
+Those external materials are capture inputs and verification evidence, not
+MIT-licensed contents of this repository.
+
 ## Dependency review inventory
 
 Versions are exact resolutions in `uv.lock`, including the Python build and

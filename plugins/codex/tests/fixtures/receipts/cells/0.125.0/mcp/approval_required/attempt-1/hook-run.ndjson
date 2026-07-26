@@ -1,0 +1,1 @@
+{"exitCode":0,"stderr":"","stdout":"{\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \"permissionDecision\": \"deny\", \"permissionDecisionReason\": \"PaloNexus approval apr_gate0_codex_01 required for g0-v0-125-0-mcp-approval_required-attempt-1; retry after approval\"}}\n","toolUseId":"sha256:fc4a3bca617ee91e3b50a56adfd301b195c496a93b02601baefcd3f2e9a94d03"}

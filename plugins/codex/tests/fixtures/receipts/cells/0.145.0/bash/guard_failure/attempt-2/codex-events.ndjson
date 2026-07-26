@@ -1,0 +1,7 @@
+{"thread_id":"sha256:d1beb7a1b625ba406d142a0915048acd228d797ec69cb4cd428249d6e3b357ca","type":"thread.started"}
+{"item":{"containsNonce":false,"id":"sha256:2f58b7d7725eac66c32ab446bb53a188688dc1d76fcc40cf31f5cf6509181ce8","messageFingerprint":"sha256:9ae0be6ab478140d49ffbed0007f7aaf3f1992c17dff23c3cb9fe2d7455cd7d8","type":"error"},"type":"item.completed"}
+{"item":{"containsNonce":false,"id":"sha256:32012c4c32888ee2c4ba4331e3c77ece9acd811a4b3abb708363123591abfea2","messageFingerprint":"sha256:9ae0be6ab478140d49ffbed0007f7aaf3f1992c17dff23c3cb9fe2d7455cd7d8","type":"error"},"type":"item.completed"}
+{"type":"turn.started"}
+{"item":{"containsNonce":false,"id":"sha256:6a9722cdf589a2a068832c955a8253b9df87983501c03dd92e95debae1f409da","textFingerprint":"sha256:b20ee096ba49a1dae42c380e115668136649227f0cb3e4cd380fa3d98ca0c210","type":"agent_message"},"type":"item.completed"}
+{"item":{"containsNonce":false,"id":"sha256:4a317b6972e2f1834050485420bd71fe6fc2d87cd25d572cb4b8b327b37bc030","textFingerprint":"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","type":"agent_message"},"type":"item.completed"}
+{"type":"turn.completed","usage":{"cache_write_input_tokens":0,"cached_input_tokens":0,"input_tokens":30440,"output_tokens":109,"reasoning_output_tokens":0}}

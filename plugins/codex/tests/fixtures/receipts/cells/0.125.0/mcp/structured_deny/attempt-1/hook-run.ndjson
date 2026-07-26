@@ -1,0 +1,1 @@
+{"exitCode":0,"stderr":"","stdout":"{\"hookSpecificOutput\": {\"hookEventName\": \"PreToolUse\", \"permissionDecision\": \"deny\", \"permissionDecisionReason\": \"PaloNexus fixture denial g0-v0-125-0-mcp-structured_deny-attempt-1\"}}\n","toolUseId":"sha256:a1fa112b60463f1eb7191d18283a483930b9276fce5f625b6ff3800e3b962361"}

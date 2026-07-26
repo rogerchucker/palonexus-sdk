@@ -1,0 +1,8 @@
+{
+  "dist": {
+    "integrity": "sha512-/PSPSFujjjmiyVFvG2yu/grOFhsWdokTH8t2KGWhXSo/M5n/dIDsnbsnO82/7bLtIoDuzQf7ATBUMWqPWQINlQ==",
+    "tarball": "https://registry.npmjs.org/@openai/codex/-/codex-0.145.0.tgz"
+  },
+  "name": "@openai/codex",
+  "version": "0.145.0"
+}

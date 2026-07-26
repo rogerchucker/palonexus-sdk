@@ -1,0 +1,20 @@
+{
+  "attemptedVersions": [
+    "0.124.0",
+    "0.125.0",
+    "0.145.0"
+  ],
+  "boundedRetryLimit": 2,
+  "candidateMcpComplete": {
+    "0.124.0": false,
+    "0.125.0": false
+  },
+  "exactMinimumCandidate": null,
+  "hostEvidenceFingerprints": {
+    "0.124.0": "sha256:57eebffed4c3be8e985893a89faa099c19060244784f4ac871b5a8d2ab35a3b2",
+    "0.125.0": "sha256:6903f110e4e8da43a379f5ff664a3605e4cf49ec7ea2282c0b4fb81a86a3854e",
+    "0.145.0": "sha256:386fef2f9027d6a76686581d3352a14d95a86d1de1c01a9efce16d1f99b123e7"
+  },
+  "latestMcpComplete": false,
+  "latestNonMcpComplete": false
+}

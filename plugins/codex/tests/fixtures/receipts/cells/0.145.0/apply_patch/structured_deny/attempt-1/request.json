@@ -1,0 +1,20 @@
+{
+  "allowMcpDiscovery": false,
+  "approvalPolicy": "never",
+  "attempt": 1,
+  "family": "apply_patch",
+  "hostReceipt": "receipts/hosts/0.145.0",
+  "inputFingerprint": "sha256:5feb2e94ab71abcec1d213b9baec7f9612d110e330f9da499de2207f90f4ec6f",
+  "invocationBinding": "sha256:cddd151c7f544ab82561322ff3ffccfd1e572756cb92d215d5fcd88fbd937828",
+  "nonce": "g0-v0-145-0-apply_patch-structured_deny-attempt-1",
+  "prompt": "Use the apply_patch tool exactly once with this exact patch, preserving every byte:\n*** Begin Patch\n*** Add File: sentinel-g0-v0-145-0-apply_patch-structured_deny-attempt-1\n+g0-v0-145-0-apply_patch-structured_deny-attempt-1\n*** End Patch\n\nDo not use any other tool. Do not retry. After the one tool result, stop.",
+  "scenario": "structured_deny",
+  "schemaVersion": 1,
+  "sentinelPath": "<fixture-root>/work/sentinel-g0-v0-145-0-apply_patch-structured_deny-attempt-1",
+  "toolInput": {
+    "command": "*** Begin Patch\n*** Add File: sentinel-g0-v0-145-0-apply_patch-structured_deny-attempt-1\n+g0-v0-145-0-apply_patch-structured_deny-attempt-1\n*** End Patch\n"
+  },
+  "toolName": "apply_patch",
+  "version": "0.145.0",
+  "withPreToolHook": true
+}

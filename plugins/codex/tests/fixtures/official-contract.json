@@ -1,0 +1,37 @@
+{
+  "blockingSemantics": {
+    "approvalRequiredRenderedAsDeny": false,
+    "exit2": false,
+    "noopPreservesNativePermissions": false,
+    "structuredDeny": false
+  },
+  "immutableSchemaSha256": "sha256:fabed428f0fe75767c5700208b166da5faef4e031d601dfc8bff2f96d340c682",
+  "immutableSchemaUrl": "https://raw.githubusercontent.com/openai/codex/25af12f7e61572b0bc18ddb1008be543b91519b0/codex-rs/hooks/schema/generated/pre-tool-use.command.input.schema.json",
+  "pluginContract": {
+    "disposition": "External factual evidence only; no OpenAI documentation text is redistributed.",
+    "sha256": "sha256:94185c0857ad59ba66dd47fb84852a1717c74ebdf84841071c1c60409afe71b0",
+    "url": "https://developers.openai.com/plugins/build/plugins"
+  },
+  "releaseEvidence": {
+    "basis": "Official hook availability begins with the 0.124.0 candidate. Receipt-derived executable tests of 0.124.0, 0.125.0, and 0.145.0 did not produce a complete structurally correlated blocking matrix.",
+    "latest": {
+      "releaseUrl": "https://github.com/openai/codex/releases/tag/rust-v0.145.0",
+      "tagCommit": "25af12f7e61572b0bc18ddb1008be543b91519b0"
+    },
+    "minimumCandidate": {
+      "baselineTested": true,
+      "hookMatrixTested": false,
+      "releaseUrl": "https://github.com/openai/codex/releases/tag/rust-v0.124.0",
+      "tagCommit": "e9fb49366c93a1478ec71cc41ecee415a197d036",
+      "version": "0.124.0"
+    },
+    "minimumTested": false,
+    "minimumVersion": null
+  },
+  "reproduction": "Fetch each URL at retrievedAt, compare SHA-256, verify the immutable schema permalink, then execute scripts/capture_codex_fixtures.py in the pinned envelope.",
+  "retrievedAt": "2026-07-26T17:33:25Z",
+  "sha256": "sha256:0280ab05780847b320513d91f2c93b7010822404a755c5b40cb0cc3f15571290",
+  "sourceCommit": "25af12f7e61572b0bc18ddb1008be543b91519b0",
+  "url": "https://developers.openai.com/codex/hooks",
+  "verifiedScope": "Only receipt-derived MCP no-op cells are accepted. Blocking hook receipts without a corresponding Codex JSONL tool-denial item do not satisfy Gate 0."
+}

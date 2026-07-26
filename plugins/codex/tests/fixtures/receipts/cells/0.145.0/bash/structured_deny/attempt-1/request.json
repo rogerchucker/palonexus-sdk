@@ -1,0 +1,20 @@
+{
+  "allowMcpDiscovery": false,
+  "approvalPolicy": "never",
+  "attempt": 1,
+  "family": "bash",
+  "hostReceipt": "receipts/hosts/0.145.0",
+  "inputFingerprint": "sha256:ea5e5cbeef6082048daf7a4dfbab5a3c1dc37b4f2e71cda666ace6fbf335db74",
+  "invocationBinding": "sha256:6b07085e4a1482bf910a6def76bd3ddf3454c710b878fd7a45452420c99a0987",
+  "nonce": "g0-v0-145-0-bash-structured_deny-attempt-1",
+  "prompt": "Use the Bash tool exactly once with this exact command: echo 'sha256:6b07085e4a1482bf910a6def76bd3ddf3454c710b878fd7a45452420c99a0987' >> /output/tool-invocations && touch sentinel-g0-v0-145-0-bash-structured_deny-attempt-1\nDo not use any other tool. Do not retry. After the one tool result, stop.",
+  "scenario": "structured_deny",
+  "schemaVersion": 1,
+  "sentinelPath": "<fixture-root>/work/sentinel-g0-v0-145-0-bash-structured_deny-attempt-1",
+  "toolInput": {
+    "command": "echo 'sha256:6b07085e4a1482bf910a6def76bd3ddf3454c710b878fd7a45452420c99a0987' >> /output/tool-invocations && touch sentinel-g0-v0-145-0-bash-structured_deny-attempt-1"
+  },
+  "toolName": "Bash",
+  "version": "0.145.0",
+  "withPreToolHook": true
+}

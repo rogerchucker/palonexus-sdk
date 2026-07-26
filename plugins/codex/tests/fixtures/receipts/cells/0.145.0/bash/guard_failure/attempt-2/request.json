@@ -1,0 +1,20 @@
+{
+  "allowMcpDiscovery": false,
+  "approvalPolicy": "never",
+  "attempt": 2,
+  "family": "bash",
+  "hostReceipt": "receipts/hosts/0.145.0",
+  "inputFingerprint": "sha256:7fe0808580178e33ea5dbbb13537ddadf3aa4edcfbf00613cb53e7d16b1ebc6e",
+  "invocationBinding": "sha256:594b8268b53aef315efbde656884f033879c7dd9f62bde43ddba874417f63a06",
+  "nonce": "g0-v0-145-0-bash-guard_failure-attempt-2",
+  "prompt": "Use the Bash tool exactly once with this exact command: echo 'sha256:594b8268b53aef315efbde656884f033879c7dd9f62bde43ddba874417f63a06' >> /output/tool-invocations && touch sentinel-g0-v0-145-0-bash-guard_failure-attempt-2\nDo not use any other tool. Do not retry. After the one tool result, stop.",
+  "scenario": "guard_failure",
+  "schemaVersion": 1,
+  "sentinelPath": "<fixture-root>/work/sentinel-g0-v0-145-0-bash-guard_failure-attempt-2",
+  "toolInput": {
+    "command": "echo 'sha256:594b8268b53aef315efbde656884f033879c7dd9f62bde43ddba874417f63a06' >> /output/tool-invocations && touch sentinel-g0-v0-145-0-bash-guard_failure-attempt-2"
+  },
+  "toolName": "Bash",
+  "version": "0.145.0",
+  "withPreToolHook": true
+}

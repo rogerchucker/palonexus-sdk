@@ -1,0 +1,20 @@
+{
+  "allowMcpDiscovery": false,
+  "approvalPolicy": "never",
+  "attempt": 2,
+  "family": "apply_patch",
+  "hostReceipt": "receipts/hosts/0.145.0",
+  "inputFingerprint": "sha256:f05909c1d0c85670bfd15726e883114b012364af21fe0bf4057571b129a0449a",
+  "invocationBinding": "sha256:b392ba457f5532f0b5a86764f03d718d2b67121be98fec192c96acf5be550f56",
+  "nonce": "g0-v0-145-0-apply_patch-exit_2-attempt-2",
+  "prompt": "Use the apply_patch tool exactly once with this exact patch, preserving every byte:\n*** Begin Patch\n*** Add File: sentinel-g0-v0-145-0-apply_patch-exit_2-attempt-2\n+g0-v0-145-0-apply_patch-exit_2-attempt-2\n*** End Patch\n\nDo not use any other tool. Do not retry. After the one tool result, stop.",
+  "scenario": "exit_2",
+  "schemaVersion": 1,
+  "sentinelPath": "<fixture-root>/work/sentinel-g0-v0-145-0-apply_patch-exit_2-attempt-2",
+  "toolInput": {
+    "command": "*** Begin Patch\n*** Add File: sentinel-g0-v0-145-0-apply_patch-exit_2-attempt-2\n+g0-v0-145-0-apply_patch-exit_2-attempt-2\n*** End Patch\n"
+  },
+  "toolName": "apply_patch",
+  "version": "0.145.0",
+  "withPreToolHook": true
+}

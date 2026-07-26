@@ -1,0 +1,4 @@
+{"thread_id":"sha256:ff8b646afd9d3699d0f3fc9a15278ab2a0b8de986a57e4746122ff163ca89ccd","type":"thread.started"}
+{"type":"turn.started"}
+{"item":{"containsNonce":false,"id":"sha256:2f58b7d7725eac66c32ab446bb53a188688dc1d76fcc40cf31f5cf6509181ce8","textFingerprint":"sha256:e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855","type":"agent_message"},"type":"item.completed"}
+{"type":"turn.completed","usage":{"cached_input_tokens":31872,"input_tokens":36456,"output_tokens":216,"reasoning_output_tokens":134}}
