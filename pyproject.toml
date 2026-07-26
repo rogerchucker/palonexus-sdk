@@ -5,9 +5,11 @@ members = ["python"]
 dev = [
   "hatch-vcs>=0.4",
   "hatchling>=1.27",
+  "idna==3.18",
   "jsonschema>=4.25",
   "pytest>=8.4",
   "ruff>=0.12",
+  "unicodedata2==15.1.0",
 ]
 
 [tool.pytest.ini_options]

@@ -1,0 +1,48 @@
+{
+  "canonicalizationVersion": "1",
+  "case": "unicode-equivalence",
+  "contract": "pinned Unicode NFC and scalar ordering across every resource family",
+  "expected": {
+    "canonicalUtf8": "{\"z\":1,\"é\":\"Café\"}",
+    "hash": "sha256:3846a27af5e657a6103635105dce86a0fabfe325422f4843e80a09e500f49364",
+    "jsonEqual": true,
+    "mcpEqual": true,
+    "mcpResources": [
+      "mcp:github/issues.create#sha256:15ab0d1e971829fbacbf454505af9ab6aa87c6141d318ce2b34bd981c48b7015",
+      "mcp:github/issues.create#sha256:15ab0d1e971829fbacbf454505af9ab6aa87c6141d318ce2b34bd981c48b7015"
+    ],
+    "pathEqual": true,
+    "pathExecutions": [
+      "/workspace/Café/résumé.txt",
+      "/workspace/Café/résumé.txt"
+    ],
+    "scalarOrderCanonical": "{\"\":1,\"𐀀\":2}",
+    "shellExecutions": [
+      "printf 'Café'",
+      "printf 'Café'"
+    ],
+    "shellResourcesEqual": true,
+    "urlEqual": true,
+    "urlExecutions": [
+      "https://example.com/Caf%C3%A9?q=r%C3%A9sum%C3%A9",
+      "https://example.com/Caf%C3%A9?q=r%C3%A9sum%C3%A9"
+    ]
+  },
+  "inputs": {
+    "cwd": "/workspace",
+    "leftJson": "{\"e\\u0301\":\"Cafe\\u0301\",\"z\":1}",
+    "mcpLeftJson": "{\"title\":\"Café\",\"nested\":{\"b\":2,\"a\":1}}",
+    "mcpRightJson": "{\"nested\":{\"a\":1.0,\"b\":2},\"title\":\"Cafe\\u0301\"}",
+    "mcpServer": "github",
+    "mcpTool": "issues.create",
+    "pathNfc": "Café/résumé.txt",
+    "pathNfd": "Café/résumé.txt",
+    "rightJson": "{\"z\":1.0,\"\\u00e9\":\"Caf\\u00e9\"}",
+    "scalarOrderJson": "{\"\\ud800\\udc00\":2,\"\\ue000\":1}",
+    "shellNfc": "printf 'Café'",
+    "shellNfd": "printf 'Café'",
+    "urlNfc": "https://example.com/Caf%C3%A9?q=r%C3%A9sum%C3%A9",
+    "urlNfd": "https://example.com/Cafe%CC%81?q=re%CC%81sume%CC%81"
+  },
+  "status": "draft-pending-gate-0"
+}

@@ -18,8 +18,8 @@
   "target": {
     "kind": "local-action",
     "service": "workspace",
-    "resource": "workspace:/deploy/production.yaml",
-    "resourceHash": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+    "resource": "path:/workspace/deploy/production.yaml",
+    "resourceHash": "sha256:7fcdf880e7ace656f9936da7c355726f97ca513c61896ad04d20aa87f1322b81"
   },
   "sideEffect": "write",
   "occurredAt": "2026-07-25T20:00:00Z",

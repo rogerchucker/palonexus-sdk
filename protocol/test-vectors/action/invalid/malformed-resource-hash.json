@@ -17,7 +17,7 @@
   "target": {
     "kind": "local-action",
     "service": "workspace",
-    "resource": "workspace:/deploy/production.yaml",
+    "resource": "path:/workspace/deploy/production.yaml",
     "resourceHash": "sha256:not-a-digest"
   },
   "sideEffect": "write",

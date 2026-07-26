@@ -1,0 +1,17 @@
+{
+  "canonicalizationVersion": "1",
+  "case": "missing-vs-null",
+  "contract": "absent object values are omitted; explicit null remains in scope",
+  "expected": {
+    "equal": false,
+    "missingCanonical": "{\"required\":\"value\"}",
+    "missingHash": "sha256:a89ea53eb2efd3e67b195f64359dbf0b07780d755d45d677cd266faba68f1396",
+    "nullCanonical": "{\"optional\":null,\"required\":\"value\"}",
+    "nullHash": "sha256:183025dd6d54444144db0db23bd89b5f046f117568519e9ed7141db529622d6b"
+  },
+  "inputs": {
+    "missingJson": "{\"required\":\"value\"}",
+    "nullJson": "{\"required\":\"value\",\"optional\":null}"
+  },
+  "status": "draft-pending-gate-0"
+}

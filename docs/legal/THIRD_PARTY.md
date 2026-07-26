@@ -17,6 +17,12 @@ the repository's source and binary release process. Approval records must use
 Generated software bills of materials and license reports are release evidence,
 not substitutes for this review.
 
+The protocol version 1 canonicalization reference pins `unicodedata2` so Python
+3.12, Python 3.13, and later runtimes use the same Unicode 15.1.0 normalization
+tables. It pins `idna` for strict IDNA2008 A-label validation without UTS 46
+mapping. The exact package versions and supplied licenses were reviewed; the
+reference otherwise uses the Python standard library.
+
 ## Dependency review inventory
 
 Versions are exact resolutions in `uv.lock`, including the Python build and
@@ -44,6 +50,7 @@ locked distribution without contacting the network.
 | colorama | 0.4.6 | BSD-3-Clause | reviewed | Retain notices | None identified | PyPI |
 | hatch-vcs | 0.5.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | hatchling | 1.31.0 | MIT | reviewed | Retain notices | None identified | PyPI |
+| idna | 3.18 | BSD-3-Clause | reviewed | Retain license and notices | None supplied | PyPI |
 | iniconfig | 2.3.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | jsonschema | 4.26.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | jsonschema-specifications | 2025.9.1 | MIT | reviewed | Retain notices | None identified | PyPI |
@@ -59,5 +66,6 @@ locked distribution without contacting the network.
 | setuptools-scm | 10.2.1 | MIT | reviewed | Retain notices | None identified | PyPI |
 | trove-classifiers | 2026.6.1.19 | Apache-2.0 | reviewed | Retain notices | Include supplied NOTICE | PyPI |
 | typing-extensions | 4.16.0 | PSF-2.0 | reviewed | Retain notices | None identified | PyPI |
+| unicodedata2 | 15.1.0 | Apache-2.0 | reviewed | Retain license and notices | None supplied | PyPI |
 | vcs-versioning | 2.2.2 | MIT | reviewed | Retain notices | None identified | PyPI |
 <!-- dependency-inventory:end -->

@@ -1,0 +1,41 @@
+{
+  "canonicalizationVersion": "1",
+  "case": "shell-redaction-collision-resistance",
+  "contract": "safe tokens redact known secrets; full normalized command hash binds scope",
+  "expected": {
+    "differentCommandHashes": true,
+    "first": {
+      "commandHash": "sha256:cb48c8d9b796578f503e3643fcb84944aaa2d85294ba8281d6e4867ca6d46010",
+      "tokens": [
+        "deploy",
+        "--tenant-secret",
+        "[REDACTED]",
+        "TENANT_SECRET=[REDACTED]",
+        "--tenant-secret=[REDACTED]",
+        "--token",
+        "[REDACTED]"
+      ]
+    },
+    "sameRedactedTokens": true,
+    "second": {
+      "commandHash": "sha256:8162e5f18d705b6e637e9b6bd4e5cacf321e212caf7fd8dd15db96145a39711e",
+      "tokens": [
+        "deploy",
+        "--tenant-secret",
+        "[REDACTED]",
+        "TENANT_SECRET=[REDACTED]",
+        "--tenant-secret=[REDACTED]",
+        "--token",
+        "[REDACTED]"
+      ]
+    }
+  },
+  "inputs": {
+    "additionalSensitiveNames": [
+      "tenant_secret"
+    ],
+    "first": "deploy --tenant-secret alpha TENANT_SECRET=bravo --tenant-secret=charlie --token mandatory",
+    "second": "deploy --tenant-secret delta TENANT_SECRET=echo --tenant-secret=foxtrot --token changed"
+  },
+  "status": "draft-pending-gate-0"
+}

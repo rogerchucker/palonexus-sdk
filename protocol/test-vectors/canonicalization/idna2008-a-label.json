@@ -1,0 +1,32 @@
+{
+  "canonicalizationVersion": "1",
+  "case": "idna2008-a-label",
+  "contract": "strict IDNA2008 A-label validation without UTS 46 mapping",
+  "expected": {
+    "canonical": [
+      "https://example.com/",
+      "https://xn--bcher-kva.example/",
+      "https://xn--8g0n.example/"
+    ],
+    "rejectedErrorCodes": [
+      "invalid_url_host",
+      "invalid_url_host",
+      "invalid_url_host",
+      "invalid_url_host"
+    ]
+  },
+  "inputs": {
+    "accepted": [
+      "https://example.com/",
+      "https://XN--BCHER-KVA.example/",
+      "https://xn--8g0n.example/"
+    ],
+    "rejected": [
+      "https://xn--a.example/",
+      "https://xn--0.example/",
+      "https://xn--a-ecp.example/",
+      "https://xn--1ug.example/"
+    ]
+  },
+  "status": "draft-pending-gate-0"
+}

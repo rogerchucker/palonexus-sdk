@@ -1,0 +1,133 @@
+{
+  "canonicalizationVersion": "1",
+  "case": "adapter-client-trust-boundary",
+  "contract": "diagnostic adapter binds client scope; trusted clientId is server-only",
+  "expected": {
+    "authoritativeScopeHash": "sha256:151f561d288c29d2463d7979eb4965f67c4af70f3bdc5e5d1c2ebebdae408b60",
+    "authoritativeScopeInput": {
+      "clientScope": {
+        "action": "file:write",
+        "adapter": {
+          "id": "codex",
+          "version": "0.2.0-alpha.1"
+        },
+        "scopeType": "client",
+        "scopeVersion": "1",
+        "sideEffect": "write",
+        "target": {
+          "kind": "local-action",
+          "resourceHash": "sha256:7fcdf880e7ace656f9936da7c355726f97ca513c61896ad04d20aa87f1322b81",
+          "service": "workspace"
+        },
+        "task": {
+          "sessionId": "session_01J5ABCDEFGHJKMNPQRSTVWXY0",
+          "taskId": "task_01J5ABCDEFGHJKMNPQRSTVWXY0"
+        }
+      },
+      "scopeType": "authoritative",
+      "scopeVersion": "1",
+      "trusted": {
+        "actorId": "subject_example",
+        "agentId": "agent_example",
+        "clientId": "registered-codex",
+        "delegationId": "delegation_example",
+        "tenantId": "tenant_example"
+      }
+    },
+    "changedAdapterClientScopeHash": "sha256:34410f354ac4136b28d7d457af33db042a653daac7c50f6891a71ef8bec73445",
+    "changedTrustedClientAuthoritativeScopeHash": "sha256:dd34cafaec6b93e57ff38085420703b51ca285fd289d255296504ab7262bb23c",
+    "clientScopeHash": "sha256:4b17607bdbf139c235cf7156a171225945a4736e9e733267a324d58574533b2e",
+    "clientScopeInput": {
+      "action": "file:write",
+      "adapter": {
+        "id": "codex",
+        "version": "0.2.0-alpha.1"
+      },
+      "scopeType": "client",
+      "scopeVersion": "1",
+      "sideEffect": "write",
+      "target": {
+        "kind": "local-action",
+        "resourceHash": "sha256:7fcdf880e7ace656f9936da7c355726f97ca513c61896ad04d20aa87f1322b81",
+        "service": "workspace"
+      },
+      "task": {
+        "sessionId": "session_01J5ABCDEFGHJKMNPQRSTVWXY0",
+        "taskId": "task_01J5ABCDEFGHJKMNPQRSTVWXY0"
+      }
+    }
+  },
+  "inputs": {
+    "action": {
+      "action": "file:write",
+      "actionId": "act_01J5ABCDEFGHJKMNPQRSTVWXY0",
+      "adapter": {
+        "hostVersion": "0.145.0",
+        "id": "codex",
+        "version": "0.2.0-alpha.1"
+      },
+      "context": {
+        "toolName": "apply_patch"
+      },
+      "correlationId": "corr_01J5ABCDEFGHJKMNPQRSTVWXY0",
+      "idempotencyKey": "authz_01J5ABCDEFGHJKMNPQRSTVWXY0",
+      "occurredAt": "2026-07-25T20:00:00Z",
+      "requestId": "req_01J5ABCDEFGHJKMNPQRSTVWXY0",
+      "schemaVersion": "1",
+      "sideEffect": "write",
+      "target": {
+        "kind": "local-action",
+        "resource": "path:/workspace/deploy/production.yaml",
+        "resourceHash": "sha256:7fcdf880e7ace656f9936da7c355726f97ca513c61896ad04d20aa87f1322b81",
+        "service": "workspace"
+      },
+      "task": {
+        "sessionId": "session_01J5ABCDEFGHJKMNPQRSTVWXY0",
+        "taskId": "task_01J5ABCDEFGHJKMNPQRSTVWXY0"
+      }
+    },
+    "adapterMutation": {
+      "action": "file:write",
+      "actionId": "act_01J5ABCDEFGHJKMNPQRSTVWXY0",
+      "adapter": {
+        "hostVersion": "0.145.0",
+        "id": "claude-code",
+        "version": "0.2.0-alpha.1"
+      },
+      "context": {
+        "toolName": "apply_patch"
+      },
+      "correlationId": "corr_01J5ABCDEFGHJKMNPQRSTVWXY0",
+      "idempotencyKey": "authz_01J5ABCDEFGHJKMNPQRSTVWXY0",
+      "occurredAt": "2026-07-25T20:00:00Z",
+      "requestId": "req_01J5ABCDEFGHJKMNPQRSTVWXY0",
+      "schemaVersion": "1",
+      "sideEffect": "write",
+      "target": {
+        "kind": "local-action",
+        "resource": "path:/workspace/deploy/production.yaml",
+        "resourceHash": "sha256:7fcdf880e7ace656f9936da7c355726f97ca513c61896ad04d20aa87f1322b81",
+        "service": "workspace"
+      },
+      "task": {
+        "sessionId": "session_01J5ABCDEFGHJKMNPQRSTVWXY0",
+        "taskId": "task_01J5ABCDEFGHJKMNPQRSTVWXY0"
+      }
+    },
+    "trusted": {
+      "actorId": "subject_example",
+      "agentId": "agent_example",
+      "clientId": "registered-codex",
+      "delegationId": "delegation_example",
+      "tenantId": "tenant_example"
+    },
+    "trustedClientMutation": {
+      "actorId": "subject_example",
+      "agentId": "agent_example",
+      "clientId": "registered-claude",
+      "delegationId": "delegation_example",
+      "tenantId": "tenant_example"
+    }
+  },
+  "status": "draft-pending-gate-0"
+}

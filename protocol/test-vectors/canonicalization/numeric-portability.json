@@ -1,0 +1,36 @@
+{
+  "canonicalizationVersion": "1",
+  "case": "numeric-portability",
+  "contract": "exact raw decimals normalize and concrete invalid forms fail closed",
+  "expected": {
+    "canonical": [
+      "1.23",
+      "1000",
+      "0",
+      "0.001"
+    ],
+    "rejectedErrorCodes": [
+      "non_finite_number",
+      "number_out_of_range",
+      "number_out_of_range",
+      "number_too_precise",
+      "number_out_of_range"
+    ]
+  },
+  "inputs": {
+    "acceptedJson": [
+      "1.2300",
+      "1e3",
+      "-0.000",
+      "1e-3"
+    ],
+    "rejectedJson": [
+      "NaN",
+      "1e309",
+      "1e-309",
+      "1.22222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222222",
+      "1e999999999999999999999999999999999999"
+    ]
+  },
+  "status": "draft-pending-gate-0"
+}

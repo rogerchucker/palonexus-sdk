@@ -1,0 +1,19 @@
+{
+  "canonicalizationVersion": "1",
+  "case": "mcp-nested-json",
+  "contract": "server-qualified tool plus canonical nested JSON input hash",
+  "expected": {
+    "equal": true,
+    "leftCanonicalInput": "{\"issue\":{\"priority\":1,\"title\":\"Café\"},\"labels\":[\"security\",\"agent\"]}",
+    "leftResource": "mcp:github/issues.create#sha256:d7a5ab6559d5c4c9c8214b30cb0197d0a21dd025bc0d51e6d9886c8ac1b5e4af",
+    "rightCanonicalInput": "{\"issue\":{\"priority\":1,\"title\":\"Café\"},\"labels\":[\"security\",\"agent\"]}",
+    "rightResource": "mcp:github/issues.create#sha256:d7a5ab6559d5c4c9c8214b30cb0197d0a21dd025bc0d51e6d9886c8ac1b5e4af"
+  },
+  "inputs": {
+    "leftJson": "{\"labels\":[\"security\",\"agent\"],\"issue\":{\"title\":\"Cafe\\u0301\",\"priority\":1.0}}",
+    "rightJson": "{\"issue\":{\"priority\":1,\"title\":\"Café\"},\"labels\":[\"security\",\"agent\"]}",
+    "server": "github",
+    "tool": "issues.create"
+  },
+  "status": "draft-pending-gate-0"
+}

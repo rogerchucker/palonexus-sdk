@@ -17,8 +17,8 @@
   "target": {
     "kind": "mcp-tool",
     "service": "github",
-    "resource": "mcp:github/issues.create#sha256:2222222222222222222222222222222222222222222222222222222222222222",
-    "resourceHash": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+    "resource": "mcp:github/issues.create#sha256:d7a5ab6559d5c4c9c8214b30cb0197d0a21dd025bc0d51e6d9886c8ac1b5e4af",
+    "resourceHash": "sha256:b74df4fefcd5886bc9a8c79ec31b6b74df2080f2bca5ba84d84653612a283d1a"
   },
   "sideEffect": "external",
   "occurredAt": "2026-07-25T20:01:00Z",

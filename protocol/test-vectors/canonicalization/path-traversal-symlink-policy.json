@@ -1,0 +1,55 @@
+{
+  "canonicalizationVersion": "1",
+  "case": "path-traversal-symlink-policy",
+  "contract": "absolute POSIX lexical scope; no symlink or filesystem resolution",
+  "expected": {
+    "canonical": [
+      "/workspace/project/deploy/production.yaml",
+      "/shared/policy.rego",
+      "/workspace/secret.txt"
+    ],
+    "collisions": [
+      {
+        "equal": true,
+        "left": "/workspace/target.txt",
+        "right": "/workspace/target.txt"
+      },
+      {
+        "equal": true,
+        "left": "/workspace/Café.txt",
+        "right": "/workspace/Café.txt"
+      }
+    ],
+    "executorMustUseCanonical": true,
+    "physicalTargetClaimed": false
+  },
+  "inputs": {
+    "cases": [
+      {
+        "cwd": "/workspace/project",
+        "path": "src/../deploy/./production.yaml"
+      },
+      {
+        "cwd": "/workspace/project",
+        "path": "../../shared/policy.rego"
+      },
+      {
+        "cwd": "/workspace/project",
+        "path": "/workspace/link/../secret.txt"
+      }
+    ],
+    "collisionPairs": [
+      {
+        "cwd": "/workspace",
+        "left": "link/../target.txt",
+        "right": "target.txt"
+      },
+      {
+        "cwd": "/workspace",
+        "left": "Café.txt",
+        "right": "Café.txt"
+      }
+    ]
+  },
+  "status": "draft-pending-gate-0"
+}

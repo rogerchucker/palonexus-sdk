@@ -1,0 +1,18 @@
+{
+  "canonicalizationVersion": "1",
+  "case": "duplicate-keys",
+  "contract": "duplicate object keys fail after NFC normalization",
+  "expected": {
+    "errorCodes": [
+      "duplicate_key",
+      "duplicate_key"
+    ]
+  },
+  "inputs": {
+    "rawJson": [
+      "{\"scope\":1,\"scope\":2}",
+      "{\"e\\u0301\":1,\"\\u00e9\":2}"
+    ]
+  },
+  "status": "draft-pending-gate-0"
+}

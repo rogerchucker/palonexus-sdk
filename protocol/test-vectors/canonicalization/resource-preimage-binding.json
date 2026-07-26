@@ -1,0 +1,37 @@
+{
+  "canonicalizationVersion": "1",
+  "case": "resource-preimage-binding",
+  "contract": "typed resource preimage rejects a resource mutation with a stale hash",
+  "expected": {
+    "mutationErrorCode": "resource_hash_mismatch",
+    "preimage": {
+      "kind": "local-action",
+      "preimageType": "palonexus.resource",
+      "preimageVersion": "1",
+      "resource": "path:/workspace/deploy/production.yaml",
+      "service": "workspace"
+    },
+    "resourceHash": "sha256:7fcdf880e7ace656f9936da7c355726f97ca513c61896ad04d20aa87f1322b81",
+    "validatedTarget": {
+      "kind": "local-action",
+      "resource": "path:/workspace/deploy/production.yaml",
+      "resourceHash": "sha256:7fcdf880e7ace656f9936da7c355726f97ca513c61896ad04d20aa87f1322b81",
+      "service": "workspace"
+    }
+  },
+  "inputs": {
+    "resourceMutation": {
+      "kind": "local-action",
+      "resource": "path:/workspace/deploy/staging.yaml",
+      "resourceHash": "sha256:7fcdf880e7ace656f9936da7c355726f97ca513c61896ad04d20aa87f1322b81",
+      "service": "workspace"
+    },
+    "target": {
+      "kind": "local-action",
+      "resource": "path:/workspace/deploy/production.yaml",
+      "resourceHash": "sha256:7fcdf880e7ace656f9936da7c355726f97ca513c61896ad04d20aa87f1322b81",
+      "service": "workspace"
+    }
+  },
+  "status": "draft-pending-gate-0"
+}
