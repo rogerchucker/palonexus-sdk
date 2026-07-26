@@ -1,0 +1,138 @@
+{
+  "now": "2026-07-25T20:00:09Z",
+  "limit": 4,
+  "records": [
+    {
+      "schemaVersion": "1",
+      "reconciliationId": "recon_01J5ABCDEFGHJKMNPQRSTVWXY0",
+      "actionId": "act_01J5ABCDEFGHJKMNPQRSTVWXY0",
+      "requestId": "req_01J5ABCDEFGHJKMNPQRSTVWXY0",
+      "decisionId": "dec_01J5ABCDEFGHJKMNPQRSTVWXY0",
+      "correlationId": "corr_01J5ABCDEFGHJKMNPQRSTVWXY0",
+      "authorizationIdempotencyKey": "authz_01J5ABCDEFGHJKMNPQRSTVWXY0",
+      "clientId": "registered-codex",
+      "action": "file:write",
+      "targetKind": "local-action",
+      "clientScopeHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "authoritativeScopeHash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "outcome": "allow",
+      "reasonCode": "policy_allowed",
+      "observedAt": "2026-07-25T20:00:02Z",
+      "batchId": "batch_01J5ABCDEFGHJKMNPQRSTVWXY0",
+      "batchSequence": 0,
+      "deliveryPolicy": {
+        "maxAttempts": 3,
+        "maxTotalAttempts": 5,
+        "baseDelaySeconds": 5,
+        "maxDelaySeconds": 60
+      },
+      "attemptCount": 1,
+      "lastAttemptAt": "2026-07-25T20:00:03Z",
+      "deliveryDisposition": "automatic",
+      "state": "acknowledged",
+      "acknowledgedAt": "2026-07-25T20:00:05Z",
+      "acknowledgement": {
+        "receiptId": "receipt_01J5ABCDEFGHJKMNPQRSTVWXY0",
+        "reconciliationId": "recon_01J5ABCDEFGHJKMNPQRSTVWXY0",
+        "evidenceHash": "sha256:ef28a07d036d06a118e72c15fe30347821a29f4e845769fee1f8e18c3ef11238",
+        "acknowledgedAt": "2026-07-25T20:00:05Z"
+      }
+    },
+    {
+      "schemaVersion": "1",
+      "reconciliationId": "recon_01J5ABCDEFGHJKMNPQRSTVWXY1",
+      "actionId": "act_01J5ABCDEFGHJKMNPQRSTVWXY1",
+      "requestId": "req_01J5ABCDEFGHJKMNPQRSTVWXY1",
+      "decisionId": "dec_01J5ABCDEFGHJKMNPQRSTVWXY1",
+      "correlationId": "corr_01J5ABCDEFGHJKMNPQRSTVWXY1",
+      "authorizationIdempotencyKey": "authz_01J5ABCDEFGHJKMNPQRSTVWXY1",
+      "clientId": "registered-codex",
+      "action": "file:write",
+      "targetKind": "local-action",
+      "clientScopeHash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+      "authoritativeScopeHash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
+      "outcome": "allow",
+      "reasonCode": "policy_allowed",
+      "observedAt": "2026-07-25T20:00:03Z",
+      "batchId": "batch_01J5ABCDEFGHJKMNPQRSTVWXY0",
+      "batchSequence": 1,
+      "deliveryPolicy": {
+        "maxAttempts": 3,
+        "maxTotalAttempts": 5,
+        "baseDelaySeconds": 5,
+        "maxDelaySeconds": 60
+      },
+      "attemptCount": 0,
+      "deliveryDisposition": "automatic",
+      "state": "pending"
+    },
+    {
+      "schemaVersion": "1",
+      "reconciliationId": "recon_01J5ABCDEFGHJKMNPQRSTVWXY2",
+      "actionId": "act_01J5ABCDEFGHJKMNPQRSTVWXY2",
+      "requestId": "req_01J5ABCDEFGHJKMNPQRSTVWXY2",
+      "decisionId": "dec_01J5ABCDEFGHJKMNPQRSTVWXY2",
+      "correlationId": "corr_01J5ABCDEFGHJKMNPQRSTVWXY2",
+      "authorizationIdempotencyKey": "authz_01J5ABCDEFGHJKMNPQRSTVWXY2",
+      "clientId": "registered-claude-code",
+      "action": "mcp:call",
+      "targetKind": "mcp-tool",
+      "clientScopeHash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
+      "authoritativeScopeHash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
+      "outcome": "deny",
+      "reasonCode": "policy_denied",
+      "observedAt": "2026-07-25T20:00:04Z",
+      "batchId": "batch_01J5ABCDEFGHJKMNPQRSTVWXY0",
+      "batchSequence": 2,
+      "deliveryPolicy": {
+        "maxAttempts": 3,
+        "maxTotalAttempts": 5,
+        "baseDelaySeconds": 5,
+        "maxDelaySeconds": 60
+      },
+      "attemptCount": 1,
+      "lastAttemptAt": "2026-07-25T20:00:04Z",
+      "nextAttemptAt": "2026-07-25T20:00:09Z",
+      "deliveryDisposition": "automatic",
+      "state": "retry_wait"
+    },
+    {
+      "schemaVersion": "1",
+      "reconciliationId": "recon_01J5ABCDEFGHJKMNPQRSTVWXY3",
+      "actionId": "act_01J5ABCDEFGHJKMNPQRSTVWXY3",
+      "requestId": "req_01J5ABCDEFGHJKMNPQRSTVWXY3",
+      "decisionId": "dec_01J5ABCDEFGHJKMNPQRSTVWXY3",
+      "correlationId": "corr_01J5ABCDEFGHJKMNPQRSTVWXY3",
+      "authorizationIdempotencyKey": "authz_01J5ABCDEFGHJKMNPQRSTVWXY3",
+      "clientId": "registered-codex",
+      "action": "tool:invoke",
+      "targetKind": "tool",
+      "clientScopeHash": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
+      "authoritativeScopeHash": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
+      "outcome": "approval_required",
+      "reasonCode": "approval_required",
+      "observedAt": "2026-07-25T20:00:05Z",
+      "batchId": "batch_01J5ABCDEFGHJKMNPQRSTVWXY0",
+      "batchSequence": 3,
+      "deliveryPolicy": {
+        "maxAttempts": 3,
+        "maxTotalAttempts": 5,
+        "baseDelaySeconds": 5,
+        "maxDelaySeconds": 60
+      },
+      "attemptCount": 0,
+      "deliveryDisposition": "automatic",
+      "state": "pending"
+    }
+  ],
+  "expectedSequences": [
+    1,
+    2,
+    3
+  ],
+  "expectedReconciliationIds": [
+    "recon_01J5ABCDEFGHJKMNPQRSTVWXY1",
+    "recon_01J5ABCDEFGHJKMNPQRSTVWXY2",
+    "recon_01J5ABCDEFGHJKMNPQRSTVWXY3"
+  ]
+}

@@ -1,0 +1,28 @@
+{
+  "schemaVersion": "1",
+  "reconciliationId": "recon_01J5ABCDEFGHJKMNPQRSTVWXY0",
+  "actionId": "act_01J5ABCDEFGHJKMNPQRSTVWXY0",
+  "requestId": "req_01J5ABCDEFGHJKMNPQRSTVWXY0",
+  "decisionId": "dec_01J5ABCDEFGHJKMNPQRSTVWXY0",
+  "correlationId": "corr_01J5ABCDEFGHJKMNPQRSTVWXY0",
+  "authorizationIdempotencyKey": "authz_01J5ABCDEFGHJKMNPQRSTVWXY0",
+  "clientId": "registered-codex",
+  "action": "file:write",
+  "targetKind": "local-action",
+  "clientScopeHash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "authoritativeScopeHash": "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "outcome": "allow",
+  "reasonCode": "policy_allowed",
+  "observedAt": "2026-07-25T20:00:02Z",
+  "batchId": "batch_01J5ABCDEFGHJKMNPQRSTVWXY0",
+  "batchSequence": 0,
+  "deliveryPolicy": {
+    "maxAttempts": 3,
+    "maxTotalAttempts": 5,
+    "baseDelaySeconds": 5,
+    "maxDelaySeconds": 60
+  },
+  "attemptCount": 0,
+  "deliveryDisposition": "automatic",
+  "state": "pending"
+}
