@@ -17,6 +17,13 @@ the repository's source and binary release process. Approval records must use
 Generated software bills of materials and license reports are release evidence,
 not substitutes for this review.
 
+Protocol type generation uses the Python standard library, the reviewed and
+locked JSON Schema validator for Draft 2020-12 meta-schema checks, the reviewed
+and locked Ruff formatter, and `gofmt` from the Go 1.25 baseline declared in
+`go.mod`. The generated Python and Go DTOs add no runtime package dependency.
+Their stable headers bind each output to the generator version and the SHA-256
+digest of all source schemas.
+
 The protocol version 1 canonicalization reference pins `unicodedata2` so Python
 3.12, Python 3.13, and later runtimes use the same Unicode 15.1.0 normalization
 tables. It pins `idna` for strict IDNA2008 A-label validation without UTS 46

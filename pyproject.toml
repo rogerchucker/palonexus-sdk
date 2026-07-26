@@ -15,3 +15,18 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["foundation_tests", "protocol/tests", "python/tests"]
+
+[tool.palonexus.protocol-generation]
+generator-version = "2"
+schemas = [
+  "protocol/schemas/common-v1.schema.json",
+  "protocol/schemas/action-v1.schema.json",
+  "protocol/schemas/decision-v1.schema.json",
+  "protocol/schemas/approval-v1.schema.json",
+  "protocol/schemas/error-v1.schema.json",
+  "protocol/schemas/reconciliation-v1.schema.json",
+]
+outputs = [
+  "python/src/palonexus/_generated/protocol.py",
+  "guard/pkg/protocol/generated.go",
+]
