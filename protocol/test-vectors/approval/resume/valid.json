@@ -1,0 +1,32 @@
+{
+  "schemaVersion": "1",
+  "actionId": "act_01J5ABCDEFGHJKMNPQRSTVWXY2",
+  "requestId": "req_01J5ABCDEFGHJKMNPQRSTVWXY4",
+  "correlationId": "corr_01J5ABCDEFGHJKMNPQRSTVWXY2",
+  "causationId": "dec_01J5ABCDEFGHJKMNPQRSTVWXY3",
+  "resumeFromApprovalId": "apr_01J5ABCDEFGHJKMNPQRSTVWXY2",
+  "idempotencyKey": "authz_01J5ABCDEFGHJKMNPQRSTVWXY4",
+  "adapter": {
+    "id": "codex",
+    "version": "0.2.0-alpha.1",
+    "hostVersion": "0.145.0"
+  },
+  "task": {
+    "taskId": "task_01J5ABCDEFGHJKMNPQRSTVWXY2",
+    "sessionId": "session_01J5ABCDEFGHJKMNPQRSTVWXY2"
+  },
+  "action": "file:write",
+  "target": {
+    "kind": "local-action",
+    "service": "workspace",
+    "resource": "path:/workspace/deploy/production.yaml",
+    "resourceHash": "sha256:7fcdf880e7ace656f9936da7c355726f97ca513c61896ad04d20aa87f1322b81"
+  },
+  "sideEffect": "write",
+  "occurredAt": "2026-07-25T20:05:01Z",
+  "context": {
+    "cwd": "/workspace",
+    "repository": "example/service",
+    "toolName": "apply_patch"
+  }
+}

@@ -1,0 +1,9 @@
+{
+  "schemaVersion": "1",
+  "code": "authorization_unavailable",
+  "safeMessage": "Authorization is temporarily unavailable.",
+  "retryable": true,
+  "actionId": "act_01J5ABCDEFGHJKMNPQRSTVWXY2",
+  "requestId": "req_01J5ABCDEFGHJKMNPQRSTVWXY4",
+  "correlationId": "corr_01J5ABCDEFGHJKMNPQRSTVWXY2"
+}

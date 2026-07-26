@@ -36,6 +36,10 @@
     "causationId": {
       "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/causationId"
     },
+    "resumeFromApprovalId": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/approvalId",
+      "description": "The approved record resumed by this fresh authorization attempt."
+    },
     "idempotencyKey": {
       "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/idempotencyKey"
     },

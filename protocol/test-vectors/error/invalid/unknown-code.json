@@ -1,0 +1,6 @@
+{
+  "schemaVersion": "1",
+  "code": "server_said_no",
+  "safeMessage": "The request failed.",
+  "retryable": false
+}

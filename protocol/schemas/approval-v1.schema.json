@@ -1,0 +1,202 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palonexus.dev/protocol/v1/approval-v1.schema.json",
+  "title": "PaloNexus approval record version 1",
+  "description": "An approval lifecycle record bound to one immutable authorization scope. This is a draft artifact until the host feasibility gate passes.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "approvalId",
+    "actionId",
+    "correlationId",
+    "authoritativeScopeHash",
+    "status",
+    "requestedAt",
+    "expiresAt",
+    "requesterRef",
+    "authorizationDecisionId",
+    "creationAuditRef"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/schemaVersion"
+    },
+    "approvalId": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/approvalId",
+      "description": "Approval identifier distinct from every authorization requestId."
+    },
+    "actionId": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/actionId"
+    },
+    "correlationId": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/correlationId"
+    },
+    "authoritativeScopeHash": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/sha256"
+    },
+    "status": {
+      "type": "string",
+      "enum": [
+        "pending",
+        "approved",
+        "denied",
+        "expired",
+        "cancelled"
+      ]
+    },
+    "requestedAt": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/timestamp"
+    },
+    "expiresAt": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/timestamp"
+    },
+    "requesterRef": {
+      "$ref": "#/$defs/principalRef",
+      "description": "Opaque, display-safe requester reference; never an email address or credential."
+    },
+    "authorizationDecisionId": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/decisionId",
+      "description": "The approval_required decision that created this approval."
+    },
+    "creationAuditRef": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/auditRef"
+    },
+    "reviewerRef": {
+      "$ref": "#/$defs/principalRef",
+      "description": "Opaque, display-safe reviewer reference; never an email address or credential."
+    },
+    "decidedAt": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/timestamp"
+    },
+    "resolutionAuditRef": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/auditRef"
+    },
+    "resolutionDecisionId": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/decisionId",
+      "description": "Stable identifier for the terminal approval decision."
+    },
+    "resolutionReasonCode": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(_[a-z0-9]+)*$",
+      "maxLength": 128,
+      "allOf": [
+        {
+          "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/safeText"
+        }
+      ]
+    },
+    "resolutionIdempotencyKey": {
+      "$ref": "#/$defs/resolutionIdempotencyKey",
+      "description": "Idempotency identity of the terminal approval operation."
+    },
+    "extensions": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/extensions"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "const": "pending"
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "not": {
+          "anyOf": [
+            {
+              "required": [
+                "reviewerRef"
+              ]
+            },
+            {
+              "required": [
+                "decidedAt"
+              ]
+            },
+            {
+              "required": [
+                "resolutionAuditRef"
+              ]
+            },
+            {
+              "required": [
+                "resolutionDecisionId"
+              ]
+            },
+            {
+              "required": [
+                "resolutionReasonCode"
+              ]
+            },
+            {
+              "required": [
+                "resolutionIdempotencyKey"
+              ]
+            }
+          ]
+        }
+      },
+      "else": {
+        "required": [
+          "decidedAt",
+          "resolutionAuditRef",
+          "resolutionDecisionId",
+          "resolutionReasonCode",
+          "resolutionIdempotencyKey"
+        ]
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "status": {
+            "enum": [
+              "approved",
+              "denied"
+            ]
+          }
+        },
+        "required": [
+          "status"
+        ]
+      },
+      "then": {
+        "required": [
+          "reviewerRef"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "reviewerRef"
+          ]
+        }
+      }
+    }
+  ],
+  "additionalProperties": false,
+  "$defs": {
+    "principalRef": {
+      "type": "string",
+      "minLength": 9,
+      "maxLength": 136,
+      "pattern": "^(subject|service):[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$",
+      "allOf": [
+        {
+          "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/safeText"
+        }
+      ]
+    },
+    "resolutionIdempotencyKey": {
+      "type": "string",
+      "minLength": 35,
+      "maxLength": 35,
+      "pattern": "^approval_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    }
+  }
+}

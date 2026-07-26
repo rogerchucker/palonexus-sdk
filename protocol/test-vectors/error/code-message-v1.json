@@ -1,0 +1,17 @@
+{
+  "schemaVersion": "1",
+  "messages": {
+    "invalid_request": "The request is invalid.",
+    "missing_identity": "Identity is required.",
+    "unsupported_protocol": "The protocol version is unsupported.",
+    "authentication_failed": "Authentication failed.",
+    "authorization_unavailable": "Authorization is temporarily unavailable.",
+    "invalid_decision": "The authorization decision is invalid.",
+    "idempotency_conflict": "The idempotency key conflicts with an earlier request.",
+    "approval_expired": "The approval has expired.",
+    "approval_scope_mismatch": "The action no longer matches the approved scope.",
+    "credential_revoked": "The credential has been revoked.",
+    "policy_denied": "Current policy denies this action."
+  },
+  "registeredExtensionKeys": []
+}

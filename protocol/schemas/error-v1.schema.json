@@ -1,0 +1,209 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palonexus.dev/protocol/v1/error-v1.schema.json",
+  "title": "PaloNexus protocol error version 1",
+  "description": "A stable, safe protocol failure without raw credentials, prompts, commands, or upstream responses. This is a draft artifact until the host feasibility gate passes.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "code",
+    "safeMessage",
+    "retryable"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/schemaVersion"
+    },
+    "code": {
+      "type": "string",
+      "enum": [
+        "invalid_request",
+        "missing_identity",
+        "unsupported_protocol",
+        "authentication_failed",
+        "authorization_unavailable",
+        "invalid_decision",
+        "idempotency_conflict",
+        "approval_expired",
+        "approval_scope_mismatch",
+        "credential_revoked",
+        "policy_denied"
+      ]
+    },
+    "safeMessage": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/safeText",
+      "minLength": 1,
+      "maxLength": 512,
+      "description": "Display-safe summary without raw request or credential material."
+    },
+    "retryable": {
+      "type": "boolean",
+      "description": "Whether the same semantic operation may be retried after a transient condition."
+    },
+    "actionId": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/actionId"
+    },
+    "requestId": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/requestId"
+    },
+    "correlationId": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/correlationId"
+    },
+    "decisionId": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/decisionId"
+    },
+    "approvalId": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/approvalId"
+    },
+    "auditRef": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/auditRef"
+    },
+    "extensions": {
+      "type": "object",
+      "description": "No error extension keys are registered in protocol version 1. A future key requires schema and protocol-version review.",
+      "maxProperties": 0,
+      "additionalProperties": false
+    }
+  },
+  "oneOf": [
+    {
+      "properties": {
+        "code": {
+          "const": "invalid_request"
+        },
+        "safeMessage": {
+          "const": "The request is invalid."
+        }
+      }
+    },
+    {
+      "properties": {
+        "code": {
+          "const": "missing_identity"
+        },
+        "safeMessage": {
+          "const": "Identity is required."
+        }
+      }
+    },
+    {
+      "properties": {
+        "code": {
+          "const": "unsupported_protocol"
+        },
+        "safeMessage": {
+          "const": "The protocol version is unsupported."
+        }
+      }
+    },
+    {
+      "properties": {
+        "code": {
+          "const": "authentication_failed"
+        },
+        "safeMessage": {
+          "const": "Authentication failed."
+        }
+      }
+    },
+    {
+      "properties": {
+        "code": {
+          "const": "authorization_unavailable"
+        },
+        "safeMessage": {
+          "const": "Authorization is temporarily unavailable."
+        }
+      }
+    },
+    {
+      "properties": {
+        "code": {
+          "const": "invalid_decision"
+        },
+        "safeMessage": {
+          "const": "The authorization decision is invalid."
+        }
+      }
+    },
+    {
+      "properties": {
+        "code": {
+          "const": "idempotency_conflict"
+        },
+        "safeMessage": {
+          "const": "The idempotency key conflicts with an earlier request."
+        }
+      }
+    },
+    {
+      "properties": {
+        "code": {
+          "const": "approval_expired"
+        },
+        "safeMessage": {
+          "const": "The approval has expired."
+        }
+      }
+    },
+    {
+      "properties": {
+        "code": {
+          "const": "approval_scope_mismatch"
+        },
+        "safeMessage": {
+          "const": "The action no longer matches the approved scope."
+        }
+      }
+    },
+    {
+      "properties": {
+        "code": {
+          "const": "credential_revoked"
+        },
+        "safeMessage": {
+          "const": "The credential has been revoked."
+        }
+      }
+    },
+    {
+      "properties": {
+        "code": {
+          "const": "policy_denied"
+        },
+        "safeMessage": {
+          "const": "Current policy denies this action."
+        }
+      }
+    }
+  ],
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "code": {
+            "const": "authorization_unavailable"
+          }
+        },
+        "required": [
+          "code"
+        ]
+      },
+      "then": {
+        "properties": {
+          "retryable": {
+            "const": true
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "retryable": {
+            "const": false
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

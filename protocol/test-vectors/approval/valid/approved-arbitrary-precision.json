@@ -1,0 +1,19 @@
+{
+  "schemaVersion": "1",
+  "approvalId": "apr_01J5ABCDEFGHJKMNPQRSTVWXY2",
+  "actionId": "act_01J5ABCDEFGHJKMNPQRSTVWXY2",
+  "correlationId": "corr_01J5ABCDEFGHJKMNPQRSTVWXY2",
+  "authoritativeScopeHash": "sha256:2beccecb8ab7aa14afacf117fe81869dd275c1319a6add5ea8b2de90088c681c",
+  "status": "approved",
+  "requestedAt": "2026-07-25T20:02:01.123456789123456787Z",
+  "expiresAt": "2026-07-25T20:17:01.123456789123456790Z",
+  "requesterRef": "subject:requester-42",
+  "authorizationDecisionId": "dec_01J5ABCDEFGHJKMNPQRSTVWXY3",
+  "creationAuditRef": "audit_01J5ABCDEFGHJKMNPQRSTVWXY3",
+  "reviewerRef": "subject:reviewer-7",
+  "decidedAt": "2026-07-25T20:04:01.123456789123456789Z",
+  "resolutionAuditRef": "audit_01J5ABCDEFGHJKMNPQRSTVWXY4",
+  "resolutionDecisionId": "dec_01J5ABCDEFGHJKMNPQRSTVWXY4",
+  "resolutionReasonCode": "approved",
+  "resolutionIdempotencyKey": "approval_01J5ABCDEFGHJKMNPQRSTVWXY4"
+}

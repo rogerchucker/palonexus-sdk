@@ -1,0 +1,13 @@
+{
+  "schemaVersion": "1",
+  "approvalId": "req_01J5ABCDEFGHJKMNPQRSTVWXY2",
+  "actionId": "act_01J5ABCDEFGHJKMNPQRSTVWXY2",
+  "correlationId": "corr_01J5ABCDEFGHJKMNPQRSTVWXY2",
+  "authoritativeScopeHash": "sha256:2beccecb8ab7aa14afacf117fe81869dd275c1319a6add5ea8b2de90088c681c",
+  "status": "pending",
+  "requestedAt": "2026-07-25T20:02:01Z",
+  "expiresAt": "2026-07-25T20:17:01Z",
+  "requesterRef": "subject:requester-42",
+  "authorizationDecisionId": "dec_01J5ABCDEFGHJKMNPQRSTVWXY3",
+  "creationAuditRef": "audit_01J5ABCDEFGHJKMNPQRSTVWXY3"
+}

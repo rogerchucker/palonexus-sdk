@@ -1,0 +1,10 @@
+{
+  "schemaVersion": "1",
+  "code": "approval_scope_mismatch",
+  "safeMessage": "The action no longer matches the approved scope.",
+  "retryable": false,
+  "actionId": "act_01J5ABCDEFGHJKMNPQRSTVWXY2",
+  "requestId": "req_01J5ABCDEFGHJKMNPQRSTVWXY4",
+  "correlationId": "corr_01J5ABCDEFGHJKMNPQRSTVWXY2",
+  "approvalId": "apr_01J5ABCDEFGHJKMNPQRSTVWXY2"
+}

@@ -1,0 +1,6 @@
+{
+  "schemaVersion": "1",
+  "code": "policy_denied",
+  "safeMessage": "Current policy denies this action.",
+  "retryable": true
+}
