@@ -1,0 +1,14 @@
+{
+  "attemptFingerprint": "sha256:f4734f48fb52c7c4cdd37aca632517352eceea7d1ec0698d047e934b06c7608e",
+  "claimExcluded": true,
+  "evidenceStatus": "superseded-untrusted",
+  "guardExitCode": null,
+  "hookInvocationCount": null,
+  "hookMode": "approval",
+  "hostRenderedEvidence": null,
+  "hostVersion": "2.1.219",
+  "limitation": "The legacy run asserted that the approval ID appeared and the sentinel was absent, but retained no exact invocation count or raw host result; hardened sandbox recapture terminated before tool invocation.",
+  "nonce": null,
+  "platform": "Darwin",
+  "sentinelExistsAfter": false
+}

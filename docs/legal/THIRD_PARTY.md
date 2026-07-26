@@ -17,6 +17,12 @@ the repository's source and binary release process. Approval records must use
 Generated software bills of materials and license reports are release evidence,
 not substitutes for this review.
 
+Host-contract evidence is not a bundled dependency. Its upstream sources and
+legal disposition are recorded in
+[`EVIDENCE_SOURCES.md`](EVIDENCE_SOURCES.md). The evidence fixtures retain
+factual, sanitized interoperability fields rather than upstream source code or
+documentation prose.
+
 ## Dependency review inventory
 
 Versions are exact resolutions in `uv.lock`, including the Python build and

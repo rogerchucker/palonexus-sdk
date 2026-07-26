@@ -1,0 +1,12 @@
+{
+  "cwd": "<fixture-root>/repo",
+  "hook_event_name": "PreToolUse",
+  "permission_mode": "bypassPermissions",
+  "session_id": "<session-id>",
+  "tool_input": {
+    "file_path": "<fixture-root>/repo/existing.txt"
+  },
+  "tool_name": "Read",
+  "tool_use_id": "<tool-use-id>",
+  "transcript_path": "<transcript-path>"
+}

@@ -1,0 +1,14 @@
+{
+  "attemptFingerprint": "sha256:749e543ee783a4cacad6bbbd13b34e27eeccb7aec4feca11ff6b5e45a053924b",
+  "claimExcluded": true,
+  "evidenceStatus": "superseded-untrusted",
+  "guardExitCode": null,
+  "hookInvocationCount": null,
+  "hookMode": "guard_failure",
+  "hostRenderedEvidence": null,
+  "hostVersion": "2.1.219",
+  "limitation": "The legacy run checked sentinel absence but did not retain the guard subprocess exit or rendered host result; hardened sandbox recapture terminated before tool invocation.",
+  "nonce": null,
+  "platform": "Darwin",
+  "sentinelExistsAfter": false
+}

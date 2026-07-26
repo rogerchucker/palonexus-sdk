@@ -1,0 +1,13 @@
+{
+  "attemptFingerprint": "sha256:01039bf225501d003765633b2f5056712cd0d99ec70a1acc4b4d43d81054d339",
+  "claimExcluded": true,
+  "evidenceStatus": "superseded-untrusted",
+  "hookInvocationCount": null,
+  "hookMode": "deny",
+  "hostRenderedEvidence": null,
+  "hostVersion": "2.1.212",
+  "limitation": "The legacy stable-host run checked sentinel absence but retained no exact invocation count or rendered host result; hardened sandbox recapture terminated before tool invocation.",
+  "nonce": null,
+  "platform": "Darwin",
+  "sentinelExistsAfter": false
+}

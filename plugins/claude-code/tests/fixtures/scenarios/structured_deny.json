@@ -1,0 +1,13 @@
+{
+  "attemptFingerprint": "sha256:5fb30343a7f1e302ce41fe872bc99993831002393f48ccb884fa7fa9ee97745e",
+  "claimExcluded": true,
+  "evidenceStatus": "superseded-untrusted",
+  "hookInvocationCount": null,
+  "hookMode": "deny",
+  "hostRenderedEvidence": null,
+  "hostVersion": "2.1.219",
+  "limitation": "The legacy run retained no per-invocation raw log or rendered host result; hardened sandbox recapture terminated before tool invocation.",
+  "nonce": null,
+  "platform": "Darwin",
+  "sentinelExistsAfter": false
+}

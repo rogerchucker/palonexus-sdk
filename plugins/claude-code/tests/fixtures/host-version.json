@@ -1,0 +1,28 @@
+{
+  "candidate": {
+    "arch": "arm64",
+    "origin": "Claude Code native installer executable",
+    "os": "Darwin",
+    "sha256": "sha256:a8e806faaefac53c7a0f26523d8a45c60dbef3407b14ef990c75765d08febc82",
+    "source": "locally installed executable",
+    "tested": false,
+    "version": "2.1.219"
+  },
+  "capturedAt": "2026-07-26T16:24:06+00:00",
+  "evidenceStatus": "superseded-untrusted",
+  "gateComplete": false,
+  "host": "Claude Code",
+  "latestStable": {
+    "integrity": "sha512-MEasj1oaoARRKEWU7eHJ6DWC2TC8ogml9QUDihbmxYI2Ij5Ol1leW90DIj8/a0xX3lfHZOwT3gJr0JxVKa8Sxw==",
+    "package": "@anthropic-ai/claude-code",
+    "source": "npm stable dist-tag at legacy capture time",
+    "tested": false,
+    "version": "2.1.212"
+  },
+  "minimumSupported": {
+    "reason": "Official docs do not state a minimum version and the changelog does not identify one release containing every required tool-family and blocking contract.",
+    "status": "unresolved",
+    "tested": false,
+    "version": null
+  }
+}

@@ -1,0 +1,23 @@
+{
+  "blockingSemantics": {
+    "exit2": true,
+    "noopPreservesNativePermissions": true,
+    "sourceSummary": "PreToolUse structured permissionDecision=deny prevents the tool call; exit 2 blocks PreToolUse; an empty JSON object contains no permission override.",
+    "structuredDeny": true
+  },
+  "changelog": {
+    "commit": "7ef6eec9d9ba84ea6f233f26c45f1df5c5991843",
+    "immutableUrl": "https://raw.githubusercontent.com/anthropics/claude-code/7ef6eec9d9ba84ea6f233f26c45f1df5c5991843/CHANGELOG.md",
+    "mutableUrl": "https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md",
+    "sha256": "sha256:9e4ad11b0443ad9db409b030481e284eb819781d94ee9f1ad28844b7759d74f5"
+  },
+  "documentedVersionEvidence": {
+    "minimumVersion": null,
+    "note": "No minimum Claude Code version is stated in the hooks reference."
+  },
+  "retrievedAt": "2026-07-26T16:24:06+00:00",
+  "reproduction": "Fetch the mutable hooks URL and compare SHA-256; a mismatch records upstream drift and requires a new review rather than overwriting history.",
+  "snapshotPolicy": "Only factual URLs, timestamp, commit, digest, and summarized semantics are retained; Anthropic documentation prose is not republished.",
+  "sha256": "sha256:038cad460d95b777f4a08dae02dbff2606aba557ed47faeb2a0d85aea3f53019",
+  "url": "https://code.claude.com/docs/en/hooks.md"
+}

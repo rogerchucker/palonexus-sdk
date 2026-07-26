@@ -1,0 +1,10 @@
+{
+  "cwd": "<fixture-root>/repo",
+  "hook_event_name": "PreToolUse",
+  "permission_mode": "bypassPermissions",
+  "session_id": "<session-id>",
+  "tool_input": {},
+  "tool_name": "mcp__fixture__ping",
+  "tool_use_id": "<tool-use-id>",
+  "transcript_path": "<transcript-path>"
+}

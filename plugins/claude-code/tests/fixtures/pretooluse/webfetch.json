@@ -1,0 +1,12 @@
+{
+  "cwd": "<fixture-root>/repo",
+  "hook_event_name": "PreToolUse",
+  "permission_mode": "bypassPermissions",
+  "session_id": "<session-id>",
+  "tool_input": {
+    "url": "https://example.com"
+  },
+  "tool_name": "WebFetch",
+  "tool_use_id": "<tool-use-id>",
+  "transcript_path": "<transcript-path>"
+}
