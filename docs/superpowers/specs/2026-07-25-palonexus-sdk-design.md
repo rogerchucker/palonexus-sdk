@@ -475,18 +475,24 @@ Initial categories:
 - `credential_revoked`
 - `policy_denied`
 
-### Scope hash and authorization idempotency
+### Scope hashes and authorization idempotency
 
-The scope hash covers canonical values for:
+`clientScopeHash` covers the client-visible canonical request:
 
-- Tenant and authenticated actor supplied by the trusted transport layer.
-- Agent and task identifiers.
+- Agent task and session identifiers supplied by the request.
 - Action and side-effect class.
 - Target kind, service, and canonical resource hash.
-- Adapter identity.
+- Diagnostic adapter ID and version, for request-integrity comparison only.
 
-The serialized host request does not choose tenant or actor, but the server
-includes them when computing its authoritative scope hash.
+`authoritativeScopeHash` covers those action/task/target values plus:
+
+- Tenant and authenticated actor from the trusted transport layer.
+- Authenticated agent and delegation.
+- Guard-assigned, authenticated `clientId`.
+
+The authoritative hash does not treat caller-supplied `adapter.id` as an
+authorization identity. The serialized host request does not choose tenant,
+actor, delegation, or trusted client identity.
 
 The same authorization idempotency key with the same canonical authorization
 attempt returns the same semantic processing result. The same key with
