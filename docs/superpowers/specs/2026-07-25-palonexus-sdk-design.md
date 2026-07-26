@@ -290,7 +290,7 @@ Normative fields:
 | `correlationId` | Links the task, decisions, approvals, and audit evidence. |
 | `causationId` | Optional predecessor action or event. |
 | `idempotencyKey` | Stable across transport retries of one authorization attempt; changes for a fresh post-approval attempt. |
-| `adapter` | Identifies the client package; server registration establishes trust. |
+| `adapter` | Diagnostic host/package label supplied by the caller; never grants privilege. |
 | `task` | Identifies the agent task and host session. |
 | `action` | Namespaced verb such as `file:write`. |
 | `target` | Typed service and canonical resource scope. |
@@ -353,11 +353,13 @@ or guard.
   "outcome": "approval_required",
   "reasonCode": "delegation_required",
   "displayReason": "Approval is required for this action.",
-  "scopeHash": "sha256:...",
+  "clientScopeHash": "sha256:...",
+  "authoritativeScopeHash": "sha256:...",
   "policyRevision": "policy_42",
+  "serverTime": "2026-07-25T20:00:01Z",
   "expiresAt": "2026-07-25T20:05:00Z",
   "approval": {
-    "requestId": "apr_01J...",
+    "approvalId": "apr_01J...",
     "status": "pending",
     "expiresAt": "2026-07-25T20:15:00Z"
   },
@@ -373,6 +375,19 @@ The `outcome` enum is exactly:
 - `allow`
 - `deny`
 - `approval_required`
+
+Every decision contains:
+
+- `clientScopeHash`, which must equal the client's canonical action scope.
+- `authoritativeScopeHash`, which additionally binds the server-derived tenant,
+  actor, agent, delegation, and registered guard client.
+- `serverTime`, an RFC 3339 timestamp used to calculate bounded clock offset.
+- `expiresAt`, an RFC 3339 timestamp later than `serverTime`.
+
+The client rejects a decision whose `clientScopeHash` does not match its
+request, whose authoritative hash is missing, whose time fields are invalid, or
+whose expiry is not later than server time. Approval and reconciliation records
+use the same authoritative hash returned by the decision.
 
 An allow is usable only before `expiresAt` and only for the exact request scope.
 The SDK does not execute an action; it returns or enforces the decision.
@@ -507,13 +522,19 @@ Local item states are:
 ```text
 pending → sending → acknowledged
                   ↘ retry_wait
+retry_wait → sending
+   sending → pending
 pending → discarded
 ```
 
 Only server acknowledgement moves an item to `acknowledged`. A retry reuses the
 reconciliation ID. Same ID and same body is idempotent; same ID and different
 body is a conflict. `discarded` requires an explicit local retention decision
-and records a safe reason. Vectors cover duplicate upload, crash before
+by the authenticated user or organization retention policy, records a safe
+reason, and is terminal. On process restart, an unacknowledged `sending` item
+returns to `pending`; retryable delivery failure records `retry_wait` and a
+bounded `nextAttemptAt`, after which it returns to `sending`. Vectors cover
+duplicate upload, crash before
 acknowledgement, acknowledgement loss, conflicting content, and ordered batch
 resume.
 
@@ -708,8 +729,11 @@ The guard assigns a locally registered `clientId` from the socket/CLI entrypoint
 and sends it through authenticated guard credentials. The control plane may use
 that registered client identity for audit and compatibility reporting, but
 authorization policy must not grant privilege solely from the caller-provided
-adapter label. Strong application identity requires an organization-managed
-installation or future platform attestation mechanism.
+adapter label. Caller-supplied `adapter.id` is excluded from privilege-bearing
+scope inputs. The authenticated, guard-assigned `clientId` is the registered
+client value included in the authoritative scope. Strong application identity
+requires an organization-managed installation or future platform attestation
+mechanism.
 
 ### Credential storage
 
@@ -836,7 +860,9 @@ Required CI-run examples:
 7. Codex allow, deny, approval, malformed input, and guard outage fixtures.
 8. Guard CLI against a local mock decision server.
 9. Redaction proving tokens and secret-looking arguments are absent from output.
-10. Idempotency proving retry and resume do not duplicate execution.
+10. Idempotency proving authorization retries do not duplicate decision
+    processing, and each allowed framework/host event invokes its wrapped action
+    once.
 11. A local demonstration runnable with one documented command.
 
 Offline examples do not call private cluster addresses or require credentials.
@@ -1008,7 +1034,8 @@ unchanged.
 - OIDC and STS handling with full verification.
 - Cache and reconciliation behavior.
 - Host approval rendering.
-- Adapter trust as server registration rather than a caller-supplied label.
+- Authenticated guard client registration while keeping caller adapter labels
+  diagnostic and non-authoritative.
 
 ### Exclude
 
@@ -1024,16 +1051,21 @@ SDK and plugin source under MIT on 2026-07-25.
 
 ## Delivery sequence
 
-1. Establish governance, CI skeleton, and protocol schemas.
-2. Implement golden vectors and language-neutral conformance.
-3. Implement Python models, transports, sync client, and async client.
-4. Implement approval/resume, identity helpers, redaction, and retry behavior.
-5. Implement framework adapters and neutral examples.
-6. Implement the hardened guard companion.
-7. Implement Claude Code and Codex plugins against the guard contract.
-8. Run cross-adapter, packaging, security, and install tests.
-9. Publish the public GitHub repository and prerelease artifacts.
-10. Run live control-plane and host compatibility evidence before stable release.
+1. Run Gate 0 against current official Claude Code and Codex host contracts,
+   record fixtures, and establish the exact blocking coverage and minimum
+   versions. Failure to verify either required plugin's claimed blocking path
+   blocks publication; it cannot be hidden by silently shrinking the success
+   criteria.
+2. Establish governance, CI skeleton, and protocol schemas.
+3. Implement golden vectors and language-neutral conformance.
+4. Implement Python models, transports, sync client, and async client.
+5. Implement approval/resume, identity helpers, redaction, and retry behavior.
+6. Implement framework adapters and neutral examples.
+7. Implement the hardened guard companion.
+8. Implement Claude Code and Codex plugins against the guard contract.
+9. Run cross-adapter, packaging, security, and install tests.
+10. Publish the public GitHub repository and prerelease artifacts.
+11. Run live control-plane and host compatibility evidence before stable release.
 
 Protocol schemas and vectors are frozen before parallel adapter implementation.
 One integration owner controls schema changes, shared exports, release metadata,
