@@ -43,6 +43,12 @@ The first public release is complete when:
 10. `github.com/rogerchucker/palonexus-sdk` is public and its default branch,
     security settings, documentation, and release evidence are verified.
 
+Authorization retries do not execute application work. The repository proves
+idempotent authorization processing and that framework/plugin adapters do not
+execute a blocked proposal before approval. It does not claim exactly-once
+delivery for arbitrary application side effects; applications remain
+responsible for their own transactional or idempotent execution boundary.
+
 ## Scope
 
 ### Included
@@ -166,6 +172,7 @@ palonexus-sdk/
 │   ├── schemas/
 │   │   ├── action-v1.schema.json
 │   │   ├── decision-v1.schema.json
+│   │   ├── approval-v1.schema.json
 │   │   ├── error-v1.schema.json
 │   │   └── reconciliation-v1.schema.json
 │   ├── test-vectors/
@@ -223,6 +230,19 @@ imported rather than copied between binaries.
 - JSON Schema files and golden vectors are committed source artifacts.
 - Generated language types must not be edited directly.
 
+Before protocol schemas are frozen, a host-contract feasibility gate records
+real hook payloads and responses from the minimum candidate Claude Code and
+Codex versions. The gate must prove that each supported host:
+
+- Invokes a blocking pre-tool hook for every claimed tool family.
+- Can block execution on a denial or hook failure.
+- Allows the plugin to return no permission override on PaloNexus `allow`.
+- Does not execute after the plugin renders `approval_required` as a denial.
+
+If a host cannot satisfy these conditions, that tool family is excluded from
+the supported coverage matrix. The plugin architecture is not frozen around an
+unverified host assumption.
+
 ### Action request
 
 An action request identifies an immutable proposed effect. It carries no bearer
@@ -235,7 +255,7 @@ credential in its serializable public model.
   "requestId": "req_01J...",
   "correlationId": "corr_01J...",
   "causationId": "cause_01J...",
-  "idempotencyKey": "idem_01J...",
+  "idempotencyKey": "authz_01J...",
   "adapter": {
     "id": "codex",
     "version": "0.1.0",
@@ -266,10 +286,10 @@ Normative fields:
 | Field | Requirement |
 |---|---|
 | `actionId` | Unique proposed execution. Reused only when resuming that action. |
-| `requestId` | Unique authorization request attempt. |
+| `requestId` | Unique authorization attempt. Stable across transport retries of that attempt. |
 | `correlationId` | Links the task, decisions, approvals, and audit evidence. |
 | `causationId` | Optional predecessor action or event. |
-| `idempotencyKey` | Prevents duplicate semantic processing of the same request. |
+| `idempotencyKey` | Stable across transport retries of one authorization attempt; changes for a fresh post-approval attempt. |
 | `adapter` | Identifies the client package; server registration establishes trust. |
 | `task` | Identifies the agent task and host session. |
 | `action` | Namespaced verb such as `file:write`. |
@@ -279,6 +299,31 @@ Normative fields:
 
 Raw commands, URLs, prompts, file contents, tokens, and secrets are not included
 by default. A local normalizer derives a safe display value and canonical hash.
+
+### Canonicalization
+
+Canonicalization is versioned with the protocol and performed before sending a
+request:
+
+- Strings are UTF-8 and normalized to Unicode NFC.
+- Object keys are sorted lexicographically.
+- Absent optional values are omitted; they are not serialized as `null`.
+- Paths are made absolute against the captured working directory, cleaned
+  lexically, and never resolved through a symlink merely to calculate scope.
+- URLs lower-case the scheme and host, remove a default port, discard
+  credentials and fragments, sort query keys, and redact configured sensitive
+  values before hashing.
+- Shell commands use a redacted token representation and a hash of the
+  unredacted bytes calculated locally. Unredacted bytes are not sent as
+  diagnostic context.
+- MCP targets use the server-qualified tool name plus canonical JSON tool input.
+
+`resourceHash` is the hash of the canonical resource representation. The
+client can verify that its action fields match the response `clientScopeHash`.
+The server separately returns `authoritativeScopeHash`, which additionally
+binds trusted tenant, subject, agent, delegation, and registered client data.
+Clients cannot recompute the authoritative hash and must not use it to select
+identity.
 
 ### Action taxonomy
 
@@ -332,6 +377,69 @@ The `outcome` enum is exactly:
 An allow is usable only before `expiresAt` and only for the exact request scope.
 The SDK does not execute an action; it returns or enforces the decision.
 
+`expiresAt` bounds reuse of the decision and any delay controlled by an SDK
+adapter. Implementations use the server time returned with the decision and a
+configured maximum clock-skew allowance. An SDK adapter checks validity
+immediately before calling application work and reauthorizes when the deadline
+has passed or falls inside the skew window.
+
+Coding-host plugins do not reuse an allow: each host `PreToolUse` event performs
+one guard check. A later native permission prompt is outside the plugin's
+control, so the compatibility documentation must disclose that a host may begin
+execution after the point-in-time authorization decision. High-assurance
+deployments must combine the plugin with host-managed permissions and
+OS/network enforcement. The plugin must not claim continuous authorization
+between the hook and an arbitrarily delayed host execution.
+
+### Approval
+
+The approval protocol has a separate `approval-v1` schema. An approval record
+contains:
+
+- `approvalId`
+- `actionId`
+- `correlationId`
+- `authoritativeScopeHash`
+- `status`
+- `requestedAt`
+- `expiresAt`
+- safe requester and reviewer references
+- decision and audit references
+
+The status transitions are:
+
+```text
+pending → approved
+pending → denied
+pending → expired
+pending → cancelled
+```
+
+Terminal states do not transition. Duplicate creation using the original
+authorization request returns the same approval ID. A duplicate decision by a
+reviewer returns the existing terminal result; conflicting terminal input is a
+conflict.
+
+Approval does not mutate the original authorization result. Resume creates a
+new authorization attempt:
+
+- `actionId` and `correlationId` remain unchanged.
+- The canonical action, target, side effect, and task remain unchanged.
+- `requestId` and authorization `idempotencyKey` are new.
+- `causationId` references the prior decision.
+- `resumeFromApprovalId` identifies the approval.
+- The client re-normalizes the current target and recalculates
+  `resourceHash` and `clientScopeHash`.
+
+If the recalculated scope differs, resume fails with
+`approval_scope_mismatch` and does not request an allow. If it matches, the
+server re-evaluates current identity, registry, policy, delegation, revocation,
+approval expiry, and authoritative scope.
+
+Transport retries of this resumed authorization attempt reuse its new
+`requestId` and idempotency key. This prevents duplicate billable authorization
+processing without replaying the pre-approval `approval_required` result.
+
 ### Error
 
 Protocol errors contain a stable code, safe message, identifiers available at
@@ -352,7 +460,7 @@ Initial categories:
 - `credential_revoked`
 - `policy_denied`
 
-### Scope hash and idempotency
+### Scope hash and authorization idempotency
 
 The scope hash covers canonical values for:
 
@@ -365,9 +473,49 @@ The scope hash covers canonical values for:
 The serialized host request does not choose tenant or actor, but the server
 includes them when computing its authoritative scope hash.
 
-The same idempotency key with the same canonical request returns the same
-semantic processing result. The same key with different canonical content is an
-`idempotency_conflict`.
+The same authorization idempotency key with the same canonical authorization
+attempt returns the same semantic processing result. The same key with
+different canonical content is an `idempotency_conflict`. A fresh
+post-approval attempt uses a new key as defined above.
+
+Authorization does not execute the proposed action. Therefore retrying
+`decide`, `authorize`, approval reads, or resume authorization cannot by itself
+duplicate the application side effect. A framework adapter proves that it does
+not call the wrapped tool before an allow and calls it once for one successful
+host/framework event. It cannot promise distributed exactly-once effects after
+the application begins executing. An ambiguous application result is surfaced
+to the application and is never automatically replayed by the SDK.
+
+### Reconciliation
+
+The `reconciliation-v1` schema describes durable delivery of safe local guard
+evidence. Each item contains:
+
+- `reconciliationId`
+- `actionId`
+- `requestId`
+- `decisionId`, when a decision was received
+- `correlationId`
+- registered client ID
+- action and target kind
+- client and authoritative scope hashes, when available
+- outcome and stable reason code
+- observed and acknowledged timestamps
+
+Local item states are:
+
+```text
+pending → sending → acknowledged
+                  ↘ retry_wait
+pending → discarded
+```
+
+Only server acknowledgement moves an item to `acknowledged`. A retry reuses the
+reconciliation ID. Same ID and same body is idempotent; same ID and different
+body is a conflict. `discarded` requires an explicit local retention decision
+and records a safe reason. Vectors cover duplicate upload, crash before
+acknowledgement, acknowledgement loss, conflicting content, and ordered batch
+resume.
 
 ## Python SDK
 
@@ -449,7 +597,8 @@ Required client operations:
 - `get_approval` reads approval state.
 - `wait_for_approval` waits within a caller-supplied deadline.
 - `resume` obtains a new authorization request for the original action and
-  preserves its action ID, idempotency key, and scope.
+  preserves its action ID and immutable scope while creating a new request ID
+  and authorization idempotency key.
 - `task` and `atask` bind task context without process-global mutation.
 - `close` and `aclose` release transport resources.
 
@@ -478,6 +627,8 @@ decisions and exceptions.
 - Ambiguous transport completion reuses the same key and request identity.
 - Backoff is bounded and includes jitter.
 - Cancellation ends retries and approval polling promptly.
+- Authorization retries never invoke application work.
+- Ambiguous application execution is never automatically retried.
 
 ### Framework adapters
 
@@ -530,7 +681,7 @@ The companion owns:
 - Verified issuer, audience, signature, and key rotation.
 - Device/session state and short-lived authorization credentials.
 - Secure credential storage.
-- Target routing and trusted adapter registration.
+- Target routing and client registration.
 - Local input normalization and redaction helpers.
 - Guard socket lifecycle.
 - Fail-closed decision calls.
@@ -545,6 +696,20 @@ The companion owns:
 - Writes use symlink-safe, atomic file replacement and process locking.
 - The CLI can start the daemon when absent, but a failed start returns a denial.
 - An unsupported or malformed request receives a structured fail-closed result.
+
+### Client identity
+
+The serialized `adapter.id` is diagnostic and non-authoritative. The initial
+release does not claim that a same-user process can cryptographically prove it
+is Claude Code or Codex. Peer UID protects the per-user socket from other OS
+users but not from another process owned by the same user.
+
+The guard assigns a locally registered `clientId` from the socket/CLI entrypoint
+and sends it through authenticated guard credentials. The control plane may use
+that registered client identity for audit and compatibility reporting, but
+authorization policy must not grant privilege solely from the caller-provided
+adapter label. Strong application identity requires an organization-managed
+installation or future platform attestation mechanism.
 
 ### Credential storage
 
@@ -565,7 +730,7 @@ scope and reconciliation contract.
 
 ### Reconciliation
 
-Every check has an action ID, request ID, decision ID when available, adapter,
+Every check has an action ID, request ID, decision ID when available, client,
 scope hash, outcome, and timestamp. Local records contain safe metadata rather
 than raw tool inputs. Upload is idempotent and removes or marks an item
 acknowledged only after server confirmation.
@@ -695,6 +860,8 @@ One vector set validates:
 - Stable outcome and error mapping.
 - Duplicate, orphaned, and conflicting identifiers.
 - Equivalent Python, guard, Claude, and Codex results.
+- Approval creation, terminal decisions, expiry, resume, mutation, and conflict.
+- Reconciliation retry, acknowledgement loss, deduplication, and conflict.
 
 ### Security
 
@@ -707,6 +874,8 @@ Required tests cover:
 - Socket ownership, peer checks, permissions, symlinks, and concurrent writes.
 - Approval expiry, revocation, policy change, and resource mutation before retry.
 - Idempotency conflicts and ambiguous network completion.
+- Authorization retry without application execution.
+- One wrapped invocation for one allowed framework or host event.
 - Unknown host tool and malformed hook payload.
 - Guard crash, timeout, and unavailable decision service.
 - Host allow behavior that does not override native permissions.
@@ -724,8 +893,12 @@ Python:
 
 Go:
 
+- Go 1.25 is the initial build toolchain.
 - Format, vet, staticcheck, unit, race, and fuzz tests.
-- Linux and macOS on amd64 and arm64.
+- Required runtime tests: Ubuntu 24.04 amd64 and macOS 14/15 arm64.
+- Required cross-builds: Linux amd64/arm64 and macOS amd64/arm64.
+- Cross-built but untested combinations are labeled experimental, not
+  supported.
 - Reproducible release builds where toolchains permit.
 
 Plugins:
@@ -735,6 +908,9 @@ Plugins:
 - Disposable-host installation.
 - Install, upgrade, and uninstall behavior.
 - Scheduled compatibility smoke tests isolated from required pull-request CI.
+- Before any prerelease, `docs/compatibility.md` records the exact minimum and
+  tested Claude Code and Codex versions established by the host feasibility
+  gate. Publication fails if either value is absent.
 
 ## Public repository governance
 
@@ -754,6 +930,22 @@ Required files:
 
 Contributions use Developer Certificate of Origin sign-off. PaloNexus names and
 logos remain trademarks even though the code is MIT-licensed.
+
+Relicensing evidence is committed under `docs/legal/`:
+
+- `RELICENSING.md` records the copyright owner's authorization, date, source
+  repository, destination repository, and MIT terms.
+- `PROVENANCE.csv` lists every migrated or rewritten source file, original
+  path/commit, copyright owner, contributor review, migration method, and
+  resulting license.
+- `THIRD_PARTY.md` records dependencies, generated code, licenses, and required
+  notices.
+
+CI rejects imports or links to proprietary platform-internal packages, scans
+fixtures and artifacts for private identifiers, validates package license
+metadata, and runs a dependency-license policy. A maintainer reviews files with
+non-PaloNexus contributors before migration rather than assuming the repository
+owner controls every contribution.
 
 GitHub configuration:
 
@@ -847,6 +1039,20 @@ Protocol schemas and vectors are frozen before parallel adapter implementation.
 One integration owner controls schema changes, shared exports, release metadata,
 and final merges.
 
+The initial release matrix is:
+
+| Component | Required tested targets |
+|---|---|
+| Python | CPython 3.12 and 3.13 on Ubuntu; clean install smoke on macOS |
+| Guard | Go 1.25; Ubuntu 24.04 amd64; macOS 14/15 arm64 |
+| Archives | Linux amd64/arm64; macOS amd64/arm64 |
+| Claude plugin | Exact minimum and latest tested versions recorded by Gate 0 |
+| Codex plugin | Exact minimum and latest tested versions recorded by Gate 0 |
+
+Gate 0 host versions are deliberately obtained from live official host
+contracts because they change independently of this repository. The repository
+cannot publish a prerelease while those exact version cells are unset.
+
 ## Risks and mitigations
 
 | Risk | Mitigation |
@@ -860,6 +1066,9 @@ and final merges.
 | Plugin is disabled or bypassed | Document the boundary; use managed installation and OS controls for stronger assurance. |
 | Extracted source carries proprietary coupling | Provenance review, neutral fixtures, MIT metadata, and reverse-import CI. |
 | Public artifacts differ from tested builds | Build once, attest, promote, and verify downloaded artifacts. |
+| Same-user process impersonates a plugin | Treat adapter as diagnostic; do not authorize from the label. |
+| Native permission prompt outlives decision | Treat hook decision as point-in-time and document host limitation. |
+| Authorization success is confused with exactly-once execution | SDK never retries application work and makes no distributed exactly-once claim. |
 
 ## Design decisions
 
@@ -874,6 +1083,9 @@ and final merges.
 8. The decision endpoint stays in the platform repository.
 9. GitHub release bundles are the initial plugin distribution channel.
 10. A prerelease precedes the stable public release.
+11. Adapter labels are diagnostic in v1 and cannot independently grant privilege.
+12. Authorization idempotency is per attempt; resume creates a new attempt for
+    the same immutable action.
 
 ## Open implementation details
 
@@ -881,9 +1093,8 @@ The implementation plan must resolve these details without changing the design:
 
 - Exact JSON Schema draft and code-generation tool.
 - Concrete Go keyring library and Linux Secret Service fallback.
-- Exact minimum Claude Code and Codex versions established by compatibility
-  fixtures.
+- Exact minimum Claude Code and Codex versions established by Gate 0 before
+  prerelease publication.
 - Public decision endpoint path and authentication configuration names.
 - Whether the local demo uses a Go mock server or a Python mock server.
 - Release version chosen after inspecting the existing PyPI `0.1.0` artifact.
-
