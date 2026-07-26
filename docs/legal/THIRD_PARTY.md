@@ -40,18 +40,24 @@ locked distribution without contacting the network.
 <!-- dependency-inventory:start -->
 | Dependency | Version | License | Review status | Obligations | Notice | Source |
 | --- | --- | --- | --- | --- | --- | --- |
+| attrs | 26.1.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | colorama | 0.4.6 | BSD-3-Clause | reviewed | Retain notices | None identified | PyPI |
 | hatch-vcs | 0.5.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | hatchling | 1.31.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | iniconfig | 2.3.0 | MIT | reviewed | Retain notices | None identified | PyPI |
+| jsonschema | 4.26.0 | MIT | reviewed | Retain notices | None identified | PyPI |
+| jsonschema-specifications | 2025.9.1 | MIT | reviewed | Retain notices | None identified | PyPI |
 | packaging | 26.2 | Apache-2.0 OR BSD-2-Clause | reviewed | Retain notices | Include supplied NOTICE | PyPI |
 | pathspec | 1.1.1 | MPL-2.0 | reviewed | Retain notices; disclose modifications to covered files | None identified | PyPI |
 | pluggy | 1.6.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | pygments | 2.20.0 | BSD-2-Clause | reviewed | Retain notices | None identified | PyPI |
 | pytest | 9.1.1 | MIT | reviewed | Retain notices | None identified | PyPI |
+| referencing | 0.37.0 | MIT | reviewed | Retain notices | None identified | PyPI |
+| rpds-py | 2026.6.3 | MIT | reviewed | Retain notices | None identified | PyPI |
 | ruff | 0.16.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | setuptools | 83.0.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | setuptools-scm | 10.2.1 | MIT | reviewed | Retain notices | None identified | PyPI |
 | trove-classifiers | 2026.6.1.19 | Apache-2.0 | reviewed | Retain notices | Include supplied NOTICE | PyPI |
+| typing-extensions | 4.16.0 | PSF-2.0 | reviewed | Retain notices | None identified | PyPI |
 | vcs-versioning | 2.2.2 | MIT | reviewed | Retain notices | None identified | PyPI |
 <!-- dependency-inventory:end -->

@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "1",
+  "requestId": "req_01J5ABCDEFGHJKMNPQRSTVWXY2",
+  "decisionId": "dec_01J5ABCDEFGHJKMNPQRSTVWXY3",
+  "correlationId": "corr_01J5ABCDEFGHJKMNPQRSTVWXY2",
+  "outcome": "approval_required",
+  "reasonCode": "delegation_required",
+  "displayReason": "Approval is required for this action.",
+  "clientScopeHash": "sha256:1234567890abcdef1234567890abcdef1234567890abcdef1234567890abcdef",
+  "authoritativeScopeHash": "sha256:abcdef1234567890abcdef1234567890abcdef1234567890abcdef1234567890",
+  "policyRevision": "policy_42",
+  "serverTime": "2026-07-25T20:02:01Z",
+  "expiresAt": "2026-07-25T20:07:01Z",
+  "auditRef": "audit_01J5ABCDEFGHJKMNPQRSTVWXY3",
+  "cache": {
+    "cacheable": false
+  }
+}

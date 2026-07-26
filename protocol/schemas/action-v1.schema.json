@@ -1,0 +1,161 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palonexus.dev/protocol/v1/action-v1.schema.json",
+  "title": "PaloNexus action request version 1",
+  "description": "An immutable proposed effect. This is a draft artifact until the host feasibility gate passes.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "actionId",
+    "requestId",
+    "correlationId",
+    "idempotencyKey",
+    "adapter",
+    "task",
+    "action",
+    "target",
+    "sideEffect",
+    "occurredAt",
+    "context"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/schemaVersion"
+    },
+    "actionId": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/actionId",
+      "description": "Identifier for the proposed action."
+    },
+    "requestId": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/requestId",
+      "description": "Identifier for this authorization request."
+    },
+    "correlationId": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/correlationId"
+    },
+    "causationId": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/causationId"
+    },
+    "idempotencyKey": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/idempotencyKey"
+    },
+    "adapter": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/adapter",
+      "description": "Caller-supplied diagnostic and non-authoritative host/package labels. adapter.id never identifies the authenticated guard client."
+    },
+    "task": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/task"
+    },
+    "action": {
+      "type": "string",
+      "enum": [
+        "shell:exec",
+        "file:read",
+        "file:write",
+        "file:delete",
+        "web:fetch",
+        "mcp:call",
+        "tool:invoke"
+      ]
+    },
+    "target": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/target"
+    },
+    "sideEffect": {
+      "type": "string",
+      "enum": [
+        "read_only",
+        "write",
+        "destructive",
+        "external"
+      ]
+    },
+    "occurredAt": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/timestamp"
+    },
+    "context": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/context"
+    },
+    "extensions": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/extensions"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "enum": [
+              "shell:exec",
+              "file:read",
+              "file:write",
+              "file:delete",
+              "web:fetch"
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "properties": {
+          "target": {
+            "properties": {
+              "kind": {
+                "const": "local-action"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "mcp:call"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "properties": {
+          "target": {
+            "properties": {
+              "kind": {
+                "const": "mcp-tool"
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
+            "const": "tool:invoke"
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "properties": {
+          "target": {
+            "properties": {
+              "kind": {
+                "const": "tool"
+              }
+            }
+          }
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

@@ -1,0 +1,347 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json",
+  "title": "PaloNexus protocol version 1 common definitions",
+  "description": "Shared, security-sensitive definitions for protocol version 1. These definitions are draft artifacts until the host feasibility gate passes.",
+  "type": "object",
+  "additionalProperties": false,
+  "$defs": {
+    "safeText": {
+      "type": "string",
+      "not": {
+        "pattern": "[\\x00-\\x1F\\x7F-\\x9F\u061C\u200E\u200F\u2028-\u202E\u2066-\u2069]"
+      }
+    },
+    "schemaVersion": {
+      "type": "string",
+      "const": "1",
+      "description": "The supported protocol major version."
+    },
+    "actionId": {
+      "type": "string",
+      "minLength": 30,
+      "maxLength": 30,
+      "pattern": "^act_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "requestId": {
+      "type": "string",
+      "minLength": 30,
+      "maxLength": 30,
+      "pattern": "^req_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "correlationId": {
+      "type": "string",
+      "minLength": 31,
+      "maxLength": 31,
+      "pattern": "^corr_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "causationId": {
+      "type": "string",
+      "minLength": 30,
+      "maxLength": 32,
+      "pattern": "^(act|cause|dec|event)_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+      "allOf": [
+        {
+          "$ref": "#/$defs/safeText"
+        }
+      ]
+    },
+    "idempotencyKey": {
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 32,
+      "pattern": "^authz_[0-7][0-9A-HJKMNP-TV-Z]{25}$",
+      "description": "Opaque idempotency identifier."
+    },
+    "taskId": {
+      "type": "string",
+      "minLength": 31,
+      "maxLength": 31,
+      "pattern": "^task_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "sessionId": {
+      "type": "string",
+      "minLength": 34,
+      "maxLength": 34,
+      "pattern": "^session_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "decisionId": {
+      "type": "string",
+      "minLength": 30,
+      "maxLength": 30,
+      "pattern": "^dec_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "approvalId": {
+      "type": "string",
+      "minLength": 30,
+      "maxLength": 30,
+      "pattern": "^apr_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "auditRef": {
+      "type": "string",
+      "minLength": 32,
+      "maxLength": 32,
+      "pattern": "^audit_[0-7][0-9A-HJKMNP-TV-Z]{25}$"
+    },
+    "sha256": {
+      "type": "string",
+      "minLength": 71,
+      "maxLength": 71,
+      "pattern": "^sha256:[0-9a-f]{64}$",
+      "description": "A lowercase hexadecimal SHA-256 digest with its algorithm prefix."
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(\\.[0-9]+)?(Z|[+-][0-9]{2}:[0-9]{2})$",
+      "allOf": [
+        {
+          "$ref": "#/$defs/safeText"
+        }
+      ],
+      "description": "An RFC 3339 timestamp."
+    },
+    "semver": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)\\.(0|[1-9][0-9]*)(-(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*)?(\\+[0-9A-Za-z-]+(\\.[0-9A-Za-z-]+)*)?$",
+      "allOf": [
+        {
+          "$ref": "#/$defs/safeText"
+        }
+      ]
+    },
+    "extensions": {
+      "type": "object",
+      "description": "Explicitly versioned, non-authoritative extension values. Implementations must not derive identity, privilege, policy, or cache authority from these values.",
+      "propertyNames": {
+        "maxLength": 128,
+        "pattern": "^[a-z][a-z0-9]*([.-][a-z0-9]+)*\\.v[1-9][0-9]*$",
+        "allOf": [
+          {
+            "$ref": "#/$defs/safeText"
+          }
+        ]
+      },
+      "additionalProperties": {
+        "$ref": "#/$defs/extensionValue"
+      },
+      "maxProperties": 32
+    },
+    "extensionPropertyName": {
+      "type": "string",
+      "maxLength": 128,
+      "pattern": "^[A-Za-z][A-Za-z0-9._-]{0,127}$",
+      "allOf": [
+        {
+          "$ref": "#/$defs/safeText"
+        }
+      ]
+    },
+    "extensionValue": {
+      "oneOf": [
+        {
+          "type": "object",
+          "propertyNames": {
+            "$ref": "#/$defs/extensionPropertyName"
+          },
+          "additionalProperties": {
+            "$ref": "#/$defs/extensionValue"
+          },
+          "maxProperties": 64
+        },
+        {
+          "type": "array",
+          "items": {
+            "$ref": "#/$defs/extensionValue"
+          },
+          "maxItems": 64
+        },
+        {
+          "$ref": "#/$defs/safeText",
+          "maxLength": 2048
+        },
+        {
+          "type": "number",
+          "minimum": -1e308,
+          "maximum": 1e308
+        },
+        {
+          "type": "boolean"
+        }
+      ]
+    },
+    "adapter": {
+      "type": "object",
+      "description": "Caller-supplied diagnostic and non-authoritative host/package labels. In particular, adapter.id is never a trusted client identity and cannot grant privilege.",
+      "required": [
+        "id",
+        "version",
+        "hostVersion"
+      ],
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 63,
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?$",
+          "allOf": [
+            {
+              "$ref": "#/$defs/safeText"
+            }
+          ]
+        },
+        "version": {
+          "$ref": "#/$defs/semver"
+        },
+        "hostVersion": {
+          "$ref": "#/$defs/semver"
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "task": {
+      "type": "object",
+      "description": "Caller-visible task and host session binding. Effective authenticated identity is supplied by the trusted transport, not this object.",
+      "required": [
+        "taskId",
+        "sessionId"
+      ],
+      "properties": {
+        "taskId": {
+          "$ref": "#/$defs/taskId"
+        },
+        "sessionId": {
+          "$ref": "#/$defs/sessionId"
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "target": {
+      "type": "object",
+      "required": [
+        "kind",
+        "service",
+        "resource",
+        "resourceHash"
+      ],
+      "properties": {
+        "kind": {
+          "type": "string",
+          "enum": [
+            "local-action",
+            "mcp-tool",
+            "tool"
+          ]
+        },
+        "service": {
+          "type": "string",
+          "maxLength": 253,
+          "pattern": "^[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?(\\.[a-z0-9]([a-z0-9-]{0,61}[a-z0-9])?)*$",
+          "allOf": [
+            {
+              "$ref": "#/$defs/safeText"
+            }
+          ]
+        },
+        "resource": {
+          "$ref": "#/$defs/safeText",
+          "minLength": 1,
+          "maxLength": 2048,
+          "allOf": [
+            {
+              "not": {
+                "pattern": "[\\\\]"
+              }
+            },
+            {
+              "not": {
+                "pattern": "(^|/)\\.{1,2}(/|$)"
+              }
+            }
+          ]
+        },
+        "resourceHash": {
+          "$ref": "#/$defs/sha256"
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "context": {
+      "type": "object",
+      "description": "Allowlisted, safe, non-authoritative diagnostics. Raw commands, URLs, prompts, file contents, tokens, and secrets are excluded.",
+      "properties": {
+        "cwd": {
+          "$ref": "#/$defs/safeText",
+          "minLength": 1,
+          "maxLength": 1024
+        },
+        "repository": {
+          "$ref": "#/$defs/safeText",
+          "minLength": 1,
+          "maxLength": 256
+        },
+        "toolName": {
+          "$ref": "#/$defs/safeText",
+          "minLength": 1,
+          "maxLength": 128
+        },
+        "safeDisplay": {
+          "$ref": "#/$defs/safeText",
+          "minLength": 1,
+          "maxLength": 512
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "approvalSummary": {
+      "type": "object",
+      "required": [
+        "approvalId",
+        "status",
+        "expiresAt"
+      ],
+      "properties": {
+        "approvalId": {
+          "$ref": "#/$defs/approvalId"
+        },
+        "status": {
+          "type": "string",
+          "const": "pending"
+        },
+        "expiresAt": {
+          "$ref": "#/$defs/timestamp"
+        },
+        "extensions": {
+          "$ref": "#/$defs/extensions"
+        }
+      },
+      "additionalProperties": false
+    },
+    "cacheDirective": {
+      "type": "object",
+      "description": "Protocol version 1 reserves cache metadata but never permits an offline authorization allow.",
+      "required": [
+        "cacheable"
+      ],
+      "properties": {
+        "cacheable": {
+          "type": "boolean",
+          "const": false
+        }
+      },
+      "additionalProperties": false
+    }
+  }
+}

@@ -3,6 +3,7 @@ from __future__ import annotations
 import csv
 import hashlib
 import json
+import runpy
 import subprocess
 import sys
 import zipfile
@@ -523,6 +524,11 @@ def test_verifier_rejects_invalid_spdx_and_proprietary_conflict(
 
     assert result.returncode == 1
     assert "invalid SPDX expression for demo" in result.stdout
+
+
+def test_verifier_accepts_the_typing_extensions_psf_license() -> None:
+    verifier = runpy.run_path(ROOT / "scripts" / "verify_legal.py")
+    assert verifier["_valid_spdx"]("PSF-2.0")
 
 
 def test_verifier_rejects_bogus_migrated_provenance(tmp_path: Path) -> None:

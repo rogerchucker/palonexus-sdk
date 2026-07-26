@@ -1,0 +1,124 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palonexus.dev/protocol/v1/decision-v1.schema.json",
+  "title": "PaloNexus authorization decision version 1",
+  "description": "A fail-closed point-in-time authorization decision. This is a draft artifact until the host feasibility gate passes.",
+  "type": "object",
+  "required": [
+    "schemaVersion",
+    "requestId",
+    "decisionId",
+    "correlationId",
+    "outcome",
+    "reasonCode",
+    "displayReason",
+    "clientScopeHash",
+    "authoritativeScopeHash",
+    "policyRevision",
+    "serverTime",
+    "expiresAt",
+    "auditRef",
+    "cache"
+  ],
+  "properties": {
+    "schemaVersion": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/schemaVersion"
+    },
+    "requestId": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/requestId"
+    },
+    "decisionId": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/decisionId"
+    },
+    "correlationId": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/correlationId"
+    },
+    "outcome": {
+      "type": "string",
+      "enum": [
+        "allow",
+        "deny",
+        "approval_required"
+      ]
+    },
+    "reasonCode": {
+      "type": "string",
+      "pattern": "^[a-z][a-z0-9]*(_[a-z0-9]+)*$",
+      "maxLength": 128,
+      "allOf": [
+        {
+          "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/safeText"
+        }
+      ]
+    },
+    "displayReason": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/safeText",
+      "minLength": 1,
+      "maxLength": 512
+    },
+    "clientScopeHash": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/sha256",
+      "description": "Caller-visible scope digest."
+    },
+    "authoritativeScopeHash": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/sha256",
+      "description": "Authoritative scope digest."
+    },
+    "policyRevision": {
+      "type": "string",
+      "maxLength": 135,
+      "pattern": "^policy_[0-9A-Za-z][0-9A-Za-z._~-]{0,127}$",
+      "allOf": [
+        {
+          "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/safeText"
+        }
+      ]
+    },
+    "serverTime": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/timestamp"
+    },
+    "expiresAt": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/timestamp",
+      "description": "Must be later than serverTime; consumers enforce this cross-field invariant."
+    },
+    "approval": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/approvalSummary"
+    },
+    "auditRef": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/auditRef"
+    },
+    "cache": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/cacheDirective"
+    },
+    "extensions": {
+      "$ref": "https://schemas.palonexus.dev/protocol/v1/common-v1.schema.json#/$defs/extensions"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "outcome": {
+            "const": "approval_required"
+          }
+        },
+        "required": [
+          "outcome"
+        ]
+      },
+      "then": {
+        "required": [
+          "approval"
+        ]
+      },
+      "else": {
+        "not": {
+          "required": [
+            "approval"
+          ]
+        }
+      }
+    }
+  ],
+  "additionalProperties": false
+}

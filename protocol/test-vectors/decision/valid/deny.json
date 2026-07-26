@@ -1,0 +1,18 @@
+{
+  "schemaVersion": "1",
+  "requestId": "req_01J5ABCDEFGHJKMNPQRSTVWXY0",
+  "decisionId": "dec_01J5ABCDEFGHJKMNPQRSTVWXY1",
+  "correlationId": "corr_01J5ABCDEFGHJKMNPQRSTVWXY0",
+  "outcome": "deny",
+  "reasonCode": "policy_denied",
+  "displayReason": "Policy denied this action.",
+  "clientScopeHash": "sha256:cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "authoritativeScopeHash": "sha256:dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+  "policyRevision": "policy_42",
+  "serverTime": "2026-07-25T20:01:01Z",
+  "expiresAt": "2026-07-25T20:02:01Z",
+  "auditRef": "audit_01J5ABCDEFGHJKMNPQRSTVWXY1",
+  "cache": {
+    "cacheable": false
+  }
+}

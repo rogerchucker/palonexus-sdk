@@ -5,9 +5,11 @@ members = ["python"]
 dev = [
   "hatch-vcs>=0.4",
   "hatchling>=1.27",
+  "jsonschema>=4.25",
   "pytest>=8.4",
   "ruff>=0.12",
 ]
 
 [tool.pytest.ini_options]
-testpaths = ["foundation_tests", "python/tests"]
+pythonpath = ["."]
+testpaths = ["foundation_tests", "protocol/tests", "python/tests"]

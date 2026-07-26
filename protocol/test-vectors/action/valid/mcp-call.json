@@ -1,0 +1,30 @@
+{
+  "schemaVersion": "1",
+  "actionId": "act_01J5ABCDEFGHJKMNPQRSTVWXY1",
+  "requestId": "req_01J5ABCDEFGHJKMNPQRSTVWXY1",
+  "correlationId": "corr_01J5ABCDEFGHJKMNPQRSTVWXY1",
+  "idempotencyKey": "authz_01J5ABCDEFGHJKMNPQRSTVWXY1",
+  "adapter": {
+    "id": "claude-code",
+    "version": "0.2.0-alpha.1",
+    "hostVersion": "2.1.219"
+  },
+  "task": {
+    "taskId": "task_01J5ABCDEFGHJKMNPQRSTVWXY1",
+    "sessionId": "session_01J5ABCDEFGHJKMNPQRSTVWXY1"
+  },
+  "action": "mcp:call",
+  "target": {
+    "kind": "mcp-tool",
+    "service": "github",
+    "resource": "mcp:github/issues.create#sha256:2222222222222222222222222222222222222222222222222222222222222222",
+    "resourceHash": "sha256:2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "sideEffect": "external",
+  "occurredAt": "2026-07-25T20:01:00Z",
+  "context": {
+    "cwd": "/workspace",
+    "repository": "example/service",
+    "toolName": "github.create_issue"
+  }
+}

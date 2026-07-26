@@ -1,0 +1,29 @@
+{
+  "schemaVersion": "1",
+  "actionId": "act_01J5ABCDEFGHJKMNPQRSTVWXY0",
+  "requestId": "req_01J5ABCDEFGHJKMNPQRSTVWXY0",
+  "correlationId": "corr_01J5ABCDEFGHJKMNPQRSTVWXY0",
+  "idempotencyKey": "authz_01J5ABCDEFGHJKMNPQRSTVWXY0",
+  "clientId": "caller-selected-privileged-client",
+  "adapter": {
+    "id": "codex",
+    "version": "0.2.0-alpha.1",
+    "hostVersion": "0.145.0"
+  },
+  "task": {
+    "taskId": "task_01J5ABCDEFGHJKMNPQRSTVWXY0",
+    "sessionId": "session_01J5ABCDEFGHJKMNPQRSTVWXY0"
+  },
+  "action": "file:write",
+  "target": {
+    "kind": "local-action",
+    "service": "workspace",
+    "resource": "workspace:/deploy/production.yaml",
+    "resourceHash": "sha256:1111111111111111111111111111111111111111111111111111111111111111"
+  },
+  "sideEffect": "write",
+  "occurredAt": "2026-07-25T20:00:00Z",
+  "context": {
+    "cwd": "/workspace"
+  }
+}
