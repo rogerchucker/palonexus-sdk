@@ -9,6 +9,39 @@
     "version": "2.1.219"
   },
   "capturedAt": "2026-07-26T16:24:06+00:00",
+  "containerAttempts": [
+    {
+      "attemptedAt": "2026-07-26T17:05:11Z",
+      "baseImage": "docker.io/library/node@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3",
+      "derivedImageId": "sha256:27e2bb288348fbae6e70ed5d11b6a76a34b9c22ccc81d340a8a9fe9bfadc9051",
+      "failureStage": "settings-resolution",
+      "network": "none",
+      "os": "linux",
+      "arch": "arm64",
+      "package": "@anthropic-ai/claude-code",
+      "packageIntegrity": "sha512-6PVBrRsKHFi0gzv5bCabVL+XSqI3F8AR6ekFx4gpzdE5a9XotqewolID0PbcdD9IyWVYCIDET4GDCcUdA89i3Q==",
+      "toolInvocationReached": false,
+      "version": "2.1.219"
+    },
+    {
+      "attemptedAt": "2026-07-26T17:07:59Z",
+      "authMountDigestVerified": true,
+      "authMountReadOnly": true,
+      "baseImage": "docker.io/library/node@sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3",
+      "configMountDigestVerified": true,
+      "configMountReadOnly": true,
+      "derivedImageId": "sha256:27e2bb288348fbae6e70ed5d11b6a76a34b9c22ccc81d340a8a9fe9bfadc9051",
+      "failureStage": "authentication",
+      "network": "none",
+      "os": "linux",
+      "arch": "arm64",
+      "package": "@anthropic-ai/claude-code",
+      "packageIntegrity": "sha512-6PVBrRsKHFi0gzv5bCabVL+XSqI3F8AR6ekFx4gpzdE5a9XotqewolID0PbcdD9IyWVYCIDET4GDCcUdA89i3Q==",
+      "toolInvocationReached": false,
+      "version": "2.1.219",
+      "workspaceMounted": false
+    }
+  ],
   "evidenceStatus": "superseded-untrusted",
   "gateComplete": false,
   "host": "Claude Code",

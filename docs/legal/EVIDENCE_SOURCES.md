@@ -10,6 +10,7 @@ not copy or relicense Claude Code, npm packages, or Anthropic documentation.
 | Claude Code hooks reference | Anthropic | URL, retrieval timestamp, SHA-256, and a short factual contract summary | Upstream prose is not copied; digest supports reproducibility |
 | Claude Code changelog | Anthropic GitHub repository | Immutable commit URL, commit ID, SHA-256, and factual version evidence | Upstream changelog is not copied or redistributed |
 | `PreToolUse` payloads | Claude Code executable output | Strictly allowlisted field names and non-sensitive fixture values | Factual interoperability records; PaloNexus authors the selection, sanitization, and JSON arrangement |
+| Container isolation runtime | Docker and the pinned official Node image | Image digest/ID, operating system, architecture, resource envelope, and failure stage | Factual test-environment metadata; image and Docker software are not distributed |
 
 The repository's MIT license applies to PaloNexus-authored scripts, tests,
 selection, and arrangement. It does not alter ownership of third-party

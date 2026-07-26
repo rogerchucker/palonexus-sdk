@@ -18,6 +18,7 @@ CAPTURE_SPEC.loader.exec_module(CAPTURE)
 sanitize_pretooluse = CAPTURE.sanitize_pretooluse
 validate_evidence = CAPTURE.validate_evidence
 safe_environment = CAPTURE._safe_environment
+docker_capture_command = CAPTURE.docker_capture_command
 FIXTURES = ROOT / "plugins" / "claude-code" / "tests" / "fixtures"
 REQUIRED_TOOL_FAMILIES = {
     "bash",
@@ -82,6 +83,15 @@ def test_claude_gate0_records_host_and_official_contract_evidence() -> None:
     assert host["latestStable"]["tested"] in {True, False}
     if not host["candidate"]["tested"] or not host["latestStable"]["tested"]:
         assert host["gateComplete"] is False
+    container_attempt = host["containerAttempts"][-1]
+    assert SHA256.fullmatch(container_attempt["derivedImageId"])
+    assert "@sha256:" in container_attempt["baseImage"]
+    assert container_attempt["network"] == "none"
+    assert container_attempt["toolInvocationReached"] is False
+    assert container_attempt["failureStage"] == "authentication"
+    assert container_attempt["authMountDigestVerified"] is True
+    assert container_attempt["authMountReadOnly"] is True
+    assert container_attempt["workspaceMounted"] is False
     assert host["minimumSupported"]["status"] in {"established", "unresolved"}
     if host["minimumSupported"]["status"] == "established":
         assert host["minimumSupported"]["version"]
@@ -103,57 +113,34 @@ def test_claude_gate0_records_host_and_official_contract_evidence() -> None:
     assert contract["blockingSemantics"]["noopPreservesNativePermissions"] is True
 
 
-def test_claude_gate0_proves_allow_and_fail_closed_sentinel_behavior() -> None:
+def test_claim_excluded_legacy_evidence_makes_no_capability_claims() -> None:
     capabilities = _load_json(FIXTURES / "expected-capabilities.json")
-    scenarios = capabilities["scenarios"]
-    assert REQUIRED_BLOCKING_SCENARIOS <= set(scenarios)
-
+    assert capabilities["scenarios"] == {}
+    assert set(capabilities["legacyEvidenceFiles"]) == {
+        f"legacy-scenarios/{scenario}.json"
+        for scenario in REQUIRED_BLOCKING_SCENARIOS
+    }
     for scenario in REQUIRED_BLOCKING_SCENARIOS:
-        evidence = scenarios[scenario]
-        assert evidence["sentinelMutated"] is False
-        assert evidence["hostResult"] == "blocked"
-        assert SHA256.fullmatch(evidence["attemptFingerprint"])
-        assert evidence["rawEvidence"] == f"scenarios/{scenario}.json"
-        raw = _load_json(FIXTURES / evidence["rawEvidence"])
-        assert raw["nonce"] == evidence["nonce"]
-        assert raw["sentinelExistsAfter"] is False
-        if raw["evidenceStatus"] == "trusted-sandboxed":
-            assert evidence["nonce"]
-            assert evidence["hookInvocationCount"] == 1
-            assert raw["hookInvocationCount"] == 1
-            assert raw["hostRenderedEvidence"]
-        else:
-            assert raw["evidenceStatus"] == "superseded-untrusted"
-            assert raw["claimExcluded"] is True
-            assert raw["nonce"] is None
-            assert raw["hookInvocationCount"] is None
-            assert raw["hostRenderedEvidence"] is None
-            assert raw["limitation"]
-
-    approval = scenarios["approval_required"]
-    assert approval["guardResult"]["outcome"] == "approval_required"
-    if approval["evidenceStatus"] == "trusted-sandboxed":
-        assert approval["guardResult"]["approvalId"] in approval["renderedReason"]
-    else:
-        assert approval["renderedReason"] is None
-    if scenarios["guard_failure"]["evidenceStatus"] == "trusted-sandboxed":
-        assert scenarios["guard_failure"]["guardExitCode"] == 69
-    else:
-        assert scenarios["guard_failure"]["guardExitCode"] is None
+        raw = _load_json(FIXTURES / f"legacy-scenarios/{scenario}.json")
+        assert raw["evidenceStatus"] == "superseded-untrusted"
+        assert raw["claimExcluded"] is True
+        for result_field in (
+            "guardExitCode",
+            "hookExitCode",
+            "hookInvocationCount",
+            "hostRenderedEvidence",
+            "nonce",
+            "sentinelExistsAfter",
+        ):
+            assert raw.get(result_field) is None
+        assert raw["limitation"]
 
     preservation = capabilities["nativePermissionPreservation"]
     for mode in ("nativeAllow", "nativeDeny"):
-        assert preservation[mode]["status"] in {"tested", "unresolved"}
-        if preservation[mode]["status"] == "tested":
-            assert (
-                preservation[mode]["baseline"]["sentinelMutated"]
-                == preservation[mode]["noopHook"]["sentinelMutated"]
-            )
-        else:
-            assert preservation[mode]["claimExcluded"] is True
-            assert preservation[mode]["limitation"]
-
-    assert validate_evidence(FIXTURES) == []
+        assert preservation[mode]["status"] == "unresolved"
+        assert preservation[mode]["limitation"]
+        assert "baseline" not in preservation[mode]
+        assert "noopHook" not in preservation[mode]
 
 
 @pytest.mark.parametrize(
@@ -164,6 +151,7 @@ def test_claude_gate0_proves_allow_and_fail_closed_sentinel_behavior() -> None:
         ("cwd", "/home/alice/project"),
         ("cwd", r"C:\Users\alice\project"),
         ("cwd", r"\\server\share\project"),
+        ("cwd", "/tmp/repo/../../etc"),
         ("tool_input", {"command": "echo bearer sk-secretvalue1234567890"}),
         ("tool_input", {"command": "alice@example.com"}),
         ("tool_input", {"command": "A" * 80}),
@@ -181,12 +169,53 @@ def test_strict_sanitizer_rejects_unexpected_or_sensitive_data(
         "permission_mode": "manual",
         "hook_event_name": "PreToolUse",
         "tool_name": "Bash",
-        "tool_input": {"command": "printf fixture"},
+        "tool_input": {"command": "printf fixture-bash"},
         "tool_use_id": "tool",
     }
     payload[field] = value
     with pytest.raises(ValueError):
         sanitize_pretooluse(payload, fixture_root=Path("/tmp"))
+
+
+def test_strict_sanitizer_accepts_the_exact_control_fixture(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    payload = {
+        "session_id": "session",
+        "transcript_path": str(tmp_path / "transcript"),
+        "cwd": str(repository),
+        "permission_mode": "manual",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Bash",
+        "tool_input": {"command": "printf fixture-bash"},
+        "tool_use_id": "tool",
+    }
+
+    sanitized = sanitize_pretooluse(payload, fixture_root=tmp_path)
+
+    assert sanitized["cwd"] == "<fixture-root>/repo"
+    assert sanitized["tool_input"] == {"command": "printf fixture-bash"}
+
+
+def test_strict_sanitizer_rejects_symlink_escape(tmp_path: Path) -> None:
+    repository = tmp_path / "repo"
+    repository.mkdir()
+    outside = tmp_path.parent / "outside-secret"
+    link = repository / "escape"
+    link.symlink_to(outside)
+    payload = {
+        "session_id": "session",
+        "transcript_path": str(tmp_path / "transcript"),
+        "cwd": str(repository),
+        "permission_mode": "manual",
+        "hook_event_name": "PreToolUse",
+        "tool_name": "Read",
+        "tool_input": {"file_path": str(link)},
+        "tool_use_id": "tool",
+    }
+
+    with pytest.raises(ValueError, match="outside the disposable fixture root"):
+        sanitize_pretooluse(payload, fixture_root=tmp_path)
 
 
 def test_claude_compatibility_document_is_honest_about_the_gate() -> None:
@@ -224,21 +253,96 @@ def test_capture_has_no_permission_bypass_or_unsafe_fallback() -> None:
 
     assert "--dangerously-skip-permissions" not in source
     assert "no unsafe fallback exists" in source
-    assert "sandbox-exec" in source
+    assert '"/usr/bin/sandbox-exec"' in source
+    assert "_sandbox_deny_canary(temp)" in source
     assert "fixture harness rejected unexpected tool input" in source
+
+
+def test_docker_capture_envelope_is_pinned_and_least_privilege(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    credentials = tmp_path / "credentials.json"
+    credentials.write_text("{}")
+    image = "example.invalid/claude@sha256:" + "a" * 64
+
+    command = docker_capture_command(
+        image=image,
+        output=output,
+        credentials=credentials,
+        network="none",
+        command=["claude", "--version"],
+    )
+    rendered = " ".join(command)
+
+    for required in (
+        "--user 10001:10001",
+        "--read-only",
+        "--network none",
+        "--cap-drop ALL",
+        "--security-opt no-new-privileges",
+        "--cpus 1",
+        "--memory 1g",
+        "--pids-limit 128",
+        "/home/fixture:rw,noexec,nosuid,nodev,size=64m,mode=1777",
+        "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777",
+        "dst=/output",
+        "dst=/home/fixture/.claude/.credentials.json,readonly",
+    ):
+        assert required in rendered
+    assert command.count("--mount") == 2
+    assert image in command
+
+
+def test_docker_capture_rejects_mutable_image_or_implicit_network(
+    tmp_path: Path,
+) -> None:
+    output = tmp_path / "output"
+    output.mkdir()
+    credentials = tmp_path / "credentials.json"
+    credentials.write_text("{}")
+
+    with pytest.raises(ValueError, match="pinned by digest"):
+        docker_capture_command(
+            image="node:22",
+            output=output,
+            credentials=credentials,
+            network="none",
+            command=[],
+        )
+    with pytest.raises(ValueError, match="explicitly"):
+        docker_capture_command(
+            image="node@sha256:" + "a" * 64,
+            output=output,
+            credentials=credentials,
+            network="host",
+            command=[],
+        )
 
 
 def test_cross_file_validator_rejects_scenario_tampering(tmp_path: Path) -> None:
     fixtures = tmp_path / "fixtures"
     shutil.copytree(FIXTURES, fixtures)
-    raw_path = fixtures / "scenarios" / "structured_deny.json"
+    raw_path = fixtures / "legacy-scenarios" / "structured_deny.json"
     raw = _load_json(raw_path)
-    raw["attemptFingerprint"] = f"sha256:{'0' * 64}"
+    raw["sentinelExistsAfter"] = False
     raw_path.write_text(json.dumps(raw), encoding="utf-8")
 
     errors = validate_evidence(fixtures)
 
     assert (
-        "scenario summary/raw mismatch: structured_deny/attemptFingerprint"
+        "legacy capability result must be unknown: "
+        "legacy-scenarios/structured_deny.json/sentinelExistsAfter"
         in errors
+    )
+
+
+def test_claude_gate0_requires_complete_trusted_evidence() -> None:
+    capabilities = _load_json(FIXTURES / "expected-capabilities.json")
+    evidence_errors = validate_evidence(FIXTURES)
+
+    assert evidence_errors == [] and capabilities["gateComplete"] is True, (
+        "trusted Claude Gate 0 evidence is missing; superseded observations "
+        f"cannot satisfy the gate: {evidence_errors}"
     )

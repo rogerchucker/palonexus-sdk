@@ -44,10 +44,27 @@ A hardened replacement harness now:
 - compares no-hook and `{}` behavior under explicit native allow and native
   deny configurations without bypass mode.
 
-On this machine the enforced sandbox terminated Claude Code with signal 6
-before the first tool invocation. No weaker retry was made. Therefore the
-native allow/deny comparisons, blocking scenarios, stable-host scenario, and
-minimum version remain unresolved, and Gate 0 remains incomplete.
+On this machine the enforced macOS sandbox terminated Claude Code with signal 6
+before the first tool invocation. A later pinned Linux-container isolation
+canary passed: it ran non-root with a read-only root filesystem, no network,
+no capabilities, `no-new-privileges`, resource limits, and no host workspace
+mount. The one permitted container recapture then stopped at settings
+resolution because the manual bind used macOS's `/tmp` alias rather than the
+resolved `/private/tmp` source produced by the command builder. Claude never
+reached a tool call.
+
+One corrected local run was later authorized. Every bind source used its
+resolved path, and an otherwise identical locked preflight verified the exact
+read-only credential, hook, and settings digests; output writability; absent
+workspace; and denied root-filesystem writes. The run reached Claude Code
+2.1.219, but the macOS credential was not usable by the Linux host:
+Claude reported no API-key source and required login. It stopped before any
+tool or hook invocation. No further local attempt, weaker isolation, credential
+copy, or network-enabled web run was made.
+
+Therefore the native allow/deny comparisons, blocking scenarios, stable-host
+scenario, and minimum version remain unresolved, and Gate 0 remains
+intentionally failing.
 
 ## Sources and reproduction
 

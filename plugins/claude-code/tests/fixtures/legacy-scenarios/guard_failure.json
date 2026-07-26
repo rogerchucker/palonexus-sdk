@@ -4,11 +4,12 @@
   "evidenceStatus": "superseded-untrusted",
   "guardExitCode": null,
   "hookInvocationCount": null,
+  "hookExitCode": null,
   "hookMode": "guard_failure",
   "hostRenderedEvidence": null,
   "hostVersion": "2.1.219",
-  "limitation": "The legacy run checked sentinel absence but did not retain the guard subprocess exit or rendered host result; hardened sandbox recapture terminated before tool invocation.",
+  "limitation": "The legacy run checked sentinel absence but did not retain the guard subprocess exit or rendered host result and cannot support a capability claim.",
   "nonce": null,
   "platform": "Darwin",
-  "sentinelExistsAfter": false
+  "sentinelExistsAfter": null
 }

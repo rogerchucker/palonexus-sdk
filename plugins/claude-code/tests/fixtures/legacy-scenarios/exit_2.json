@@ -3,11 +3,12 @@
   "claimExcluded": true,
   "evidenceStatus": "superseded-untrusted",
   "hookInvocationCount": null,
+  "hookExitCode": null,
   "hookMode": "exit2",
   "hostRenderedEvidence": null,
   "hostVersion": "2.1.219",
-  "limitation": "The legacy run retained no per-invocation raw log or rendered host result; hardened sandbox recapture terminated before tool invocation.",
+  "limitation": "The legacy run retained no per-invocation raw log or rendered host result and cannot support a capability claim.",
   "nonce": null,
   "platform": "Darwin",
-  "sentinelExistsAfter": false
+  "sentinelExistsAfter": null
 }

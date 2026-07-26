@@ -1,78 +1,24 @@
 {
-  "evidenceStatus": "superseded-untrusted",
   "gateComplete": false,
   "host": "Claude Code",
+  "legacyEvidenceFiles": [
+    "legacy-scenarios/approval_required.json",
+    "legacy-scenarios/exit_2.json",
+    "legacy-scenarios/guard_failure.json",
+    "legacy-scenarios/stable_deny.json",
+    "legacy-scenarios/structured_deny.json"
+  ],
   "nativePermissionPreservation": {
     "nativeAllow": {
-      "claimExcluded": true,
-      "limitation": "The legacy observation used bypassPermissions. Hardened sandbox recapture terminated with signal 6 before tool invocation.",
+      "limitation": "The legacy observation used bypassPermissions. Hardened sandbox recapture terminated before tool invocation.",
       "status": "unresolved"
     },
     "nativeDeny": {
-      "claimExcluded": true,
-      "limitation": "No baseline-versus-empty-hook native-deny comparison completed in the enforced sandbox.",
+      "limitation": "No baseline-versus-empty-hook native-deny comparison completed in enforced isolation.",
       "status": "unresolved"
     }
   },
-  "scenarios": {
-    "approval_required": {
-      "attemptFingerprint": "sha256:f4734f48fb52c7c4cdd37aca632517352eceea7d1ec0698d047e934b06c7608e",
-      "evidenceStatus": "superseded-untrusted",
-      "guardExitCode": null,
-      "guardResult": {
-        "approvalId": "apr_fixture_01",
-        "outcome": "approval_required"
-      },
-      "hookInvocationCount": null,
-      "hostResult": "blocked",
-      "hostVersion": "2.1.219",
-      "nonce": null,
-      "rawEvidence": "scenarios/approval_required.json",
-      "renderedReason": null,
-      "sentinelMutated": false
-    },
-    "exit_2": {
-      "attemptFingerprint": "sha256:d0c9c4f798a8f739da32fa09247431d0b5b33e02403047f26d6d45d46956fafa",
-      "evidenceStatus": "superseded-untrusted",
-      "hookInvocationCount": null,
-      "hostResult": "blocked",
-      "hostVersion": "2.1.219",
-      "nonce": null,
-      "rawEvidence": "scenarios/exit_2.json",
-      "sentinelMutated": false
-    },
-    "guard_failure": {
-      "attemptFingerprint": "sha256:749e543ee783a4cacad6bbbd13b34e27eeccb7aec4feca11ff6b5e45a053924b",
-      "evidenceStatus": "superseded-untrusted",
-      "guardExitCode": null,
-      "hookInvocationCount": null,
-      "hostResult": "blocked",
-      "hostVersion": "2.1.219",
-      "nonce": null,
-      "rawEvidence": "scenarios/guard_failure.json",
-      "sentinelMutated": false
-    },
-    "stable_deny": {
-      "attemptFingerprint": "sha256:01039bf225501d003765633b2f5056712cd0d99ec70a1acc4b4d43d81054d339",
-      "evidenceStatus": "superseded-untrusted",
-      "hookInvocationCount": null,
-      "hostResult": "blocked",
-      "hostVersion": "2.1.212",
-      "nonce": null,
-      "rawEvidence": "scenarios/stable_deny.json",
-      "sentinelMutated": false
-    },
-    "structured_deny": {
-      "attemptFingerprint": "sha256:5fb30343a7f1e302ce41fe872bc99993831002393f48ccb884fa7fa9ee97745e",
-      "evidenceStatus": "superseded-untrusted",
-      "hookInvocationCount": null,
-      "hostResult": "blocked",
-      "hostVersion": "2.1.219",
-      "nonce": null,
-      "rawEvidence": "scenarios/structured_deny.json",
-      "sentinelMutated": false
-    }
-  },
+  "scenarios": {},
   "toolFamilies": [
     "bash",
     "edit",

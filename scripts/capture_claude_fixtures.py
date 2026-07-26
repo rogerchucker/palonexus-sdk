@@ -91,6 +91,10 @@ SAFE_ENV_KEYS = {
     "TERM",
     "TMPDIR",
 }
+PINNED_DOCKER_BASE = (
+    "docker.io/library/node@"
+    "sha256:6c74791e557ce11fc957704f6d4fe134a7bc8d6f5ca4403205b2966bd488f6b3"
+)
 
 
 def _run(
@@ -177,7 +181,8 @@ def _safe_environment(home: Path, temp: Path) -> dict[str, str]:
 
 
 def _sandbox_profile(temp: Path, executables: list[Path]) -> tuple[Path, str]:
-    if platform.system() != "Darwin" or shutil.which("sandbox-exec") is None:
+    sandbox = Path("/usr/bin/sandbox-exec")
+    if platform.system() != "Darwin" or not sandbox.is_file():
         raise RuntimeError(
             "safe capture requires macOS sandbox-exec; no unsafe fallback exists"
         )
@@ -213,16 +218,98 @@ def _sandbox_profile(temp: Path, executables: list[Path]) -> tuple[Path, str]:
     return profile, _sha256_file(profile)
 
 
+def _sandbox_deny_canary(temp: Path) -> None:
+    target = temp / "sandbox-deny-canary"
+    result = subprocess.run(
+        [
+            "/usr/bin/sandbox-exec",
+            "-p",
+            "(version 1)(deny default)(allow process*)",
+            "/usr/bin/touch",
+            str(target),
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode == 0 or target.exists():
+        raise RuntimeError("sandbox deny canary unexpectedly succeeded")
+
+
+def docker_capture_command(
+    *,
+    image: str,
+    output: Path,
+    credentials: Path,
+    network: str,
+    command: list[str],
+) -> list[str]:
+    """Build the only accepted Docker isolation envelope."""
+    if "@sha256:" not in image and not re.fullmatch(r"sha256:[0-9a-f]{64}", image):
+        raise ValueError("Docker capture image must be pinned by digest")
+    if network not in {"none", "bridge"}:
+        raise ValueError("Docker network must be explicitly none or bridge")
+    output = output.resolve()
+    credentials = credentials.resolve()
+    if not output.is_dir() or not credentials.is_file():
+        raise ValueError("Docker capture mounts must exist")
+    return [
+        "/usr/local/bin/docker",
+        "run",
+        "--rm",
+        "--user",
+        "10001:10001",
+        "--read-only",
+        "--network",
+        network,
+        "--cap-drop",
+        "ALL",
+        "--security-opt",
+        "no-new-privileges",
+        "--cpus",
+        "1",
+        "--memory",
+        "1g",
+        "--pids-limit",
+        "128",
+        "--tmpfs",
+        "/home/fixture:rw,noexec,nosuid,nodev,size=64m,mode=1777",
+        "--tmpfs",
+        "/tmp:rw,noexec,nosuid,nodev,size=64m,mode=1777",
+        "--mount",
+        f"type=bind,src={output},dst=/output",
+        "--mount",
+        (
+            f"type=bind,src={credentials},"
+            "dst=/home/fixture/.claude/.credentials.json,readonly"
+        ),
+        "--env",
+        "HOME=/home/fixture",
+        "--env",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        image,
+        *command,
+    ]
+
+
 def _fixture_relative(value: str, fixture_root: Path) -> str:
     if WINDOWS_ABSOLUTE.search(value):
         raise ValueError("Windows or UNC absolute paths are forbidden")
-    aliases = {str(fixture_root), str(fixture_root.resolve())}
-    for alias in sorted(aliases, key=len, reverse=True):
-        if value == alias:
-            return "<fixture-root>"
-        if value.startswith(alias + "/"):
-            return "<fixture-root>/" + value[len(alias) + 1 :]
-    raise ValueError("absolute path is outside the disposable fixture root")
+    candidate = Path(value)
+    if not candidate.is_absolute():
+        raise ValueError("fixture path must be absolute before sanitization")
+    if ".." in candidate.parts:
+        raise ValueError("path traversal is forbidden")
+    root = fixture_root.resolve()
+    resolved = candidate.resolve()
+    if not resolved.is_relative_to(root):
+        raise ValueError("absolute path is outside the disposable fixture root")
+    relative = resolved.relative_to(root)
+    return (
+        "<fixture-root>"
+        if not relative.parts
+        else f"<fixture-root>/{relative.as_posix()}"
+    )
 
 
 def _safe_scalar(value: Any) -> Any:
@@ -405,6 +492,9 @@ def validate_evidence(fixtures: Path) -> list[str]:
         errors.append("invalid candidate executable digest")
     if not candidate.get("os") or not candidate.get("arch"):
         errors.append("candidate platform identity is incomplete")
+    latest_stable = host.get("latestStable", {})
+    if not str(latest_stable.get("integrity", "")).startswith("sha512-"):
+        errors.append("latest stable npm integrity is missing")
     if set(capabilities.get("toolFamilies", [])) != REQUIRED_FAMILIES:
         errors.append("claimed tool family set is not exact")
     for family, tool_name in EXPECTED_TOOL_NAMES.items():
@@ -425,9 +515,16 @@ def validate_evidence(fixtures: Path) -> list[str]:
         )
     scenarios = capabilities.get("scenarios", {})
     if set(scenarios) != REQUIRED_SCENARIOS:
-        errors.append("blocking scenario set is not exact")
-    for name in REQUIRED_SCENARIOS:
+        missing = sorted(REQUIRED_SCENARIOS - set(scenarios))
+        extra = sorted(set(scenarios) - REQUIRED_SCENARIOS)
+        errors.append(
+            f"trusted blocking scenario set is incomplete: missing={missing}, "
+            f"extra={extra}"
+        )
+    for name in REQUIRED_SCENARIOS & set(scenarios):
         summary = scenarios.get(name, {})
+        if summary.get("evidenceStatus") != "trusted-sandboxed":
+            errors.append(f"scenario summary is not trusted: {name}")
         raw_path = summary.get("rawEvidence")
         if raw_path != f"scenarios/{name}.json":
             errors.append(f"bad raw evidence path: {name}")
@@ -445,28 +542,83 @@ def validate_evidence(fixtures: Path) -> list[str]:
         if raw.get("platform") != candidate.get("os"):
             errors.append(f"scenario platform mismatch: {name}")
         evidence_status = raw.get("evidenceStatus")
+        if evidence_status != summary.get("evidenceStatus"):
+            errors.append(f"scenario evidence status mismatch: {name}")
         if evidence_status == "trusted-sandboxed":
             if raw.get("hookInvocationCount") != 1:
                 errors.append(f"scenario did not invoke exactly one hook: {name}")
             if not raw.get("hostRenderedEvidence"):
                 errors.append(f"missing host-rendered evidence: {name}")
-        elif evidence_status == "superseded-untrusted":
-            if raw.get("claimExcluded") is not True:
-                errors.append(f"untrusted scenario is not claim-excluded: {name}")
-            if raw.get("hookInvocationCount") is not None:
-                errors.append(f"untrusted hook count must remain unknown: {name}")
-            if raw.get("hostRenderedEvidence") is not None:
-                errors.append(
-                    f"untrusted rendered evidence must remain unknown: {name}"
-                )
-            if not raw.get("limitation"):
-                errors.append(f"untrusted scenario lacks limitation: {name}")
         else:
-            errors.append(f"unknown evidence status: {name}")
+            errors.append(f"raw scenario is not trusted: {name}")
         if not SHA256.fullmatch(str(raw.get("attemptFingerprint", ""))):
             errors.append(f"invalid attempt fingerprint: {name}")
         if raw.get("sentinelExistsAfter") is not False:
             errors.append(f"sentinel was not proven absent: {name}")
+        requested = raw.get("requestedToolInput")
+        observed = raw.get("observedToolInput")
+        if requested != observed:
+            errors.append(f"requested/observed tool input mismatch: {name}")
+        if not isinstance(requested, dict):
+            errors.append(f"missing requested tool input: {name}")
+        else:
+            nonce = raw.get("nonce")
+            expected_command = f"touch sentinel-{name}-{nonce}"
+            if requested != {"command": expected_command}:
+                errors.append(f"tool input is not nonce-bound: {name}")
+    if scenarios:
+        runtime = host.get("captureRuntime", {})
+        image_digest = str(runtime.get("containerImageDigest", ""))
+        if not SHA256.fullmatch(
+            f"sha256:{image_digest.removeprefix('sha256:')}"
+        ):
+            errors.append("trusted capture container digest is missing")
+        if runtime.get("os") != "Linux" or not runtime.get("arch"):
+            errors.append("trusted capture container platform is invalid")
+    legacy_files = capabilities.get("legacyEvidenceFiles", [])
+    for relative in legacy_files:
+        try:
+            legacy = json.loads((fixtures / relative).read_text())
+        except (OSError, json.JSONDecodeError):
+            errors.append(f"missing legacy evidence: {relative}")
+            continue
+        if legacy.get("evidenceStatus") != "superseded-untrusted":
+            errors.append(f"legacy evidence is not marked untrusted: {relative}")
+        if legacy.get("claimExcluded") is not True:
+            errors.append(f"legacy evidence is not claim-excluded: {relative}")
+        for result_field in (
+            "guardExitCode",
+            "hookExitCode",
+            "hookInvocationCount",
+            "hostRenderedEvidence",
+            "nonce",
+            "sentinelExistsAfter",
+        ):
+            if legacy.get(result_field) is not None:
+                errors.append(
+                    f"legacy capability result must be unknown: "
+                    f"{relative}/{result_field}"
+                )
+    preservation = capabilities.get("nativePermissionPreservation", {})
+    for mode, expected_mutation in (("nativeAllow", True), ("nativeDeny", False)):
+        comparison = preservation.get(mode, {})
+        if comparison.get("status") != "tested":
+            errors.append(f"native permission comparison is unresolved: {mode}")
+            continue
+        if comparison.get("equivalent") is not True:
+            errors.append(f"native permission comparison differs: {mode}")
+        for arm in ("baseline", "noopHook"):
+            evidence = comparison.get(arm, {})
+            if evidence.get("toolInvocationCount") != 1:
+                errors.append(f"native probe skipped or repeated: {mode}/{arm}")
+            if evidence.get("sentinelMutated") is not expected_mutation:
+                errors.append(f"native probe outcome mismatch: {mode}/{arm}")
+            if not evidence.get("nonce") or not SHA256.fullmatch(
+                str(evidence.get("attemptFingerprint", ""))
+            ):
+                errors.append(f"native probe correlation missing: {mode}/{arm}")
+    if capabilities.get("gateComplete") is not True:
+        errors.append("Claude Gate 0 is not complete")
     for digest_key in ("sha256",):
         if not SHA256.fullmatch(str(contract.get(digest_key, ""))):
             errors.append(f"invalid official contract {digest_key}")
@@ -478,6 +630,42 @@ def validate_evidence(fixtures: Path) -> list[str]:
 def _write_json(path: Path, value: object) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+
+
+def _action_fingerprint(tool_name: str, tool_input: dict[str, Any]) -> str:
+    canonical = json.dumps(
+        {"tool_name": tool_name, "tool_input": tool_input},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode()
+    return f"sha256:{hashlib.sha256(canonical).hexdigest()}"
+
+
+def _tool_uses(result: subprocess.CompletedProcess[str]) -> list[dict[str, Any]]:
+    uses: list[dict[str, Any]] = []
+
+    def visit(value: Any) -> None:
+        if isinstance(value, dict):
+            if (
+                value.get("type") == "tool_use"
+                and isinstance(value.get("name"), str)
+                and isinstance(value.get("input"), dict)
+            ):
+                uses.append(
+                    {"tool_name": value["name"], "tool_input": value["input"]}
+                )
+            for child in value.values():
+                visit(child)
+        elif isinstance(value, list):
+            for child in value:
+                visit(child)
+
+    for line in result.stdout.splitlines():
+        try:
+            visit(json.loads(line))
+        except json.JSONDecodeError:
+            continue
+    return uses
 
 
 def _runtime_files(temp: Path) -> tuple[Path, Path, Path]:
@@ -542,6 +730,22 @@ name = payload.get("tool_name", "unknown").replace("/", "_")
 mode = os.environ.get("PALONEXUS_HOOK_MODE", "noop")
 nonce = os.environ.get("PALONEXUS_SCENARIO_NONCE")
 scenario_log = os.environ.get("PALONEXUS_SCENARIO_LOG")
+if nonce:
+    expected_mode = os.environ["PALONEXUS_EXPECTED_HOOK_MODE"]
+    expected_tool = os.environ["PALONEXUS_EXPECTED_TOOL"]
+    expected_input = json.loads(os.environ["PALONEXUS_EXPECTED_TOOL_INPUT"])
+    observed_effect_input = {
+        key: value for key, value in tool_input.items() if key != "description"
+    }
+    if (
+        mode != expected_mode
+        or tool_name != expected_tool
+        or observed_effect_input != expected_input
+        or nonce not in json.dumps(expected_input, sort_keys=True)
+    ):
+        print("fixture harness rejected nonce or expected input mismatch",
+              file=sys.stderr)
+        raise SystemExit(2)
 record = {
     "nonce": nonce,
     "hookMode": mode,
@@ -550,7 +754,11 @@ record = {
         json.dumps(
             {
                 "tool_name": payload.get("tool_name"),
-                "tool_input": payload.get("tool_input"),
+                "tool_input": {
+                    key: value
+                    for key, value in payload.get("tool_input", {}).items()
+                    if key != "description"
+                },
             },
             sort_keys=True,
             separators=(",", ":"),
@@ -692,7 +900,7 @@ def _invoke(
     permission_mode: str = "manual",
 ) -> subprocess.CompletedProcess[str]:
     command = [
-        shutil.which("sandbox-exec") or "sandbox-exec",
+        "/usr/bin/sandbox-exec",
         "-f",
         str(sandbox_profile),
         *claude,
@@ -706,7 +914,8 @@ def _invoke(
         permission_mode,
         "--no-session-persistence",
         "--output-format",
-        "json",
+        "stream-json",
+        "--verbose",
     ]
     if tools is not None:
         command += ["--tools", tools]
@@ -748,6 +957,27 @@ def capture() -> None:
         )
         _require_success(tags_result, "npm Claude dist-tags lookup")
         stable_version = json.loads(tags_result.stdout)["stable"]
+        def npm_integrity(version: str) -> str:
+            result = _run(
+                [
+                    "npm",
+                    "view",
+                    f"@anthropic-ai/claude-code@{version}",
+                    "dist.integrity",
+                    "--json",
+                ],
+                cwd=repo,
+                env=base_env,
+                timeout=60,
+            )
+            _require_success(result, f"npm integrity lookup for {version}")
+            integrity = json.loads(result.stdout)
+            if not isinstance(integrity, str) or not integrity.startswith("sha512-"):
+                raise RuntimeError(f"invalid npm integrity for {version}")
+            return integrity
+
+        candidate_integrity = npm_integrity(candidate_version)
+        stable_integrity = npm_integrity(stable_version)
         commit_result = _run(
             ["git", "ls-remote", "https://github.com/anthropics/claude-code", "HEAD"],
             cwd=repo,
@@ -784,6 +1014,7 @@ def capture() -> None:
                 Path(shutil.which("npx") or "/usr/local/bin/npx"),
             ],
         )
+        _sandbox_deny_canary(temp)
         settings = temp / "settings.json"
         _write_json(settings, _settings(hook))
         empty_settings = temp / "empty-settings.json"
@@ -889,6 +1120,12 @@ def capture() -> None:
             env["PALONEXUS_HOOK_MODE"] = mode
             env["PALONEXUS_SCENARIO_NONCE"] = nonce
             env["PALONEXUS_SCENARIO_LOG"] = str(scenario_log)
+            requested_input = {"command": f"touch {sentinel.name}"}
+            env["PALONEXUS_EXPECTED_HOOK_MODE"] = mode
+            env["PALONEXUS_EXPECTED_TOOL"] = "Bash"
+            env["PALONEXUS_EXPECTED_TOOL_INPUT"] = json.dumps(
+                requested_input, sort_keys=True
+            )
             scenario = _invoke(
                 [installed],
                 f"Use Bash exactly once to run `touch {sentinel.name}`. "
@@ -901,6 +1138,23 @@ def capture() -> None:
                 sandbox_profile=sandbox_profile,
             )
             _require_success(scenario, name)
+            uses = _tool_uses(scenario)
+            expected_use = {"tool_name": "Bash", "tool_input": requested_input}
+            normalized_uses = [
+                {
+                    "tool_name": use["tool_name"],
+                    "tool_input": {
+                        key: value
+                        for key, value in use["tool_input"].items()
+                        if key != "description"
+                    },
+                }
+                for use in uses
+            ]
+            if normalized_uses != [expected_use]:
+                raise RuntimeError(
+                    f"{name}: expected exactly one nonce-bound tool use"
+                )
             rendered = expected_reasons[name]
             if rendered not in scenario.stdout + scenario.stderr:
                 raise RuntimeError(f"{name}: host did not render hook evidence")
@@ -917,7 +1171,16 @@ def capture() -> None:
                     f"{name}: expected one hook invocation, got {len(records)}"
                 )
             record = records[0]
+            expected_fingerprint = _action_fingerprint("Bash", requested_input)
+            if record["attemptFingerprint"] != expected_fingerprint:
+                raise RuntimeError(f"{name}: hook fingerprint mismatch")
+            if (
+                record.get("nonce") != nonce
+                or record.get("hookMode") != mode
+            ):
+                raise RuntimeError(f"{name}: hook correlation mismatch")
             entry: dict[str, Any] = {
+                "evidenceStatus": "trusted-sandboxed",
                 "testedWithRealHost": True,
                 "hostVersion": candidate_version,
                 "hostProcessExitCode": scenario.returncode,
@@ -952,6 +1215,9 @@ def capture() -> None:
                     "arch": platform.machine(),
                     "hostProcessExitCode": scenario.returncode,
                     "hostRenderedEvidence": rendered,
+                    "requestedToolInput": requested_input,
+                    "observedToolInput": normalized_uses[0]["tool_input"],
+                    "expectedSentinel": f"<fixture-root>/repo/{sentinel.name}",
                     "sentinelExistsAfter": False,
                     "sandboxProfileSha256": sandbox_digest,
                     "environmentPolicy": "strict-allowlist",
@@ -967,6 +1233,12 @@ def capture() -> None:
         env["PALONEXUS_HOOK_MODE"] = "deny"
         env["PALONEXUS_SCENARIO_NONCE"] = stable_nonce
         env["PALONEXUS_SCENARIO_LOG"] = str(stable_log)
+        stable_requested_input = {"command": f"touch {stable_sentinel.name}"}
+        env["PALONEXUS_EXPECTED_HOOK_MODE"] = "deny"
+        env["PALONEXUS_EXPECTED_TOOL"] = "Bash"
+        env["PALONEXUS_EXPECTED_TOOL_INPUT"] = json.dumps(
+            stable_requested_input, sort_keys=True
+        )
         stable_result = _invoke(
             stable_command,
             f"Use Bash exactly once to run `touch {stable_sentinel.name}`. "
@@ -981,6 +1253,24 @@ def capture() -> None:
         _require_success(stable_result, "latest stable denial")
         if stable_sentinel.exists():
             raise RuntimeError("latest stable host executed a denied sentinel")
+        stable_uses = _tool_uses(stable_result)
+        stable_normalized = [
+            {
+                "tool_name": use["tool_name"],
+                "tool_input": {
+                    key: value
+                    for key, value in use["tool_input"].items()
+                    if key != "description"
+                },
+            }
+            for use in stable_uses
+        ]
+        if stable_normalized != [
+            {"tool_name": "Bash", "tool_input": stable_requested_input}
+        ]:
+            raise RuntimeError(
+                "latest stable denial did not make one exact nonce-bound tool use"
+            )
         if "fixture structured denial" not in (
             stable_result.stdout + stable_result.stderr
         ):
@@ -993,7 +1283,13 @@ def capture() -> None:
                 "latest stable denial did not invoke exactly one hook"
             )
         stable_record = stable_records[0]
+        stable_fingerprint = _action_fingerprint(
+            "Bash", stable_requested_input
+        )
+        if stable_record["attemptFingerprint"] != stable_fingerprint:
+            raise RuntimeError("latest stable hook fingerprint mismatch")
         scenario_results["stable_deny"] = {
+            "evidenceStatus": "trusted-sandboxed",
             "testedWithRealHost": True,
             "hostVersion": stable_version,
             "hostProcessExitCode": stable_result.returncode,
@@ -1014,6 +1310,11 @@ def capture() -> None:
                 "arch": platform.machine(),
                 "hostProcessExitCode": stable_result.returncode,
                 "hostRenderedEvidence": "fixture structured denial",
+                "requestedToolInput": stable_requested_input,
+                "observedToolInput": stable_normalized[0]["tool_input"],
+                "expectedSentinel": (
+                    f"<fixture-root>/repo/{stable_sentinel.name}"
+                ),
                 "sentinelExistsAfter": False,
                 "sandboxProfileSha256": sandbox_digest,
                 "environmentPolicy": "strict-allowlist",
@@ -1027,10 +1328,18 @@ def capture() -> None:
             *,
             allow: bool,
         ) -> dict[str, Any]:
-            sentinel = repo / f"sentinel-{label}"
+            nonce = secrets.token_hex(8)
+            sentinel = repo / f"sentinel-{label}-{nonce}"
+            requested_input = {"command": f"touch {sentinel.name}"}
             env["PALONEXUS_HOOK_MODE"] = "noop"
-            env.pop("PALONEXUS_SCENARIO_LOG", None)
-            env.pop("PALONEXUS_SCENARIO_NONCE", None)
+            env["PALONEXUS_SCENARIO_NONCE"] = nonce
+            env["PALONEXUS_EXPECTED_HOOK_MODE"] = "noop"
+            env["PALONEXUS_EXPECTED_TOOL"] = "Bash"
+            env["PALONEXUS_EXPECTED_TOOL_INPUT"] = json.dumps(
+                requested_input, sort_keys=True
+            )
+            probe_log = temp / f"{label}-{nonce}.jsonl"
+            env["PALONEXUS_SCENARIO_LOG"] = str(probe_log)
             result = _invoke(
                 [installed],
                 f"Use Bash exactly once to run `touch {sentinel.name}`. Do not retry.",
@@ -1043,10 +1352,47 @@ def capture() -> None:
                 sandbox_profile=sandbox_profile,
             )
             _require_success(result, label)
+            uses = _tool_uses(result)
+            normalized = [
+                {
+                    "tool_name": use["tool_name"],
+                    "tool_input": {
+                        key: value
+                        for key, value in use["tool_input"].items()
+                        if key != "description"
+                    },
+                }
+                for use in uses
+            ]
+            expected = {"tool_name": "Bash", "tool_input": requested_input}
+            if normalized != [expected]:
+                raise RuntimeError(
+                    f"{label}: expected exactly one correlated tool invocation"
+                )
+            hook_records = (
+                [
+                    json.loads(line)
+                    for line in probe_log.read_text().splitlines()
+                    if line
+                ]
+                if probe_settings == settings
+                else []
+            )
+            if probe_settings == settings and len(hook_records) != 1:
+                raise RuntimeError(
+                    f"{label}: no-op hook did not run exactly once"
+                )
             return {
                 "hostVersion": candidate_version,
                 "sentinelMutated": sentinel.exists(),
                 "hostProcessExitCode": result.returncode,
+                "toolInvocationCount": 1,
+                "nonce": nonce,
+                "attemptFingerprint": _action_fingerprint(
+                    "Bash", requested_input
+                ),
+                "requestedToolInput": requested_input,
+                "observedToolInput": normalized[0]["tool_input"],
             }
 
         native_allow_baseline = permission_probe(
@@ -1063,6 +1409,7 @@ def capture() -> None:
         )
         native_preservation = {
             "nativeAllow": {
+                "status": "tested",
                 "baseline": native_allow_baseline,
                 "noopHook": native_allow_noop,
                 "equivalent": (
@@ -1099,6 +1446,8 @@ def capture() -> None:
                 "tested": True,
                 "source": "locally installed executable",
                 "origin": "Claude Code native installer executable",
+                "package": "@anthropic-ai/claude-code",
+                "packageIntegrity": candidate_integrity,
                 "sha256": _sha256_file(candidate_path),
                 "os": platform.system(),
                 "arch": platform.machine(),
@@ -1108,6 +1457,14 @@ def capture() -> None:
                 "tested": True,
                 "source": "npm stable dist-tag at capture time",
                 "package": "@anthropic-ai/claude-code",
+                "integrity": stable_integrity,
+            },
+            "captureRuntime": {
+                "containerImageDigest": os.environ.get(
+                    "PALONEXUS_CONTAINER_IMAGE_DIGEST"
+                ),
+                "os": platform.system(),
+                "arch": platform.machine(),
             },
             "minimumSupported": {
                 "version": None,
