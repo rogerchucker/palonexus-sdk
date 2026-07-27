@@ -144,9 +144,7 @@ def _context_value(
             raise ModelValidationError()
         return context
     return TaskContext(
-        task_id=(
-            task_id if task_id is not None else _new_identifier("task")
-        ),
+        task_id=(task_id if task_id is not None else _new_identifier("task")),
         session_id=(
             session_id if session_id is not None else _new_identifier("session")
         ),
@@ -217,9 +215,7 @@ def task(
     when building from generator-driven code.
     """
 
-    return _TaskScope(
-        _context_value(context, task_id=task_id, session_id=session_id)
-    )
+    return _TaskScope(_context_value(context, task_id=task_id, session_id=session_id))
 
 
 def atask(

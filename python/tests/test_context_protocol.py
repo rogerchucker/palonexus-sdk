@@ -325,9 +325,12 @@ def test_builder_creates_generated_wire_request_and_matches_scope_vectors() -> N
     document = prepared.request.to_dict()
 
     assert isinstance(prepared.request, generated.ActionRequest)
-    assert document["target"] == json.loads(
-        (ROOT / "protocol/test-vectors/action/valid/file-write.json").read_text()
-    )["target"]
+    assert (
+        document["target"]
+        == json.loads(
+            (ROOT / "protocol/test-vectors/action/valid/file-write.json").read_text()
+        )["target"]
+    )
     assert prepared.client_scope_hash == independent_client_scope_hash(document)
     validate_action_document(document)
 
@@ -510,9 +513,7 @@ def test_fresh_resume_preserves_action_scope_but_rotates_attempt_identity() -> N
     with pytest.raises(ModelValidationError):
         original.consume()
     assert resumed.consume() == "/workspace/deploy/production.yaml"
-    assert resumed.request.resume_from_approval_id == (
-        "apr_01J5ABCDEFGHJKMNPQRSTVWXY2"
-    )
+    assert resumed.request.resume_from_approval_id == ("apr_01J5ABCDEFGHJKMNPQRSTVWXY2")
     assert resumed.request.causation_id == "dec_01J5ABCDEFGHJKMNPQRSTVWXY3"
     assert resumed.client_scope_hash == original.client_scope_hash
 

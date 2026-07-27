@@ -12,12 +12,13 @@ PACKAGE = ROOT / "python" / "src" / "palonexus" / "_canonicalize.py"
 REFERENCE_VECTOR_PATH = (
     'VECTORS = Path(__file__).parents[1] / "test-vectors" / "canonicalization"'
 )
-PACKAGE_VECTOR_PATH = """VECTORS = (
-    Path(__file__).parents[3]
-    / "protocol"
-    / "test-vectors"
-    / "canonicalization"
-)"""
+# The emitted statement is one line: it fits the project's 88-column limit, and a
+# wrapped form makes `ruff format` reject the vendored output. It is written here as
+# two concatenated parts only to keep this source line within the same limit.
+PACKAGE_VECTOR_PATH = (
+    'VECTORS = Path(__file__).parents[3] / "protocol"'
+    ' / "test-vectors" / "canonicalization"'
+)
 
 
 def generated_bytes() -> bytes:

@@ -164,6 +164,7 @@ class _ExecutionState:
                 self.closed = True
                 self.finalizer.detach()
 
+
 _TARGET_STATES: weakref.WeakKeyDictionary[_PreparedTarget, _ExecutionState]
 _ACTION_STATES: weakref.WeakKeyDictionary[_PreparedAction, _ExecutionState]
 
@@ -672,10 +673,7 @@ class ActionRequestBuilder:
     ) -> _PreparedAction:
         try:
             checked = ActionRequest.model_validate(
-                {
-                    name: getattr(intent, name)
-                    for name in type(intent).model_fields
-                }
+                {name: getattr(intent, name) for name in type(intent).model_fields}
             )
             if checked.action_id is None or checked.request_id is None:
                 raise _invalid()
@@ -717,9 +715,7 @@ class ActionRequestBuilder:
                     kind=_wire.TargetKind(canonical_target["kind"]),
                     service=canonical_target["service"],
                     resource=_wire.SafeText(canonical_target["resource"]),
-                    resource_hash=_wire.SHA256Digest(
-                        canonical_target["resourceHash"]
-                    ),
+                    resource_hash=_wire.SHA256Digest(canonical_target["resourceHash"]),
                 ),
                 side_effect=_wire.SideEffect(checked.side_effect),
                 occurred_at=_timestamp(lambda: datetime.now(UTC)),
@@ -815,8 +811,7 @@ class ActionRequestBuilder:
                 request.adapter != self._adapter
                 or request.resume_from_approval_id is not None
                 or type(client_scope_hash) is not str
-                or _canonical.client_scope_hash(request.to_dict())
-                != client_scope_hash
+                or _canonical.client_scope_hash(request.to_dict()) != client_scope_hash
             ):
                 raise ValueError
             target_document = request.target.to_dict()
@@ -855,9 +850,11 @@ class ActionRequestBuilder:
         decision before committing execution ownership. The public ``resume``
         method above retains its original atomic-transfer contract.
         """
-        if not isinstance(original, _PreparedAction) or not isinstance(
-            current, _PreparedAction
-        ) or current is original:
+        if (
+            not isinstance(original, _PreparedAction)
+            or not isinstance(current, _PreparedAction)
+            or current is original
+        ):
             raise _invalid()
         original._verify_for(self._seal_key)
         current._verify_for(self._seal_key)
@@ -902,16 +899,15 @@ class ActionRequestBuilder:
                 resume_from_approval_id=_wire.ApprovalID(approval_id),
             )
             resumed_request.validate_structural()
-            if (
-                resumed_request.request_id
-                in {prior.request_id, checked.request_id}
-                or resumed_request.idempotency_key
-                in {prior.idempotency_key, checked.idempotency_key}
-            ):
+            if resumed_request.request_id in {
+                prior.request_id,
+                checked.request_id,
+            } or resumed_request.idempotency_key in {
+                prior.idempotency_key,
+                checked.idempotency_key,
+            }:
                 raise _invalid()
-            resumed_scope_hash = _canonical.client_scope_hash(
-                resumed_request.to_dict()
-            )
+            resumed_scope_hash = _canonical.client_scope_hash(resumed_request.to_dict())
             if resumed_scope_hash != original.client_scope_hash:
                 raise ApprovalScopeMismatch(
                     request_id=resumed_request.request_id,

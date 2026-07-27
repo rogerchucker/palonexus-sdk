@@ -421,9 +421,7 @@ def test_public_approval_record_enforces_cross_field_time_invariants(
     value = replace(
         value,
         requested_at=wire.RFC3339Timestamp(requested_at),
-        decided_at=(
-            None if decided_at is None else wire.RFC3339Timestamp(decided_at)
-        ),
+        decided_at=(None if decided_at is None else wire.RFC3339Timestamp(decided_at)),
         expires_at=wire.RFC3339Timestamp(expires_at),
     )
     with pytest.raises(InvalidDecision):
@@ -437,9 +435,7 @@ def test_resume_uses_exact_trusted_time_with_arbitrary_fractional_precision() ->
     initial = AuthorizationClient(auth).decide(original)
     value = replace(
         _approval("approved", original, initial),
-        decided_at=wire.RFC3339Timestamp(
-            "2026-07-25T20:04:01.123456789123456789Z"
-        ),
+        decided_at=wire.RFC3339Timestamp("2026-07-25T20:04:01.123456789123456789Z"),
     )
     approval = ApprovalRecord._from_protocol(value)
 
@@ -479,15 +475,11 @@ def test_decision_approval_expiry_comparison_preserves_submicrosecond_order() ->
     assert value.approval is not None
     value = replace(
         value,
-        server_time=wire.RFC3339Timestamp(
-            "2026-07-25T20:02:01.1234567889Z"
-        ),
+        server_time=wire.RFC3339Timestamp("2026-07-25T20:02:01.1234567889Z"),
         expires_at=wire.RFC3339Timestamp("2026-07-25T20:02:02Z"),
         approval=replace(
             value.approval,
-            expires_at=wire.RFC3339Timestamp(
-                "2026-07-25T20:02:01.1234567890Z"
-            ),
+            expires_at=wire.RFC3339Timestamp("2026-07-25T20:02:01.1234567890Z"),
         ),
     )
 
@@ -592,9 +584,7 @@ def test_async_poll_chain_rejects_replacement() -> None:
         pending = _approval("pending", original, prior)
         replacement = replace(
             _approval("approved", original, prior),
-            correlation_id=wire.CorrelationID(
-                "corr_01J5ABCDEFGHJKMNPQRSTVWXY9"
-            ),
+            correlation_id=wire.CorrelationID("corr_01J5ABCDEFGHJKMNPQRSTVWXY9"),
         )
         client = AsyncAuthorizationClient(
             auth,

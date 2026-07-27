@@ -154,9 +154,7 @@ class ApprovalRecord:
                     None if value.decided_at is None else str(value.decided_at)
                 ),
                 "expires_at": str(value.expires_at),
-                "_extensions_canonical": _canonical.canonical_json(
-                    value.extensions
-                ),
+                "_extensions_canonical": _canonical.canonical_json(value.extensions),
                 "requested_at": str(value.requested_at),
                 "requester_ref": value.requester_ref,
                 "resolution_audit_ref": (
