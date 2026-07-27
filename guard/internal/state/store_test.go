@@ -3,6 +3,7 @@
 package state
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
@@ -283,8 +284,12 @@ func TestStoreSerializesAcrossProcesses(t *testing.T) {
 		t.Fatal(err)
 	}
 	var commands []*exec.Cmd
+	var outputs []*bytes.Buffer
 	for index := 0; index < 6; index++ {
 		command := exec.Command(os.Args[0], "-test.run=^TestStateProcessHelper$")
+		output := new(bytes.Buffer)
+		command.Stdout = output
+		command.Stderr = output
 		command.Env = append(os.Environ(),
 			"PALONEXUS_STATE_HELPER=1",
 			"PALONEXUS_STATE_ROOT="+root,
@@ -294,10 +299,11 @@ func TestStoreSerializesAcrossProcesses(t *testing.T) {
 			t.Fatal(err)
 		}
 		commands = append(commands, command)
+		outputs = append(outputs, output)
 	}
-	for _, command := range commands {
+	for index, command := range commands {
 		if err := command.Wait(); err != nil {
-			t.Fatal(err)
+			t.Fatalf("helper %d: %v\n%s", index, err, outputs[index].String())
 		}
 	}
 	store, err = New(root)
