@@ -18,6 +18,7 @@ import (
 	"time"
 
 	"github.com/rogerchucker/palonexus-sdk/guard/pkg/protocol"
+	"golang.org/x/sys/unix"
 )
 
 func echoHandler(_ context.Context, request []byte) ([]byte, error) {
@@ -119,6 +120,18 @@ func TestOneRequestOneResponseNDJSON(t *testing.T) {
 	got := exchange(t, path, `{"schemaVersion":"1","value":"ok"}`+"\n")
 	if string(got) != `{"schemaVersion":"1","value":"ok"}`+"\n" {
 		t.Fatalf("unexpected response %q", got)
+	}
+}
+
+func TestHandlerResponseIsOneCompactPhysicalLine(t *testing.T) {
+	_, path := startTestServer(t, func(c *Config) {
+		c.Handler = func(context.Context, []byte) ([]byte, error) {
+			return []byte("{\n  \"schemaVersion\": \"1\",\n  \"value\": \"ok\"\n}"), nil
+		}
+	})
+	got := exchange(t, path, `{"schemaVersion":"1"}`+"\n")
+	if string(got) != `{"schemaVersion":"1","value":"ok"}`+"\n" {
+		t.Fatalf("response is not compact NDJSON: %q", got)
 	}
 }
 
@@ -293,6 +306,53 @@ func TestRejectsUnsafeRuntimeAndPreexistingSocketPaths(t *testing.T) {
 			t.Fatal("accepted pre-existing socket")
 		}
 	})
+
+	t.Run("device", func(t *testing.T) {
+		dir := filepath.Join(root, "existing-device")
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		device := filepath.Join(dir, DefaultSocketName)
+		err := unix.Mknod(device, unix.S_IFCHR|0o600, int(unix.Mkdev(1, 3)))
+		if errors.Is(err, unix.EPERM) || errors.Is(err, unix.EACCES) {
+			t.Skip("kernel denied unprivileged device inode creation")
+		}
+		if err != nil {
+			t.Fatalf("device capability probe failed: %v", err)
+		}
+		if _, err := New(Config{RuntimeDir: dir, Handler: echoHandler}); err == nil {
+			t.Fatal("accepted pre-existing device inode")
+		}
+		if info, err := os.Lstat(device); err != nil || info.Mode()&os.ModeDevice == 0 {
+			t.Fatalf("device inode was removed: %v", err)
+		}
+	})
+}
+
+func TestOwnedStaleModeClassifierRejectsEveryNonSocketInode(t *testing.T) {
+	identity := fileIdentity{device: 7, inode: 9}
+	record := identity
+	for name, mode := range map[string]uint32{
+		"regular":   unix.S_IFREG | 0o600,
+		"directory": unix.S_IFDIR | 0o700,
+		"fifo":      unix.S_IFIFO | 0o600,
+		"character": unix.S_IFCHR | 0o600,
+		"block":     unix.S_IFBLK | 0o600,
+		"symlink":   unix.S_IFLNK | 0o777,
+	} {
+		t.Run(name, func(t *testing.T) {
+			node := nodeInfo{identity: identity, mode: mode, uid: uint32(os.Getuid())}
+			if ownedStaleSocket(node, &record) {
+				t.Fatalf("classified %s as an owned stale socket", name)
+			}
+		})
+	}
+	socket := nodeInfo{
+		identity: identity, mode: unix.S_IFSOCK | 0o600, uid: uint32(os.Getuid()),
+	}
+	if !ownedStaleSocket(socket, &record) {
+		t.Fatal("rejected matching owned socket")
+	}
 }
 
 func TestCleanupNeverUnlinksReplacement(t *testing.T) {
@@ -332,6 +392,64 @@ func TestRuntimeDirectoryReplacementBeforeBindIsRejected(t *testing.T) {
 	if srv, err := New(cfg); err == nil {
 		_ = srv.Close()
 		t.Fatal("accepted replaced runtime directory")
+	}
+}
+
+func TestReplacementAfterLastValidationBeforeBindIsRejected(t *testing.T) {
+	root, err := os.MkdirTemp("", "pn-bind-race-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	dir := filepath.Join(root, "run")
+	cfg := Config{RuntimeDir: dir, Handler: echoHandler}
+	cfg.afterValidationBeforeBind = func() {
+		if err := os.Rename(dir, dir+".original"); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if srv, err := New(cfg); err == nil {
+		_ = srv.Close()
+		t.Fatal("accepted replacement after final validation")
+	}
+}
+
+func TestPublishedPathMustReachActualListener(t *testing.T) {
+	root, err := os.MkdirTemp("", "pn-proof-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	dir := filepath.Join(root, "run")
+	var replacement *net.UnixListener
+	cfg := Config{
+		RuntimeDir: dir, Handler: echoHandler, IOTimeout: 30 * time.Millisecond,
+	}
+	cfg.beforeListenerProof = func(path string) {
+		if err := os.Remove(path); err != nil {
+			t.Fatal(err)
+		}
+		var err error
+		replacement, err = net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+		if err != nil {
+			t.Fatal(err)
+		}
+		replacement.SetUnlinkOnClose(false)
+	}
+	if srv, err := New(cfg); err == nil {
+		_ = srv.Close()
+		t.Fatal("accepted a pathname routed to a different listener")
+	}
+	if replacement == nil {
+		t.Fatal("replacement hook did not run")
+	}
+	defer replacement.Close()
+	info, err := os.Lstat(filepath.Join(dir, DefaultSocketName))
+	if err != nil || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("listener replacement was removed: %v", err)
 	}
 }
 
@@ -435,5 +553,105 @@ func TestReadTimeoutReturnsStructuredFailure(t *testing.T) {
 	failure, err := protocol.ParseProtocolError(response)
 	if err != nil || failure.Code != protocol.ProtocolErrorCodeInvalidRequest {
 		t.Fatalf("invalid safe timeout failure: %#v, %v", failure, err)
+	}
+}
+
+func TestCloseBetweenAcceptAndRegistrationStartsNoHandler(t *testing.T) {
+	accepted := make(chan struct{})
+	closeStarted := make(chan struct{})
+	release := make(chan struct{})
+	handlerCalled := make(chan struct{}, 1)
+	srv, path := startTestServer(t, func(c *Config) {
+		c.afterAccept = func() {
+			close(accepted)
+			<-release
+		}
+		c.onClosing = func() { close(closeStarted) }
+		c.Handler = func(context.Context, []byte) ([]byte, error) {
+			handlerCalled <- struct{}{}
+			return []byte(`{"schemaVersion":"1"}`), nil
+		}
+	})
+	conn, err := net.DialTimeout("unix", path, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	<-accepted
+	closed := make(chan error, 1)
+	go func() { closed <- srv.Close() }()
+	<-closeStarted
+	close(release)
+	if err := <-closed; err != nil {
+		t.Fatal(err)
+	}
+	_, _ = conn.Write([]byte(`{"schemaVersion":"1"}` + "\n"))
+	select {
+	case <-handlerCalled:
+		t.Fatal("handler started after Close began")
+	case <-time.After(50 * time.Millisecond):
+	}
+}
+
+func TestCrashRestartRecoversOnlyOwnedStaleSocket(t *testing.T) {
+	root, err := os.MkdirTemp("", "pn-crash-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	cfg := Config{RuntimeDir: filepath.Join(root, "run"), Handler: echoHandler}
+	first, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stalePath := first.Path()
+	if err := first.crashForTest(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Lstat(stalePath); err != nil {
+		t.Fatalf("crash did not leave a stale socket: %v", err)
+	}
+	restarted, err := New(cfg)
+	if err != nil {
+		t.Fatalf("owned stale socket was not recovered: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = restarted.Serve(ctx) }()
+	defer restarted.Close()
+	_ = exchange(t, restarted.Path(), `{"schemaVersion":"1"}`+"\n")
+}
+
+func TestActiveSocketAndStaleReplacementAreNeverRemoved(t *testing.T) {
+	root, err := os.MkdirTemp("", "pn-active-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	cfg := Config{RuntimeDir: filepath.Join(root, "run"), Handler: echoHandler}
+	active, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(cfg); err == nil {
+		t.Fatal("second server replaced an active listener")
+	}
+	if info, err := os.Lstat(active.Path()); err != nil || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("active socket was removed: %v", err)
+	}
+	if err := active.crashForTest(); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(active.Path()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(active.Path(), []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(cfg); err == nil {
+		t.Fatal("stale ownership record authorized a replacement inode")
+	}
+	if data, err := os.ReadFile(active.Path()); err != nil || string(data) != "replacement" {
+		t.Fatalf("replacement was removed: %q, %v", data, err)
 	}
 }

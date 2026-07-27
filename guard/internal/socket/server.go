@@ -6,6 +6,8 @@ import (
 	"bufio"
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -36,22 +38,32 @@ type Config struct {
 	Handler         Handler
 	// beforeBind is a test seam for exercising pathname replacement races.
 	beforeBind func()
+	// afterValidationBeforeBind exercises the final pathname race window.
+	afterValidationBeforeBind func()
 	// peerUID is a test seam for exercising credential rejection.
 	peerUID func(net.Conn) (uint32, error)
+	// afterAccept exercises shutdown between accept and handler registration.
+	afterAccept func()
+	// onClosing synchronizes shutdown race tests after the registration gate closes.
+	onClosing func()
+	// beforeListenerProof exercises replacement after anchored publication.
+	beforeListenerProof func(string)
 }
 
 type Server struct {
 	listener *net.UnixListener
 	dir      *os.File
+	lock     *os.File
 	dirInfo  os.FileInfo
 	path     string
-	bound    os.FileInfo
 	boundID  fileIdentity
 	cfg      Config
 
 	closeOnce sync.Once
 	closeErr  error
 	wg        sync.WaitGroup
+	acceptMu  sync.Mutex
+	closing   bool
 }
 
 func New(cfg Config) (*Server, error) {
@@ -87,15 +99,38 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return nil, err
 	}
+	lockName := "." + cfg.SocketName + ".lock"
+	lock, staleIdentity, err := acquireServerLock(dir, lockName)
+	if err != nil {
+		_ = dir.Close()
+		return nil, err
+	}
 	fail := func(err error) (*Server, error) {
+		_ = releaseServerLock(lock)
 		_ = dir.Close()
 		return nil, err
 	}
 	path := filepath.Join(cfg.RuntimeDir, cfg.SocketName)
-	if _, err := os.Lstat(path); err == nil {
-		return fail(errors.New("socket: path already exists"))
-	} else if !errors.Is(err, os.ErrNotExist) {
-		return fail(fmt.Errorf("socket: inspect path: %w", err))
+	existing, inspectErr := inspectAt(dir, cfg.SocketName)
+	switch {
+	case inspectErr == nil:
+		if !ownedStaleSocket(existing, staleIdentity) {
+			return fail(errors.New("socket: path already exists and is not owned stale state"))
+		}
+		if err := removeOwnedAt(dir, cfg.SocketName, existing.identity); err != nil {
+			return fail(err)
+		}
+		if err := writeLockIdentity(lock, nil); err != nil {
+			return fail(err)
+		}
+	case errors.Is(inspectErr, os.ErrNotExist):
+		if staleIdentity != nil {
+			if err := writeLockIdentity(lock, nil); err != nil {
+				return fail(err)
+			}
+		}
+	default:
+		return fail(fmt.Errorf("socket: inspect path: %w", inspectErr))
 	}
 	if err := verifyRuntimeDir(dir, cfg.RuntimeDir, dirInfo); err != nil {
 		return fail(err)
@@ -106,7 +141,20 @@ func New(cfg Config) (*Server, error) {
 	if err := verifyRuntimeDir(dir, cfg.RuntimeDir, dirInfo); err != nil {
 		return fail(err)
 	}
-	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: path, Net: "unix"})
+	if cfg.afterValidationBeforeBind != nil {
+		cfg.afterValidationBeforeBind()
+	}
+	stageName, err := randomStageName()
+	if err != nil {
+		return fail(err)
+	}
+	stagePath := filepath.Join(cfg.RuntimeDir, stageName)
+	// Unix has no portable bindat. Bind an unpublished random staging name,
+	// then require that exact vnode to exist beneath the held directory FD.
+	// Only an anchored, no-replace rename publishes the fixed client path. If
+	// pathname resolution was redirected, the anchored lookup fails and this
+	// listener is never published or served.
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: stagePath, Net: "unix"})
 	if err != nil {
 		return fail(fmt.Errorf("socket: bind: %w", err))
 	}
@@ -114,39 +162,135 @@ func New(cfg Config) (*Server, error) {
 	// Close, which could delete an attacker replacement. Cleanup below is
 	// identity checked instead.
 	listener.SetUnlinkOnClose(false)
-	bound, err := os.Lstat(path)
-	if err != nil || bound.Mode()&os.ModeSocket == 0 {
+	if err := verifyListenerFD(listener, stagePath); err != nil {
 		_ = listener.Close()
-		_ = dir.Close()
-		return nil, errors.New("socket: bound path verification failed")
+		return fail(err)
 	}
-	boundID, err := identityFromInfo(bound)
-	if err != nil {
-		_ = listener.Close()
-		_ = dir.Close()
-		return nil, err
-	}
+	publishedName := stageName
+	var boundID fileIdentity
 	cleanupListener := func(err error) (*Server, error) {
 		_ = listener.Close()
-		_ = removeOwnedAt(dir, cfg.SocketName, boundID)
-		_ = dir.Close()
-		return nil, err
+		if boundID != (fileIdentity{}) {
+			_ = removeOwnedAt(dir, publishedName, boundID)
+		}
+		_ = writeLockIdentity(lock, nil)
+		return fail(err)
 	}
-	if err := os.Chmod(path, 0o600); err != nil {
+	staged, err := inspectAt(dir, stageName)
+	if err != nil || staged.mode&unixSocketMode() != unixSocketMode() ||
+		staged.uid != currentUID() {
+		return cleanupListener(errors.New("socket: staged listener is outside the anchored runtime directory"))
+	}
+	boundID = staged.identity
+	if err := chmodAt(dir, stageName, 0o600); err != nil {
 		return cleanupListener(fmt.Errorf("socket: restrict permissions: %w", err))
 	}
-	restricted, err := os.Lstat(path)
-	if err != nil || !os.SameFile(restricted, bound) ||
-		restricted.Mode()&os.ModeSocket == 0 || restricted.Mode().Perm() != 0o600 {
-		return cleanupListener(errors.New("socket: bound path verification failed"))
+	if err := renameNoReplace(int(dir.Fd()), stageName, cfg.SocketName); err != nil {
+		return cleanupListener(fmt.Errorf("socket: publish listener: %w", err))
+	}
+	publishedName = cfg.SocketName
+	if err := dir.Sync(); err != nil {
+		return cleanupListener(fmt.Errorf("socket: sync published listener: %w", err))
+	}
+	published, err := inspectAt(dir, cfg.SocketName)
+	if err != nil || !securePublishedSocket(published, boundID) {
+		return cleanupListener(errors.New("socket: published listener identity mismatch"))
+	}
+	if err := writeLockIdentity(lock, &boundID); err != nil {
+		return cleanupListener(err)
 	}
 	if err := verifyRuntimeDir(dir, cfg.RuntimeDir, dirInfo); err != nil {
 		return cleanupListener(err)
 	}
+	if cfg.beforeListenerProof != nil {
+		cfg.beforeListenerProof(path)
+	}
+	if err := proveListenerPath(listener, path, cfg.IOTimeout); err != nil {
+		return cleanupListener(err)
+	}
+	finalNode, err := inspectAt(dir, cfg.SocketName)
+	if err != nil || !securePublishedSocket(finalNode, boundID) {
+		return cleanupListener(errors.New("socket: listener path changed after proof"))
+	}
 	return &Server{
-		listener: listener, dir: dir, dirInfo: dirInfo, path: path, bound: restricted,
+		listener: listener, dir: dir, lock: lock, dirInfo: dirInfo, path: path,
 		boundID: boundID, cfg: cfg,
 	}, nil
+}
+
+func randomStageName() (string, error) {
+	var nonce [6]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", fmt.Errorf("socket: stage nonce: %w", err)
+	}
+	return ".s" + base64.RawURLEncoding.EncodeToString(nonce[:]), nil
+}
+
+func unixSocketMode() uint32 { return 0o140000 }
+
+func ownedStaleSocket(node nodeInfo, record *fileIdentity) bool {
+	return record != nil && node.identity == *record &&
+		securePublishedSocket(node, *record)
+}
+
+func securePublishedSocket(node nodeInfo, identity fileIdentity) bool {
+	return node.identity == identity && node.mode&0o170000 == unixSocketMode() &&
+		node.mode&0o777 == 0o600 && node.uid == currentUID()
+}
+
+func proveListenerPath(listener *net.UnixListener, path string, timeout time.Duration) error {
+	if timeout > time.Second {
+		timeout = time.Second
+	}
+	if timeout <= 0 {
+		timeout = time.Second
+	}
+	var nonce [32]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return fmt.Errorf("socket: proof nonce: %w", err)
+	}
+	if err := listener.SetDeadline(time.Now().Add(timeout)); err != nil {
+		return fmt.Errorf("socket: proof deadline: %w", err)
+	}
+	defer listener.SetDeadline(time.Time{})
+	clientDone := make(chan error, 1)
+	go func() {
+		conn, err := net.DialTimeout("unix", path, timeout)
+		if err != nil {
+			clientDone <- err
+			return
+		}
+		defer conn.Close()
+		_ = conn.SetDeadline(time.Now().Add(timeout))
+		if _, err = conn.Write(nonce[:]); err == nil {
+			var echoed [len(nonce)]byte
+			_, err = io.ReadFull(conn, echoed[:])
+			if err == nil && echoed != nonce {
+				err = errors.New("socket proof response mismatch")
+			}
+		}
+		clientDone <- err
+	}()
+	conn, err := listener.AcceptUnix()
+	if err != nil {
+		<-clientDone
+		return fmt.Errorf("socket: listener proof accept: %w", err)
+	}
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	var received [len(nonce)]byte
+	_, readErr := io.ReadFull(conn, received[:])
+	if readErr == nil && received != nonce {
+		readErr = errors.New("socket proof request mismatch")
+	}
+	if readErr == nil {
+		_, readErr = conn.Write(received[:])
+	}
+	_ = conn.Close()
+	clientErr := <-clientDone
+	if readErr != nil || clientErr != nil {
+		return errors.New("socket: published path does not reach the bound listener")
+	}
+	return nil
 }
 
 func (s *Server) Path() string { return s.path }
@@ -156,13 +300,21 @@ func (s *Server) Serve(ctx context.Context) error {
 		return errors.New("socket: nil context")
 	}
 	defer s.Close()
+	s.acceptMu.Lock()
+	if s.closing {
+		s.acceptMu.Unlock()
+		return nil
+	}
 	if err := verifyRuntimeDir(s.dir, filepath.Dir(s.path), s.dirInfo); err != nil {
+		s.acceptMu.Unlock()
 		return err
 	}
-	current, err := os.Lstat(s.path)
-	if err != nil || !os.SameFile(current, s.bound) || current.Mode()&os.ModeSocket == 0 {
+	current, err := inspectAt(s.dir, filepath.Base(s.path))
+	if err != nil || !securePublishedSocket(current, s.boundID) {
+		s.acceptMu.Unlock()
 		return errors.New("socket: bound path was replaced before serving")
 	}
+	s.acceptMu.Unlock()
 	stop := context.AfterFunc(ctx, func() { _ = s.listener.Close() })
 	defer stop()
 	for {
@@ -178,7 +330,17 @@ func (s *Server) Serve(ctx context.Context) error {
 			}
 			return fmt.Errorf("socket: accept: %w", err)
 		}
+		if s.cfg.afterAccept != nil {
+			s.cfg.afterAccept()
+		}
+		s.acceptMu.Lock()
+		if s.closing {
+			s.acceptMu.Unlock()
+			_ = conn.Close()
+			return nil
+		}
 		s.wg.Add(1)
+		s.acceptMu.Unlock()
 		go func() {
 			defer s.wg.Done()
 			s.handle(ctx, conn)
@@ -289,7 +451,11 @@ func processFrame(ctx context.Context, frame []byte, maximum int, handler Handle
 	if len(response) == 0 || len(response) > maximum || !json.Valid(response) {
 		return failure(protocol.ProtocolErrorCodeInvalidDecision, false)
 	}
-	return append(append([]byte(nil), response...), '\n')
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, response); err != nil || compact.Len() > maximum {
+		return failure(protocol.ProtocolErrorCodeInvalidDecision, false)
+	}
+	return append(compact.Bytes(), '\n')
 }
 
 func decodeTopLevelObject(document []byte) (map[string]json.RawMessage, error) {
@@ -351,7 +517,13 @@ func failure(code protocol.ProtocolErrorCode, retryable bool) []byte {
 
 func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
+		s.acceptMu.Lock()
+		s.closing = true
+		if s.cfg.onClosing != nil {
+			s.cfg.onClosing()
+		}
 		listenErr := s.listener.Close()
+		s.acceptMu.Unlock()
 		s.wg.Wait()
 		runtimeErr := verifyRuntimeDir(s.dir, filepath.Dir(s.path), s.dirInfo)
 		if err := removeOwnedAt(s.dir, filepath.Base(s.path), s.boundID); err != nil {
@@ -361,8 +533,39 @@ func (s *Server) Close() error {
 		} else if listenErr != nil && !errors.Is(listenErr, net.ErrClosed) {
 			s.closeErr = listenErr
 		}
+		if err := writeLockIdentity(s.lock, nil); s.closeErr == nil && err != nil {
+			s.closeErr = err
+		}
+		if err := releaseServerLock(s.lock); s.closeErr == nil && err != nil {
+			s.closeErr = err
+		}
 		if err := s.dir.Close(); s.closeErr == nil && err != nil {
 			s.closeErr = err
+		}
+	})
+	return s.closeErr
+}
+
+// crashForTest simulates process death: descriptors close, while the
+// inode-bound lifecycle record and socket pathname remain for restart recovery.
+func (s *Server) crashForTest() error {
+	s.closeOnce.Do(func() {
+		s.acceptMu.Lock()
+		s.closing = true
+		if s.cfg.onClosing != nil {
+			s.cfg.onClosing()
+		}
+		listenErr := s.listener.Close()
+		s.acceptMu.Unlock()
+		s.wg.Wait()
+		lockErr := releaseServerLock(s.lock)
+		dirErr := s.dir.Close()
+		if listenErr != nil && !errors.Is(listenErr, net.ErrClosed) {
+			s.closeErr = listenErr
+		} else if lockErr != nil {
+			s.closeErr = lockErr
+		} else {
+			s.closeErr = dirErr
 		}
 	})
 	return s.closeErr

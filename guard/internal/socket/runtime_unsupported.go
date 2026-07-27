@@ -24,11 +24,40 @@ func peerUID(net.Conn) (uint32, error) {
 }
 
 type fileIdentity struct{}
-
-func identityFromInfo(os.FileInfo) (fileIdentity, error) {
-	return fileIdentity{}, errors.New("socket: Unix inode identity is unsupported on this platform")
+type nodeInfo struct {
+	identity fileIdentity
+	mode     uint32
+	uid      uint32
 }
 
 func removeOwnedAt(*os.File, string, fileIdentity) error {
 	return errors.New("socket: Unix safe cleanup is unsupported on this platform")
+}
+
+func inspectAt(*os.File, string) (nodeInfo, error) {
+	return nodeInfo{}, errors.New("socket: Unix inode inspection is unsupported on this platform")
+}
+
+func verifyListenerFD(*net.UnixListener, string) error {
+	return errors.New("socket: Unix listener inspection is unsupported on this platform")
+}
+
+func chmodAt(*os.File, string, uint32) error {
+	return errors.New("socket: Unix chmod is unsupported on this platform")
+}
+
+func acquireServerLock(*os.File, string) (*os.File, *fileIdentity, error) {
+	return nil, nil, errors.New("socket: Unix locking is unsupported on this platform")
+}
+
+func writeLockIdentity(*os.File, *fileIdentity) error {
+	return errors.New("socket: Unix locking is unsupported on this platform")
+}
+
+func releaseServerLock(*os.File) error {
+	return errors.New("socket: Unix locking is unsupported on this platform")
+}
+
+func renameNoReplace(int, string, string) error {
+	return errors.New("socket: Unix rename is unsupported on this platform")
 }
