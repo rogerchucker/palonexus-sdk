@@ -42,9 +42,70 @@ func TestStoreBindsSecretsToTenantAndAccountAndCopiesMemory(t *testing.T) {
 	}
 }
 
+func TestBindingEncodingIsInjectiveAcrossDelimiterUnicodeAndMaximumLengths(t *testing.T) {
+	t.Parallel()
+	backend := &captureBindingBackend{}
+	store, err := New("dev.palonexus.guard", backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bindings := []Key{
+		{Tenant: "a:b", Account: "c"},
+		{Tenant: "a", Account: "b:c"},
+		{Tenant: "租户", Account: "δοκιμή"},
+		{Tenant: strings.Repeat("t", MaxBindingBytes), Account: strings.Repeat("a", MaxBindingBytes)},
+	}
+	for _, binding := range bindings {
+		if err := store.Put(context.Background(), binding, []byte("secret")); err != nil {
+			t.Fatalf("Put(%q,%q): %v", binding.Tenant, binding.Account, err)
+		}
+	}
+	if len(backend.accounts) != len(bindings) {
+		t.Fatalf("captured %d backend keys, want %d", len(backend.accounts), len(bindings))
+	}
+	seen := make(map[string]struct{}, len(backend.accounts))
+	for _, account := range backend.accounts {
+		if _, duplicate := seen[account]; duplicate {
+			t.Fatalf("binding encoding collided: %q", account)
+		}
+		seen[account] = struct{}{}
+		if strings.Contains(account, "租户") || strings.Contains(account, "δοκιμή") {
+			t.Fatalf("backend key exposed raw binding: %q", account)
+		}
+	}
+}
+
+func TestInjectiveBindingsRoundTripAndDeleteIndependently(t *testing.T) {
+	t.Parallel()
+	store, err := New("dev.palonexus.guard", NewMemoryBackendForTesting())
+	if err != nil {
+		t.Fatal(err)
+	}
+	left := Key{Tenant: "a:b", Account: "c"}
+	right := Key{Tenant: "a", Account: "b:c"}
+	if err := store.Put(context.Background(), left, []byte("left")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(context.Background(), right, []byte("right")); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[Key]string{left: "left", right: "right"} {
+		got, err := store.Get(context.Background(), key)
+		if err != nil || string(got) != want {
+			t.Fatalf("Get(%#v) = %q, %v", key, got, err)
+		}
+	}
+	if err := store.Delete(context.Background(), left); err != nil {
+		t.Fatal(err)
+	}
+	if got, err := store.Get(context.Background(), right); err != nil || string(got) != "right" {
+		t.Fatalf("Delete collided with other binding: %q, %v", got, err)
+	}
+}
+
 func TestStoreValidatesBindingsWithoutReflectingSensitiveInput(t *testing.T) {
 	t.Parallel()
-	const sensitive = "tenant/raw-secret"
+	const sensitive = "tenant/raw-secret\n"
 	store, err := New("dev.palonexus.guard", NewMemoryBackendForTesting())
 	if err != nil {
 		t.Fatal(err)
@@ -75,6 +136,44 @@ func TestStoreZeroesBackendReadBufferAfterCopy(t *testing.T) {
 	}
 	if !bytes.Equal(raw, make([]byte, len(raw))) {
 		t.Fatal("backend-owned temporary buffer was not zeroed")
+	}
+}
+
+func TestStoreRejectsEmptyAndOversizedSecretsBeforeBackend(t *testing.T) {
+	t.Parallel()
+	backend := &captureBindingBackend{}
+	store, err := New("dev.palonexus.guard", backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	key := Key{Tenant: "tenant", Account: "account"}
+	for _, secret := range [][]byte{nil, make([]byte, MaxSecretBytes+1)} {
+		if err := store.Put(context.Background(), key, secret); !errors.Is(err, ErrInvalidSecret) {
+			t.Fatalf("Put secret length %d = %v", len(secret), err)
+		}
+	}
+	if len(backend.accounts) != 0 {
+		t.Fatal("invalid secret reached backend")
+	}
+}
+
+func TestStoreRejectsEmptyAndOversizedBackendResultsAndZeroesThem(t *testing.T) {
+	t.Parallel()
+	for _, raw := range [][]byte{{}, make([]byte, MaxSecretBytes+1)} {
+		backend := &observingBackend{getResult: raw}
+		store, err := New("dev.palonexus.guard", backend)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := store.Get(
+			context.Background(),
+			Key{Tenant: "tenant", Account: "account"},
+		); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("Get backend length %d = %v", len(raw), err)
+		}
+		if !bytes.Equal(raw, make([]byte, len(raw))) {
+			t.Fatal("invalid backend result was not zeroed")
+		}
 	}
 }
 
@@ -197,7 +296,11 @@ func TestEncryptedFileFallbackIsDisabledByDefault(t *testing.T) {
 
 func TestEncryptedFileFallbackRequiresExplicitTestingFlagAndEncrypts(t *testing.T) {
 	t.Parallel()
-	root := filepath.Join(t.TempDir(), "credentials")
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(base, "credentials")
 	backend, err := NewEncryptedFileBackend(EncryptedFileOptions{
 		Root:             root,
 		Key:              bytes.Repeat([]byte{7}, 32),
@@ -244,6 +347,125 @@ func TestEncryptedFileFallbackRequiresExplicitTestingFlagAndEncrypts(t *testing.
 	}
 }
 
+func TestEncryptedFileFallbackRejectsSymlinkAncestor(t *testing.T) {
+	t.Parallel()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := filepath.Join(base, "target")
+	if err := os.Mkdir(target, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	link := filepath.Join(base, "link")
+	if err := os.Symlink(target, link); err != nil {
+		t.Fatal(err)
+	}
+	_, err = NewEncryptedFileBackend(EncryptedFileOptions{
+		Root:             filepath.Join(link, "credentials"),
+		Key:              bytes.Repeat([]byte{1}, 32),
+		EnableForTesting: true,
+	})
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("constructor through symlink = %v", err)
+	}
+}
+
+func TestEncryptedFileFallbackPinsTrustedRootAcrossRenameSwap(t *testing.T) {
+	t.Parallel()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(base, "credentials")
+	backend, err := NewEncryptedFileBackend(EncryptedFileOptions{
+		Root:             root,
+		Key:              bytes.Repeat([]byte{1}, 32),
+		EnableForTesting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	anchored := filepath.Join(base, "anchored")
+	if err := os.Rename(root, anchored); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := backend.Put(context.Background(), "service", "account", []byte("secret")); err != nil {
+		t.Fatal(err)
+	}
+	replacementEntries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(replacementEntries) != 0 {
+		t.Fatal("fallback wrote into replacement root")
+	}
+	anchoredEntries, err := os.ReadDir(anchored)
+	if err != nil || len(anchoredEntries) == 0 {
+		t.Fatalf("anchored root not written: %v", err)
+	}
+}
+
+func TestEncryptedFileFallbackRejectsWritableAncestor(t *testing.T) {
+	t.Parallel()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	writable := filepath.Join(base, "writable")
+	if err := os.Mkdir(writable, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(writable, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	_, err = NewEncryptedFileBackend(EncryptedFileOptions{
+		Root:             filepath.Join(writable, "credentials"),
+		Key:              bytes.Repeat([]byte{9}, 32),
+		EnableForTesting: true,
+	})
+	if !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("constructor through writable ancestor = %v", err)
+	}
+}
+
+func TestEncryptedFileFallbackSeparatesDelimiterCollisionBindings(t *testing.T) {
+	t.Parallel()
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend, err := NewEncryptedFileBackend(EncryptedFileOptions{
+		Root:             filepath.Join(base, "credentials"),
+		Key:              bytes.Repeat([]byte{5}, 32),
+		EnableForTesting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	store, err := New("dev.palonexus.guard", backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	left := Key{Tenant: "a:b", Account: "c"}
+	right := Key{Tenant: "a", Account: "b:c"}
+	if err := store.Put(context.Background(), left, []byte("left")); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Put(context.Background(), right, []byte("right")); err != nil {
+		t.Fatal(err)
+	}
+	for key, want := range map[Key]string{left: "left", right: "right"} {
+		got, err := store.Get(context.Background(), key)
+		if err != nil || string(got) != want {
+			t.Fatalf("Get(%#v) = %q, %v", key, got, err)
+		}
+	}
+}
+
 type observingBackend struct {
 	getResult []byte
 }
@@ -257,6 +479,19 @@ func (b *observingBackend) Delete(context.Context, string, string) error { retur
 type cancelAfterMutationBackend struct {
 	cancel context.CancelFunc
 }
+
+type captureBindingBackend struct {
+	accounts []string
+}
+
+func (b *captureBindingBackend) Put(_ context.Context, _, account string, _ []byte) error {
+	b.accounts = append(b.accounts, account)
+	return nil
+}
+func (*captureBindingBackend) Get(context.Context, string, string) ([]byte, error) {
+	return nil, ErrNotFound
+}
+func (*captureBindingBackend) Delete(context.Context, string, string) error { return nil }
 
 func (b *cancelAfterMutationBackend) Put(context.Context, string, string, []byte) error {
 	b.cancel()

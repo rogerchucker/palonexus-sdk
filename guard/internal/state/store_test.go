@@ -1,326 +1,474 @@
+//go:build darwin || linux
+
 package state
 
 import (
-	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
-	"sync"
 	"testing"
+	"time"
+
+	"golang.org/x/sys/unix"
 )
 
-func TestStoreAtomicRoundTripAndBinding(t *testing.T) {
+func TestTypedMetadataRoundTripsForEachAllowlistedKind(t *testing.T) {
 	t.Parallel()
-	root := filepath.Join(t.TempDir(), "state")
-	store, err := New(root)
-	if err != nil {
-		t.Fatal(err)
+	store := newTestStore(t)
+	binding := Binding{Tenant: "租户", Account: "account:a"}
+	records := []Metadata{
+		{Kind: KindRouting, RouteID: "route-primary"},
+		{
+			Kind:      KindSession,
+			SessionID: "session_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+			ExpiresAt: time.Date(2026, 7, 27, 12, 0, 0, 0, time.UTC),
+		},
+		{
+			Kind:             KindReconciliation,
+			ReconciliationID: "recon_01ARZ3NDEKTSV4RRFFQ69G5FAV",
+			ReferenceHash:    "sha256:" + strings.Repeat("a", 64),
+		},
 	}
-	binding := Binding{Tenant: "tenant-a", Account: "user-a"}
-	payload := json.RawMessage(`{"decision":"deny","sequence":1}`)
-	if err := store.Put(context.Background(), binding, "reconciliation", payload); err != nil {
-		t.Fatal(err)
-	}
-	payload[13] = 'X'
-	got, err := store.Get(context.Background(), binding, "reconciliation")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if string(got) != `{"decision":"deny","sequence":1}` {
-		t.Fatalf("Get = %s", got)
-	}
-	if _, err := store.Get(context.Background(), Binding{Tenant: "tenant-b", Account: "user-a"}, "reconciliation"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("cross-tenant Get = %v", err)
-	}
-	assertMode(t, root, 0o700)
-	entries, err := os.ReadDir(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, entry := range entries {
-		if entry.Name() == ".lock" {
-			continue
+	for _, record := range records {
+		if err := store.PutMetadata(context.Background(), binding, record); err != nil {
+			t.Fatalf("PutMetadata(%s): %v", record.Kind, err)
 		}
-		assertMode(t, filepath.Join(root, entry.Name()), 0o600)
-	}
-}
-
-func TestStoreRejectsSymlinkRootAndRecord(t *testing.T) {
-	t.Parallel()
-	base := t.TempDir()
-	target := filepath.Join(base, "target")
-	if err := os.Mkdir(target, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	rootLink := filepath.Join(base, "root-link")
-	if err := os.Symlink(target, rootLink); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := New(rootLink); !errors.Is(err, ErrUnsafePath) {
-		t.Fatalf("New(symlink) = %v, want ErrUnsafePath", err)
-	}
-
-	root := filepath.Join(base, "state")
-	store, err := New(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	binding := Binding{Tenant: "tenant", Account: "account"}
-	recordPath, err := store.recordPath(binding, "session")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Symlink(target, recordPath); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Put(context.Background(), binding, "session", json.RawMessage(`{}`)); !errors.Is(err, ErrUnsafePath) {
-		t.Fatalf("Put(symlink) = %v, want ErrUnsafePath", err)
-	}
-}
-
-func TestStoreRejectsPermissiveAndNonRegularRecord(t *testing.T) {
-	t.Parallel()
-	root := filepath.Join(t.TempDir(), "state")
-	store, err := New(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	binding := Binding{Tenant: "tenant", Account: "account"}
-	if err := os.Chmod(root, 0o755); err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Put(context.Background(), binding, "session", json.RawMessage(`{}`)); !errors.Is(err, ErrUnsafePermissions) {
-		t.Fatalf("Put with permissive root = %v", err)
-	}
-	if err := os.Chmod(root, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	recordPath, err := store.recordPath(binding, "session")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := os.Mkdir(recordPath, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.Get(context.Background(), binding, "session"); !errors.Is(err, ErrUnsafePath) {
-		t.Fatalf("Get(directory) = %v, want ErrUnsafePath", err)
-	}
-}
-
-func TestStoreCorruptionAndUnknownVersionFailClosed(t *testing.T) {
-	t.Parallel()
-	root := filepath.Join(t.TempDir(), "state")
-	store, err := New(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	binding := Binding{Tenant: "tenant", Account: "account"}
-	recordPath, err := store.recordPath(binding, "session")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, content := range [][]byte{
-		[]byte(`not-json`),
-		[]byte(`{"version":2,"tenant":"tenant","account":"account","kind":"session","payload":{}}`),
-		[]byte(`{"version":1,"tenant":"other","account":"account","kind":"session","payload":{}}`),
-	} {
-		if err := os.WriteFile(recordPath, content, 0o600); err != nil {
-			t.Fatal(err)
+		got, err := store.GetMetadata(context.Background(), binding, record.Kind)
+		if err != nil {
+			t.Fatalf("GetMetadata(%s): %v", record.Kind, err)
 		}
-		if _, err := store.Get(context.Background(), binding, "session"); !errors.Is(err, ErrCorrupt) {
-			t.Fatalf("Get(%s) = %v, want ErrCorrupt", content, err)
+		if got != record {
+			t.Fatalf("round trip = %#v, want %#v", got, record)
 		}
 	}
 }
 
-func TestStoreRejectsSensitiveOrInvalidPayloadWithoutReflection(t *testing.T) {
+func TestTypedMetadataRejectsSecretAndRawInputByConstruction(t *testing.T) {
 	t.Parallel()
-	store, err := New(filepath.Join(t.TempDir(), "state"))
-	if err != nil {
-		t.Fatal(err)
+	store := newTestStore(t)
+	binding := Binding{Tenant: "tenant", Account: "account"}
+	rejected := []Metadata{
+		{Kind: KindRouting, RouteID: "value=raw-secret"},
+		{Kind: KindRouting, RouteID: "session/raw-tool-input"},
+		{Kind: KindSession, SessionID: "api_key_raw-secret", ExpiresAt: time.Now().UTC()},
+		{Kind: KindSession, SessionID: "eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiJ4In0.signature", ExpiresAt: time.Now().UTC()},
+		{Kind: KindReconciliation, ReconciliationID: "neutral-raw-command", ReferenceHash: "raw-secret"},
+		{Kind: KindRouting, RouteID: "route-abcdefghijklmnopqrstuvwxyz0123456789abcdefghijklmnop"},
 	}
-	const secret = "raw-secret-token"
-	for _, payload := range []json.RawMessage{
-		json.RawMessage(`{"access_token":"` + secret + `"}`),
-		json.RawMessage(`{"nested":{"refreshToken":"` + secret + `"}}`),
-		json.RawMessage(`not-json-` + secret),
-	} {
-		err := store.Put(context.Background(), Binding{Tenant: "tenant", Account: "account"}, "session", payload)
+	for _, metadata := range rejected {
+		err := store.PutMetadata(context.Background(), binding, metadata)
 		if !errors.Is(err, ErrUnsafePayload) {
-			t.Fatalf("Put(%s) = %v, want ErrUnsafePayload", payload, err)
+			t.Fatalf("PutMetadata(%#v) = %v, want ErrUnsafePayload", metadata, err)
 		}
-		if strings.Contains(err.Error(), secret) {
+		if strings.Contains(err.Error(), "raw-secret") {
 			t.Fatalf("error reflected secret: %v", err)
 		}
 	}
 }
 
-func TestDeleteAccountRemovesOnlyBoundRecords(t *testing.T) {
+func TestBindingPathsAreInjectiveAndDoNotExposeUnicode(t *testing.T) {
 	t.Parallel()
-	store, err := New(filepath.Join(t.TempDir(), "state"))
-	if err != nil {
-		t.Fatal(err)
+	store := newTestStore(t)
+	bindings := []Binding{
+		{Tenant: "a:b", Account: "c"},
+		{Tenant: "a", Account: "b:c"},
+		{Tenant: "租户", Account: "δοκιμή"},
 	}
-	ctx := context.Background()
-	left := Binding{Tenant: "tenant-a", Account: "user"}
-	right := Binding{Tenant: "tenant-b", Account: "user"}
-	for _, binding := range []Binding{left, right} {
-		if err := store.Put(ctx, binding, "session", json.RawMessage(`{"status":"active"}`)); err != nil {
+	seen := map[string]struct{}{}
+	for _, binding := range bindings {
+		name, err := store.recordName(binding, KindRouting)
+		if err != nil {
 			t.Fatal(err)
 		}
-	}
-	if err := store.DeleteAccount(ctx, left); err != nil {
-		t.Fatal(err)
-	}
-	if _, err := store.Get(ctx, left, "session"); !errors.Is(err, ErrNotFound) {
-		t.Fatalf("deleted Get = %v", err)
-	}
-	if _, err := store.Get(ctx, right, "session"); err != nil {
-		t.Fatalf("other tenant record removed: %v", err)
+		if _, duplicate := seen[name]; duplicate {
+			t.Fatalf("record name collision: %q", name)
+		}
+		seen[name] = struct{}{}
+		if binding.Tenant == "租户" &&
+			(strings.Contains(name, binding.Tenant) || strings.Contains(name, binding.Account)) {
+			t.Fatalf("record name exposed binding: %q", name)
+		}
 	}
 }
 
-func TestConcurrentStoresProduceWholeRecords(t *testing.T) {
+func TestStoreMigratesBenignVersionZeroMetadataToCurrentVersion(t *testing.T) {
 	t.Parallel()
-	root := filepath.Join(t.TempDir(), "state")
-	first, err := New(root)
-	if err != nil {
-		t.Fatal(err)
-	}
-	second, err := New(root)
-	if err != nil {
-		t.Fatal(err)
-	}
+	store := newTestStore(t)
 	binding := Binding{Tenant: "tenant", Account: "account"}
-	left := json.RawMessage(`{"writer":"left","padding":"` + strings.Repeat("a", 4096) + `"}`)
-	right := json.RawMessage(`{"writer":"right","padding":"` + strings.Repeat("b", 4096) + `"}`)
-
-	var wg sync.WaitGroup
-	for i := 0; i < 40; i++ {
-		for index, candidate := range []struct {
-			store   *Store
-			payload json.RawMessage
-		}{{first, left}, {second, right}} {
-			wg.Add(1)
-			go func(index int, candidate struct {
-				store   *Store
-				payload json.RawMessage
-			}) {
-				defer wg.Done()
-				if err := candidate.store.Put(context.Background(), binding, "session", candidate.payload); err != nil {
-					t.Errorf("writer %d: %v", index, err)
-				}
-			}(index, candidate)
-		}
-	}
-	wg.Wait()
-	got, err := first.Get(context.Background(), binding, "session")
+	name, err := store.recordName(binding, KindRouting)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var decoded struct {
-		Writer  string `json:"writer"`
-		Padding string `json:"padding"`
+	writeAnchoredTestRecord(t, store, name, []byte(
+		`{"version":0,"tenant":"tenant","account":"account","metadata":{"kind":"routing","routeId":"route-primary"}}`,
+	))
+	got, err := store.GetMetadata(context.Background(), binding, KindRouting)
+	if err != nil || got.RouteID != "route-primary" {
+		t.Fatalf("migration = %#v, %v", got, err)
 	}
-	if err := json.Unmarshal(got, &decoded); err != nil {
-		t.Fatalf("concurrent write produced invalid JSON: %v", err)
-	}
-	if (decoded.Writer != "left" || decoded.Padding != strings.Repeat("a", 4096)) &&
-		(decoded.Writer != "right" || decoded.Padding != strings.Repeat("b", 4096)) {
-		t.Fatal("concurrent write produced a torn record")
+	onDisk := readAnchoredTestRecord(t, store, name)
+	if !strings.Contains(string(onDisk), `"version":1`) {
+		t.Fatalf("migration was not durably rewritten: %s", onDisk)
 	}
 }
 
-func TestCancelledContextFailsClosed(t *testing.T) {
+func TestUnknownVersionAndLegacyRawPayloadFailClosed(t *testing.T) {
 	t.Parallel()
-	store, err := New(filepath.Join(t.TempDir(), "state"))
+	store := newTestStore(t)
+	binding := Binding{Tenant: "tenant", Account: "account"}
+	name, err := store.recordName(binding, KindRouting)
 	if err != nil {
 		t.Fatal(err)
 	}
-	ctx, cancel := context.WithCancel(context.Background())
-	cancel()
-	if err := store.Put(ctx, Binding{Tenant: "tenant", Account: "account"}, "session", json.RawMessage(`{}`)); !errors.Is(err, context.Canceled) {
-		t.Fatalf("Put = %v, want context.Canceled", err)
+	for _, document := range []string{
+		`{"version":2,"tenant":"tenant","account":"account","metadata":{"kind":"routing","routeId":"route-primary"}}`,
+		`{"version":0,"tenant":"tenant","account":"account","payload":{"value":"raw-tool-input"}}`,
+	} {
+		writeAnchoredTestRecord(t, store, name, []byte(document))
+		if _, err := store.GetMetadata(context.Background(), binding, KindRouting); !errors.Is(err, ErrCorrupt) {
+			t.Fatalf("GetMetadata(%s) = %v, want ErrCorrupt", document, err)
+		}
 	}
 }
 
-func TestStoreSerializesAtomicWritesAcrossProcesses(t *testing.T) {
-	root := filepath.Join(t.TempDir(), "state")
-	if _, err := New(root); err != nil {
+func TestStoreAnchorsRootAndRejectsSymlinkAncestorsAndRecords(t *testing.T) {
+	t.Parallel()
+	base := canonicalTempDir(t)
+	realParent := filepath.Join(base, "real")
+	if err := os.Mkdir(realParent, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	type child struct {
-		command *exec.Cmd
-		output  *bytes.Buffer
+	symlinkParent := filepath.Join(base, "link")
+	if err := os.Symlink(realParent, symlinkParent); err != nil {
+		t.Fatal(err)
 	}
-	var commands []child
-	for index := 0; index < 8; index++ {
-		command := exec.Command(os.Args[0], "-test.run=^TestStateStoreProcessHelper$")
-		command.Env = append(os.Environ(),
-			"PALONEXUS_STATE_HELPER=1",
-			"PALONEXUS_STATE_ROOT="+root,
-			"PALONEXUS_STATE_WRITER="+string(rune('a'+index)),
-		)
-		output := new(bytes.Buffer)
-		command.Stdout = output
-		command.Stderr = output
-		if err := command.Start(); err != nil {
-			t.Fatal(err)
-		}
-		commands = append(commands, child{command: command, output: output})
+	if _, err := New(filepath.Join(symlinkParent, "state")); !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("New through symlink ancestor = %v", err)
 	}
-	for _, child := range commands {
-		if err := child.command.Wait(); err != nil {
-			t.Fatalf("child failed: %v: %s", err, child.output)
-		}
-	}
+
+	root := filepath.Join(realParent, "state")
 	store, err := New(root)
 	if err != nil {
 		t.Fatal(err)
 	}
-	got, err := store.Get(context.Background(), Binding{Tenant: "tenant", Account: "account"}, "session")
+	t.Cleanup(func() { _ = store.Close() })
+	binding := Binding{Tenant: "tenant", Account: "account"}
+	name, err := store.recordName(binding, KindRouting)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var decoded map[string]string
-	if err := json.Unmarshal(got, &decoded); err != nil || len(decoded["writer"]) != 1 {
-		t.Fatalf("cross-process result = %s, %v", got, err)
+	if err := os.Symlink(filepath.Join(base, "outside"), filepath.Join(root, name)); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutMetadata(context.Background(), binding, Metadata{Kind: KindRouting, RouteID: "route-primary"}); !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("PutMetadata over symlink = %v", err)
 	}
 }
 
-func TestStateStoreProcessHelper(t *testing.T) {
+func TestStoreRejectsWritableAncestor(t *testing.T) {
+	t.Parallel()
+	base := canonicalTempDir(t)
+	writable := filepath.Join(base, "writable")
+	if err := os.Mkdir(writable, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(writable, 0o777); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(filepath.Join(writable, "state")); !errors.Is(err, ErrUnsafePermissions) {
+		t.Fatalf("New through writable ancestor = %v", err)
+	}
+}
+
+func TestStoreRequiresUserOnlyDirectoryAndFileModes(t *testing.T) {
+	t.Parallel()
+	base := canonicalTempDir(t)
+	permissive := filepath.Join(base, "permissive")
+	if err := os.Mkdir(permissive, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := New(permissive); !errors.Is(err, ErrUnsafePermissions) {
+		t.Fatalf("New permissive root = %v", err)
+	}
+	store, err := New(filepath.Join(base, "state"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	binding := Binding{Tenant: "tenant", Account: "account"}
+	if err := store.PutMetadata(
+		context.Background(),
+		binding,
+		Metadata{Kind: KindRouting, RouteID: "route-primary"},
+	); err != nil {
+		t.Fatal(err)
+	}
+	name, err := store.recordName(binding, KindRouting)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(filepath.Join(base, "state", name), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetMetadata(context.Background(), binding, KindRouting); !errors.Is(err, ErrUnsafePermissions) {
+		t.Fatalf("GetMetadata permissive file = %v", err)
+	}
+}
+
+func TestRootRenameSwapCannotRedirectAnchoredWrites(t *testing.T) {
+	t.Parallel()
+	base := canonicalTempDir(t)
+	root := filepath.Join(base, "state")
+	store, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+	anchored := filepath.Join(base, "anchored")
+	if err := os.Rename(root, anchored); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.PutMetadata(context.Background(), Binding{Tenant: "tenant", Account: "account"}, Metadata{Kind: KindRouting, RouteID: "route-primary"}); err != nil {
+		t.Fatal(err)
+	}
+	newEntries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(newEntries) != 0 {
+		t.Fatal("anchored store wrote into attacker replacement root")
+	}
+	oldEntries, err := os.ReadDir(anchored)
+	if err != nil || len(oldEntries) == 0 {
+		t.Fatalf("anchored directory not written: %v", err)
+	}
+}
+
+func TestLogoutDeletesCorruptScopedRecordsAndIgnoresJunk(t *testing.T) {
+	t.Parallel()
+	store := newTestStore(t)
+	binding := Binding{Tenant: "tenant", Account: "account"}
+	scoped, err := store.recordName(binding, KindSession)
+	if err != nil {
+		t.Fatal(err)
+	}
+	writeAnchoredTestRecord(t, store, scoped, []byte(`corrupt`))
+	writeAnchoredTestRecord(t, store, "unrelated-junk", []byte(`do-not-touch`))
+	if err := store.DeleteAccount(context.Background(), binding); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := store.GetMetadata(context.Background(), binding, KindSession); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("scoped corrupt record survived: %v", err)
+	}
+	if got := readAnchoredTestRecord(t, store, "unrelated-junk"); string(got) != "do-not-touch" {
+		t.Fatalf("junk changed: %q", got)
+	}
+}
+
+func TestStoreSerializesAcrossProcesses(t *testing.T) {
+	root := filepath.Join(canonicalTempDir(t), "state")
+	store, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Close(); err != nil {
+		t.Fatal(err)
+	}
+	var commands []*exec.Cmd
+	for index := 0; index < 6; index++ {
+		command := exec.Command(os.Args[0], "-test.run=^TestStateProcessHelper$")
+		command.Env = append(os.Environ(),
+			"PALONEXUS_STATE_HELPER=1",
+			"PALONEXUS_STATE_ROOT="+root,
+			"PALONEXUS_STATE_ROUTE=route-"+string(rune('a'+index)),
+		)
+		if err := command.Start(); err != nil {
+			t.Fatal(err)
+		}
+		commands = append(commands, command)
+	}
+	for _, command := range commands {
+		if err := command.Wait(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	store, err = New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer store.Close()
+	got, err := store.GetMetadata(context.Background(), Binding{Tenant: "tenant", Account: "account"}, KindRouting)
+	if err != nil || !strings.HasPrefix(got.RouteID, "route-") {
+		t.Fatalf("cross-process record = %#v, %v", got, err)
+	}
+}
+
+func TestAtomicWriteFaultBoundariesAndIndeterminateDurability(t *testing.T) {
+	t.Parallel()
+	binding := Binding{Tenant: "tenant", Account: "account"}
+	metadata := Metadata{Kind: KindRouting, RouteID: "route-primary"}
+	injected := errors.New("injected")
+	for _, stage := range []string{"write", "file-sync", "rename"} {
+		store := newTestStore(t)
+		impl := store.impl.(*unixStore)
+		switch stage {
+		case "write":
+			impl.faults.write = func(*os.File, []byte) (int, error) { return 0, injected }
+		case "file-sync":
+			impl.faults.syncFile = func(*os.File) error { return injected }
+		case "rename":
+			impl.faults.rename = func(int, string, int, string) error { return injected }
+		}
+		if err := store.PutMetadata(context.Background(), binding, metadata); err == nil ||
+			errors.Is(err, ErrDurabilityIndeterminate) {
+			t.Fatalf("%s failure = %v, want definite precommit failure", stage, err)
+		}
+		impl.faults = unixFaults{}
+		if _, err := store.GetMetadata(context.Background(), binding, KindRouting); !errors.Is(err, ErrNotFound) {
+			t.Fatalf("%s failure committed a record: %v", stage, err)
+		}
+	}
+
+	store := newTestStore(t)
+	impl := store.impl.(*unixStore)
+	impl.faults.syncDir = func(int) error { return injected }
+	err := store.PutMetadata(context.Background(), binding, metadata)
+	if !errors.Is(err, ErrDurabilityIndeterminate) {
+		t.Fatalf("post-rename fsync = %v, want ErrDurabilityIndeterminate", err)
+	}
+	impl.faults = unixFaults{}
+	got, err := store.GetMetadata(context.Background(), binding, KindRouting)
+	if err != nil || got != metadata {
+		t.Fatalf("indeterminate write did not expose committed record: %#v, %v", got, err)
+	}
+}
+
+func TestCancellationBeforeAndAfterCommitBoundary(t *testing.T) {
+	t.Parallel()
+	binding := Binding{Tenant: "tenant", Account: "account"}
+	metadata := Metadata{Kind: KindRouting, RouteID: "route-primary"}
+
+	store := newTestStore(t)
+	impl := store.impl.(*unixStore)
+	ctx, cancel := context.WithCancel(context.Background())
+	impl.faults.beforeRename = cancel
+	if err := store.PutMetadata(ctx, binding, metadata); !errors.Is(err, context.Canceled) {
+		t.Fatalf("precommit cancellation = %v", err)
+	}
+	impl.faults = unixFaults{}
+	if _, err := store.GetMetadata(context.Background(), binding, KindRouting); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("precommit cancellation wrote a record: %v", err)
+	}
+
+	ctx, cancel = context.WithCancel(context.Background())
+	impl.faults.afterRename = cancel
+	if err := store.PutMetadata(ctx, binding, metadata); err != nil {
+		t.Fatalf("completed commit reported late cancellation: %v", err)
+	}
+	impl.faults = unixFaults{}
+	if _, err := store.GetMetadata(context.Background(), binding, KindRouting); err != nil {
+		t.Fatalf("postcommit record missing: %v", err)
+	}
+}
+
+func TestStateProcessHelper(t *testing.T) {
 	if os.Getenv("PALONEXUS_STATE_HELPER") != "1" {
-		t.Skip("helper process")
+		t.Skip("helper")
 	}
 	store, err := New(os.Getenv("PALONEXUS_STATE_ROOT"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload, err := json.Marshal(map[string]string{"writer": os.Getenv("PALONEXUS_STATE_WRITER")})
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := store.Put(
+	defer store.Close()
+	if err := store.PutMetadata(
 		context.Background(),
 		Binding{Tenant: "tenant", Account: "account"},
-		"session",
-		payload,
+		Metadata{Kind: KindRouting, RouteID: os.Getenv("PALONEXUS_STATE_ROUTE")},
 	); err != nil {
 		t.Fatal(err)
 	}
 }
 
-func assertMode(t *testing.T, path string, want os.FileMode) {
+func newTestStore(t *testing.T) *Store {
 	t.Helper()
-	info, err := os.Stat(path)
+	store, err := New(filepath.Join(canonicalTempDir(t), "state"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got := info.Mode().Perm(); got != want {
-		t.Fatalf("%s mode = %o, want %o", filepath.Base(path), got, want)
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Error(err)
+		}
+	})
+	return store
+}
+
+func canonicalTempDir(t *testing.T) string {
+	t.Helper()
+	path, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
 	}
+	return path
+}
+
+func writeAnchoredTestRecord(t *testing.T, store *Store, name string, document []byte) {
+	t.Helper()
+	if err := store.writeRawForTesting(name, document); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func readAnchoredTestRecord(t *testing.T, store *Store, name string) []byte {
+	t.Helper()
+	document, err := store.readRawForTesting(name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var compact json.RawMessage = document
+	return compact
+}
+
+func (s *Store) writeRawForTesting(name string, document []byte) error {
+	impl := s.impl.(*unixStore)
+	return impl.withLock(context.Background(), func() error {
+		fd, err := unix.Openat(impl.rootFD, name,
+			unix.O_WRONLY|unix.O_CREAT|unix.O_TRUNC|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+		if err != nil {
+			return ErrUnsafePath
+		}
+		file := os.NewFile(uintptr(fd), name)
+		defer file.Close()
+		if _, err := file.Write(document); err != nil {
+			return ErrUnsafePath
+		}
+		if err := file.Sync(); err != nil {
+			return ErrUnsafePath
+		}
+		return syncRoot(impl.rootFD)
+	})
+}
+
+func (s *Store) readRawForTesting(name string) ([]byte, error) {
+	impl := s.impl.(*unixStore)
+	var result []byte
+	err := impl.withLock(context.Background(), func() error {
+		fd, err := unix.Openat(impl.rootFD, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+		if err != nil {
+			return err
+		}
+		file := os.NewFile(uintptr(fd), name)
+		defer file.Close()
+		result, err = io.ReadAll(file)
+		return err
+	})
+	return result, err
 }

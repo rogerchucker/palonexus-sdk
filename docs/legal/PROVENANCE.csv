@@ -198,3 +198,16 @@ guard/internal/keystore/keystore_test.go,rogerchucker/palonexus-sdk,WORKTREE,gua
 guard/internal/state/store.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/state/store.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/state/store_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/state/store_test.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/state/store_unsupported.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/state/store_unsupported.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/keystore/encrypted_file_unix.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/keystore/encrypted_file_unix.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/keystore/encrypted_file_unix_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/keystore/encrypted_file_unix_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/keystore/encrypted_file_unsupported.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/keystore/encrypted_file_unsupported.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/keystore/keyring_darwin_nocgo.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/keystore/keyring_darwin_nocgo.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/keystore/keyring_darwin_nocgo_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/keystore/keyring_darwin_nocgo_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/keystore/keyring_darwin_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/keystore/keyring_darwin_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/keystore/keyring_linux_backend.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/keystore/keyring_linux_backend.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/keystore/keyring_linux_contract_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/keystore/keyring_linux_contract_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/keystore/keyring_linux_crypto.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/keystore/keyring_linux_crypto.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/keystore/keyring_linux_crypto_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/keystore/keyring_linux_crypto_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/keystore/keyring_linux_native.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/keystore/keyring_linux_native.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/state/store_unix.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/state/store_unix.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/state/store_unsupported_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/state/store_unsupported_test.go,PaloNexus,yes,new,MIT,rogerchucker

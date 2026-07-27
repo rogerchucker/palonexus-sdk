@@ -4,20 +4,31 @@ package keystore
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/binary"
+	"encoding/hex"
 	"errors"
 	"regexp"
 	"sync"
+	"unicode"
+	"unicode/utf8"
 )
 
 var (
-	ErrNotFound    = errors.New("credential not found")
-	ErrUnavailable = errors.New("credential store unavailable")
-	ErrUnsupported = errors.New("credential store unsupported on this operating system")
-	ErrInvalidKey  = errors.New("invalid credential binding")
-	ErrTestingOnly = errors.New("encrypted file credential store is testing-only and disabled")
+	ErrNotFound      = errors.New("credential not found")
+	ErrUnavailable   = errors.New("credential store unavailable")
+	ErrUnsupported   = errors.New("credential store unsupported on this operating system")
+	ErrInvalidKey    = errors.New("invalid credential binding")
+	ErrInvalidSecret = errors.New("invalid credential secret")
+	ErrTestingOnly   = errors.New("encrypted file credential store is testing-only and disabled")
 )
 
-var bindingPart = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$`)
+const (
+	MaxBindingBytes = 128
+	MaxSecretBytes  = 1 << 20
+)
+
+var serviceName = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._:@-]{0,127}$`)
 
 // Key binds a credential to both the authenticated tenant and account. A
 // credential stored for one tenant cannot be selected by account name alone.
@@ -41,7 +52,7 @@ type Store struct {
 }
 
 func New(service string, backend Backend) (*Store, error) {
-	if !bindingPart.MatchString(service) || backend == nil {
+	if !serviceName.MatchString(service) || backend == nil {
 		return nil, ErrInvalidKey
 	}
 	return &Store{service: service, backend: backend}, nil
@@ -50,6 +61,9 @@ func New(service string, backend Backend) (*Store, error) {
 func (s *Store) Put(ctx context.Context, key Key, secret []byte) error {
 	if err := validateKey(key); err != nil {
 		return err
+	}
+	if len(secret) == 0 || len(secret) > MaxSecretBytes {
+		return ErrInvalidSecret
 	}
 	if err := ctx.Err(); err != nil {
 		return err
@@ -74,6 +88,9 @@ func (s *Store) Get(ctx context.Context, key Key) ([]byte, error) {
 		return nil, sanitizeBackendError(err)
 	}
 	defer Zero(temporary)
+	if len(temporary) == 0 || len(temporary) > MaxSecretBytes {
+		return nil, ErrUnavailable
+	}
 	result := append([]byte(nil), temporary...)
 	if err := ctx.Err(); err != nil {
 		Zero(result)
@@ -96,14 +113,35 @@ func (s *Store) Delete(ctx context.Context, key Key) error {
 }
 
 func validateKey(key Key) error {
-	if !bindingPart.MatchString(key.Tenant) || !bindingPart.MatchString(key.Account) {
+	if !validBindingPart(key.Tenant) || !validBindingPart(key.Account) {
 		return ErrInvalidKey
 	}
 	return nil
 }
 
 func accountName(key Key) string {
-	return key.Tenant + ":" + key.Account
+	hasher := sha256.New()
+	hasher.Write([]byte("palonexus-keystore-binding-v1\x00"))
+	var length [2]byte
+	binary.BigEndian.PutUint16(length[:], uint16(len(key.Tenant)))
+	hasher.Write(length[:])
+	hasher.Write([]byte(key.Tenant))
+	binary.BigEndian.PutUint16(length[:], uint16(len(key.Account)))
+	hasher.Write(length[:])
+	hasher.Write([]byte(key.Account))
+	return "pnx1:" + hex.EncodeToString(hasher.Sum(nil))
+}
+
+func validBindingPart(value string) bool {
+	if len(value) == 0 || len(value) > MaxBindingBytes || !utf8.ValidString(value) {
+		return false
+	}
+	for _, character := range value {
+		if unicode.IsControl(character) {
+			return false
+		}
+	}
+	return true
 }
 
 func sanitizeBackendError(err error) error {
@@ -114,6 +152,8 @@ func sanitizeBackendError(err error) error {
 		return ErrNotFound
 	case errors.Is(err, ErrUnsupported):
 		return ErrUnsupported
+	case errors.Is(err, context.Canceled), errors.Is(err, context.DeadlineExceeded):
+		return err
 	default:
 		return ErrUnavailable
 	}
