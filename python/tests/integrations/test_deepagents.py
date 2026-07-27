@@ -392,70 +392,86 @@ def test_factory_uses_only_documented_public_hooks() -> None:
     ]
 
 
-def test_harness_profile_style_exclusion_cannot_strip_bound_guards() -> None:
-    from deepagents import HarnessProfile
-
-    with pytest.raises(ValueError, match="required scaffolding cannot be excluded"):
-        HarnessProfile(excluded_middleware=frozenset({"SubAgentMiddleware"}))
-
-    middleware, _ = _authorization(ScriptedEngine.allow())
-    captured: dict[str, object] = {}
-
-    def profile_filtering_factory(
-        *,
-        model: object,
-        tools: object,
-        middleware: object,
-        context_schema: object,
-        name: object,
-        subagents: object,
-    ) -> object:
-        del model, tools, context_schema, name
-        assert isinstance(middleware, tuple)
-        captured["main"] = tuple(
-            item
-            for item in middleware
-            if type(item) is not PaloNexusDeepAgentsMiddleware
-            and item.name != "PaloNexusDeepAgentsMiddleware"
-        )
-        assert isinstance(subagents, tuple)
-        captured["children"] = tuple(
-            tuple(
-                item
-                for item in spec["middleware"]
-                if type(item) is not PaloNexusDeepAgentsMiddleware
-                and item.name != "PaloNexusDeepAgentsMiddleware"
-            )
-            for spec in subagents
-        )
-        return "agent"
-
-    assert (
-        create_authorized_deep_agent(
-            model="offline:model",
-            tools=[inventory_write],
-            authorization=middleware,
-            name="coordinator",
-            subagents=[
-                {
-                    "name": "inventory-worker",
-                    "description": "Worker.",
-                    "system_prompt": "Work.",
-                }
-            ],
-            deep_agent_factory=profile_filtering_factory,
-        )
-        == "agent"
+@pytest.mark.parametrize("exclusion_form", ["class", "string"])
+def test_real_harness_profile_exclusion_fails_closed_in_subprocess(
+    exclusion_form: str,
+) -> None:
+    exclusion = (
+        "PaloNexusDeepAgentsMiddleware"
+        if exclusion_form == "class"
+        else '"PaloNexusDeepAgentsMiddleware"'
     )
-    main = captured["main"]
-    children = captured["children"]
-    assert isinstance(main, tuple)
-    assert len(main) == 1 and main[0].name == "_FactoryBoundPaloNexusMiddleware"
-    assert isinstance(children, tuple)
-    assert all(
-        len(child) == 1 and child[0].name == "_FactoryBoundPaloNexusMiddleware"
-        for child in children
+    code = f"""
+from deepagents import HarnessProfile, create_deep_agent, register_harness_profile
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+from langchain_core.messages import AIMessage
+from palonexus import AuthorizationClient, AuthorizationUnavailable
+from palonexus.integrations.deepagents import (
+    PaloNexusDeepAgentsMiddleware,
+    create_authorized_deep_agent,
+)
+from palonexus.integrations.langchain import (
+    LangChainActionPolicy,
+    PaloNexusLangChainMiddleware,
+)
+from palonexus.testing import FakeTransport, ScriptedEngine
+
+model = FakeMessagesListChatModel(
+    responses=[AIMessage(content="done")],
+    name="profile-test-model",
+)
+engine = ScriptedEngine(ScriptedEngine.allow(), testing_only=True)
+delegate = PaloNexusLangChainMiddleware(
+    client=AuthorizationClient(FakeTransport(engine, testing_only=True)),
+    async_client=None,
+    tool_policies={{}},
+    model_policies={{
+        "profile-test-model": LangChainActionPolicy(
+            service="model-runtime",
+            side_effect="external",
+        )
+    }},
+    model_bindings={{"profile-test-model": model}},
+)
+authorization = PaloNexusDeepAgentsMiddleware(
+    authorization=delegate,
+    accountable_actors={{
+        "coordinator": "agent:coordinator",
+        "general-purpose": "agent:coordinator",
+    }},
+)
+register_harness_profile(
+    "fakemessageslistchatmodel",
+    HarnessProfile(excluded_middleware=frozenset({{{exclusion}}})),
+)
+
+# Prove the real profile is active: the unbound public middleware is stripped
+# and the naive graph silently constructs.
+create_deep_agent(model=model, middleware=[authorization], name="naive")
+print("NAIVE_STRIPPED")
+
+try:
+    create_authorized_deep_agent(
+        model=model,
+        tools=[],
+        authorization=authorization,
+        name="coordinator",
     )
+except AuthorizationUnavailable:
+    print("FACTORY_FAILED_CLOSED")
+"""
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode == 0, result.stdout + result.stderr
+    assert result.stdout.splitlines() == [
+        "NAIVE_STRIPPED",
+        "FACTORY_FAILED_CLOSED",
+    ]
 
 
 def _real_graph(
