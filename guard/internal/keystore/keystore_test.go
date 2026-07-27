@@ -75,70 +75,6 @@ func TestBindingEncodingIsInjectiveAcrossDelimiterUnicodeAndMaximumLengths(t *te
 	}
 }
 
-func TestLegacyDelimiterCredentialIsPurgedAndNeverReturned(t *testing.T) {
-	backend := NewMemoryBackendForTesting()
-	store, err := New("guard.test", backend)
-	if err != nil {
-		t.Fatal(err)
-	}
-	key := Key{Tenant: "a:b", Account: "c"}
-	legacy := legacyAccountName(key)
-	if err := backend.Put(context.Background(), "guard.test", legacy, []byte("legacy-secret")); err != nil {
-		t.Fatal(err)
-	}
-	if value, err := store.Get(context.Background(), key); !errors.Is(err, ErrNotFound) || value != nil {
-		t.Fatalf("legacy Get = %q, %v", value, err)
-	}
-	if value, err := backend.Get(context.Background(), "guard.test", legacy); !errors.Is(err, ErrNotFound) || value != nil {
-		t.Fatalf("legacy item survived purge = %q, %v", value, err)
-	}
-}
-
-func TestLegacyPurgeIsMandatoryObservableAndRetried(t *testing.T) {
-	key := Key{Tenant: "tenant", Account: "account"}
-	current := []byte("current-secret")
-	backend := &legacyPurgeBackend{current: current, failLegacyDeletes: 1}
-	store, _ := New("guard.test", backend)
-	if value, err := store.Get(context.Background(), key); !errors.Is(err, ErrUnavailable) || value != nil {
-		t.Fatalf("failed purge Get = %q, %v", value, err)
-	}
-	if !allZeroBytes(current) {
-		t.Fatalf("current value not zeroed after failed purge: %x", current)
-	}
-	backend.current = []byte("current-secret")
-	value, err := store.Get(context.Background(), key)
-	if err != nil || string(value) != "current-secret" || backend.legacyDeletes != 2 {
-		t.Fatalf("retried purge Get = %q, %v, deletes=%d", value, err, backend.legacyDeletes)
-	}
-}
-
-func TestLegacyPurgeFailureBlocksPutAndMissingGet(t *testing.T) {
-	key := Key{Tenant: "tenant", Account: "account"}
-	backend := &legacyPurgeBackend{missing: true, failLegacyDeletes: 2}
-	store, _ := New("guard.test", backend)
-	if value, err := store.Get(context.Background(), key); !errors.Is(err, ErrUnavailable) ||
-		errors.Is(err, ErrNotFound) || value != nil {
-		t.Fatalf("missing current with failed purge = %q, %v", value, err)
-	}
-	if err := store.Put(context.Background(), key, []byte("new")); !errors.Is(err, ErrUnavailable) || backend.puts != 0 {
-		t.Fatalf("Put after failed purge = %v, puts=%d", err, backend.puts)
-	}
-}
-
-func TestLegacyPurgePropagatesCancellationAndDeletePartialFailure(t *testing.T) {
-	key := Key{Tenant: "tenant", Account: "account"}
-	backend := &legacyPurgeBackend{current: []byte("current"), legacyDeleteErr: context.Canceled}
-	store, _ := New("guard.test", backend)
-	if value, err := store.Get(context.Background(), key); !errors.Is(err, context.Canceled) || value != nil {
-		t.Fatalf("canceled purge Get = %q, %v", value, err)
-	}
-	backend.legacyDeleteErr = errors.New("locked")
-	if err := store.Delete(context.Background(), key); !errors.Is(err, ErrUnavailable) ||
-		backend.currentDeletes != 1 || backend.legacyDeletes != 2 {
-		t.Fatalf("partial Delete = %v, current=%d legacy=%d", err, backend.currentDeletes, backend.legacyDeletes)
-	}
-}
-
 func TestInjectiveBindingsRoundTripAndDeleteIndependently(t *testing.T) {
 	t.Parallel()
 	store, err := New("dev.palonexus.guard", NewMemoryBackendForTesting())
@@ -532,51 +468,6 @@ func TestEncryptedFileFallbackSeparatesDelimiterCollisionBindings(t *testing.T) 
 
 type observingBackend struct {
 	getResult []byte
-}
-
-type legacyPurgeBackend struct {
-	current           []byte
-	missing           bool
-	failLegacyDeletes int
-	legacyDeletes     int
-	currentDeletes    int
-	puts              int
-	legacyDeleteErr   error
-}
-
-func (b *legacyPurgeBackend) Put(context.Context, string, string, []byte) error {
-	b.puts++
-	return nil
-}
-func (b *legacyPurgeBackend) Get(context.Context, string, string) ([]byte, error) {
-	if b.missing {
-		return nil, ErrNotFound
-	}
-	return b.current, nil
-}
-func (b *legacyPurgeBackend) Delete(_ context.Context, _ string, account string) error {
-	if strings.Contains(account, ":") && !strings.HasPrefix(account, "pnx1:") {
-		b.legacyDeletes++
-		if b.legacyDeleteErr != nil {
-			return b.legacyDeleteErr
-		}
-		if b.failLegacyDeletes > 0 {
-			b.failLegacyDeletes--
-			return errors.New("transient keyring failure")
-		}
-	} else {
-		b.currentDeletes++
-	}
-	return nil
-}
-
-func allZeroBytes(value []byte) bool {
-	for _, element := range value {
-		if element != 0 {
-			return false
-		}
-	}
-	return true
 }
 
 func (b *observingBackend) Put(context.Context, string, string, []byte) error { return nil }

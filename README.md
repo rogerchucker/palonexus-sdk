@@ -35,16 +35,10 @@ operating systems are currently unsupported.
 
 An AES-GCM file backend exists only for isolated tests. It is disabled unless
 the caller uses the explicit testing-only constructor flag and is never
-selected by native backend discovery.
-
-Pre-release credential code used ambiguous `tenant:account` keys. Every lookup, write, and explicit delete
-attempts removal of the exact service-scoped legacy credential and never reads
-it. A cleanup failure fails closed: lookups return no current credential,
-writes do not begin, and later operations retry cleanup. Delete attempts both
-the current and legacy entries and reports any partial cleanup failure. Users
-with only a legacy credential must authenticate again. Local state only owns
-canonical current-format filenames: version 0 typed metadata is upgraded in
-place to version 1, while unknown versions and arbitrary payloads fail closed.
+selected by native backend discovery. Closing its public store closes the
+directory descriptor, zeros the backend-owned key copy, and makes the cipher
+eligible for garbage collection; Go does not guarantee deterministic erasure
+of expanded cipher-key material held by the runtime.
 
 ## License
 

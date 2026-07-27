@@ -5,8 +5,6 @@ package state
 import (
 	"bytes"
 	"context"
-	"crypto/sha256"
-	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -294,30 +292,6 @@ func TestCleanupTempsUsesIndependentDirectoryOffset(t *testing.T) {
 	}
 }
 
-func TestLogoutDoesNotTouchUnreleasedLegacyStateNames(t *testing.T) {
-	store := newTestStore(t)
-	binding := Binding{Tenant: "tenant", Account: "account"}
-	for _, kind := range []Kind{KindRouting, KindSession, KindReconciliation} {
-		document := []byte(`{"version":1,"tenant":"tenant","account":"account","kind":"` + string(kind) +
-			`","payload":{"contentType":"application/octet-stream","value":"opaque"}}`)
-		writeAnchoredTestRecord(t, store, testLegacyRecordName(binding, kind), document)
-	}
-	if err := store.DeleteAccount(context.Background(), binding); err != nil {
-		t.Fatal(err)
-	}
-	for _, kind := range []Kind{KindRouting, KindSession, KindReconciliation} {
-		if err := unix.Fstatat(store.impl.(*unixStore).rootFD, testLegacyRecordName(binding, kind),
-			&unix.Stat_t{}, unix.AT_SYMLINK_NOFOLLOW); err != nil {
-			t.Fatalf("unreleased legacy %s was mutated: %v", kind, err)
-		}
-	}
-}
-
-func testLegacyRecordName(binding Binding, kind Kind) string {
-	sum := sha256.Sum256([]byte(binding.Tenant + "\x00" + binding.Account + "\x00" + string(kind)))
-	return "state-" + hex.EncodeToString(sum[:]) + ".json"
-}
-
 func TestStoreSerializesAcrossProcesses(t *testing.T) {
 	root := filepath.Join(canonicalTempDir(t), "state")
 	store, err := New(root)
@@ -399,6 +373,91 @@ func TestAtomicWriteFaultBoundariesAndIndeterminateDurability(t *testing.T) {
 	if err != nil || got != metadata {
 		t.Fatalf("indeterminate write did not expose committed record: %#v, %v", got, err)
 	}
+}
+
+func TestDeleteAccountCancellationAndFaultBoundaries(t *testing.T) {
+	binding := Binding{Tenant: "tenant", Account: "account"}
+	putAll := func(t *testing.T, store *Store) {
+		t.Helper()
+		for _, metadata := range []Metadata{
+			{Kind: KindRouting, RouteID: "route-primary"},
+			{Kind: KindSession, SessionID: "session_01ARZ3NDEKTSV4RRFFQ69G5FAV", ExpiresAt: time.Now().UTC().Add(time.Hour)},
+			{Kind: KindReconciliation, ReconciliationID: "recon_01ARZ3NDEKTSV4RRFFQ69G5FAV", ReferenceHash: "sha256:" + strings.Repeat("a", 64)},
+		} {
+			if err := store.PutMetadata(context.Background(), binding, metadata); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	t.Run("canceled-after-flock", func(t *testing.T) {
+		store := newTestStore(t)
+		putAll(t, store)
+		ctx, cancel := context.WithCancel(context.Background())
+		impl := store.impl.(*unixStore)
+		impl.faults.afterLock = cancel
+		for attempt := 0; attempt < 2; attempt++ {
+			if err := store.DeleteAccount(ctx, binding); !errors.Is(err, context.Canceled) {
+				t.Fatalf("attempt %d = %v", attempt, err)
+			}
+		}
+		impl.faults = unixFaults{}
+		if _, err := store.GetMetadata(context.Background(), binding, KindRouting); err != nil {
+			t.Fatalf("canceled delete mutated state: %v", err)
+		}
+	})
+	t.Run("unlink-failure", func(t *testing.T) {
+		store := newTestStore(t)
+		putAll(t, store)
+		injected := errors.New("unlink")
+		impl := store.impl.(*unixStore)
+		impl.faults.unlink = func(int, string) error { return injected }
+		if err := store.DeleteAccount(context.Background(), binding); !errors.Is(err, injected) {
+			t.Fatalf("unlink failure = %v", err)
+		}
+	})
+	t.Run("late-cancel-finishes", func(t *testing.T) {
+		store := newTestStore(t)
+		putAll(t, store)
+		ctx, cancel := context.WithCancel(context.Background())
+		impl := store.impl.(*unixStore)
+		calls := 0
+		impl.faults.unlink = func(fd int, name string) error {
+			calls++
+			err := unlinkRegularAt(fd, name)
+			if calls == 1 {
+				cancel()
+			}
+			return err
+		}
+		if err := store.DeleteAccount(ctx, binding); err != nil || calls != 3 {
+			t.Fatalf("late cancellation = %v, calls=%d", err, calls)
+		}
+	})
+	t.Run("later-unlink-indeterminate", func(t *testing.T) {
+		store := newTestStore(t)
+		putAll(t, store)
+		impl := store.impl.(*unixStore)
+		calls := 0
+		impl.faults.unlink = func(fd int, name string) error {
+			calls++
+			if calls == 2 {
+				return errors.New("second unlink")
+			}
+			return unlinkRegularAt(fd, name)
+		}
+		if err := store.DeleteAccount(context.Background(), binding); !errors.Is(err, ErrDurabilityIndeterminate) {
+			t.Fatalf("later unlink = %v", err)
+		}
+	})
+	t.Run("directory-sync-indeterminate", func(t *testing.T) {
+		store := newTestStore(t)
+		putAll(t, store)
+		impl := store.impl.(*unixStore)
+		impl.faults.syncDir = func(int) error { return errors.New("sync") }
+		if err := store.DeleteAccount(context.Background(), binding); !errors.Is(err, ErrDurabilityIndeterminate) {
+			t.Fatalf("sync failure = %v", err)
+		}
+	})
 }
 
 func TestCancellationBeforeAndAfterCommitBoundary(t *testing.T) {
@@ -550,11 +609,13 @@ func TestSessionTransactionSerializesAcrossStoreInstancesAndPreservesRouting(t *
 	}()
 	<-entered
 	secondEntered := make(chan struct{})
+	secondDone := make(chan struct{})
 	go func() {
 		_ = second.WithSessionTransaction(context.Background(), binding, func(Metadata, bool) (*Metadata, error) {
 			close(secondEntered)
 			return nil, nil
 		})
+		close(secondDone)
 	}()
 	select {
 	case <-secondEntered:
@@ -570,6 +631,7 @@ func TestSessionTransactionSerializesAcrossStoreInstancesAndPreservesRouting(t *
 	case <-time.After(time.Second):
 		t.Fatal("second transaction did not acquire lock")
 	}
+	<-secondDone
 	if _, err := first.GetMetadata(context.Background(), binding, KindRouting); err != nil {
 		t.Fatalf("session transaction damaged routing metadata: %v", err)
 	}

@@ -7,19 +7,24 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"io"
+	"sync"
 )
 
 type encryptedFiles interface {
 	Put(context.Context, string, []byte) error
 	Get(context.Context, string) ([]byte, error)
 	Delete(context.Context, string) error
+	Close() error
 }
 
 const encryptedDocumentVersionBytes = 1
 
 type encryptedFileBackend struct {
-	aead  cipher.AEAD
-	files encryptedFiles
+	aead   cipher.AEAD
+	files  encryptedFiles
+	key    []byte
+	mu     sync.Mutex
+	closed bool
 }
 
 func (b *encryptedFileBackend) maxDocumentBytes() int {
@@ -42,10 +47,15 @@ func newEncryptedFileBackend(options EncryptedFileOptions) (Backend, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &encryptedFileBackend{aead: aead, files: files}, nil
+	return &encryptedFileBackend{aead: aead, files: files, key: append([]byte(nil), options.Key...)}, nil
 }
 
 func (b *encryptedFileBackend) Put(ctx context.Context, service, account string, secret []byte) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return ErrUnavailable
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
@@ -61,6 +71,11 @@ func (b *encryptedFileBackend) Put(ctx context.Context, service, account string,
 }
 
 func (b *encryptedFileBackend) Get(ctx context.Context, service, account string) ([]byte, error) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return nil, ErrUnavailable
+	}
 	document, err := b.files.Get(ctx, encryptedName(service, account))
 	if err != nil {
 		return nil, err
@@ -86,7 +101,25 @@ func (b *encryptedFileBackend) Get(ctx context.Context, service, account string)
 }
 
 func (b *encryptedFileBackend) Delete(ctx context.Context, service, account string) error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return ErrUnavailable
+	}
 	return b.files.Delete(ctx, encryptedName(service, account))
+}
+
+func (b *encryptedFileBackend) Close() error {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return nil
+	}
+	b.closed = true
+	Zero(b.key)
+	b.key = nil
+	b.aead = nil
+	return b.files.Close()
 }
 
 func encryptedName(service, account string) string {

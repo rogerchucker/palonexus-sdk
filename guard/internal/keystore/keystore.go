@@ -51,6 +51,18 @@ type Store struct {
 	backend Backend
 }
 
+// Close releases backend resources. Backends without owned resources are
+// treated as no-op closers.
+func (s *Store) Close() error {
+	if s == nil || s.backend == nil {
+		return nil
+	}
+	if closer, ok := s.backend.(interface{ Close() error }); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
 func New(service string, backend Backend) (*Store, error) {
 	if !serviceName.MatchString(service) || backend == nil {
 		return nil, ErrInvalidKey
@@ -68,9 +80,6 @@ func (s *Store) Put(ctx context.Context, key Key, secret []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := s.backend.Delete(ctx, s.service, legacyAccountName(key)); err != nil {
-		return sanitizeBackendError(err)
-	}
 	copyOfSecret := append([]byte(nil), secret...)
 	defer Zero(copyOfSecret)
 	if err := s.backend.Put(ctx, s.service, accountName(key), copyOfSecret); err != nil {
@@ -87,11 +96,6 @@ func (s *Store) Get(ctx context.Context, key Key) ([]byte, error) {
 		return nil, err
 	}
 	temporary, err := s.backend.Get(ctx, s.service, accountName(key))
-	purgeErr := s.backend.Delete(ctx, s.service, legacyAccountName(key))
-	if purgeErr != nil {
-		Zero(temporary)
-		return nil, sanitizeBackendError(purgeErr)
-	}
 	if err != nil {
 		return nil, sanitizeBackendError(err)
 	}
@@ -114,15 +118,8 @@ func (s *Store) Delete(ctx context.Context, key Key) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	currentErr := s.backend.Delete(ctx, s.service, accountName(key))
-	legacyErr := s.backend.Delete(ctx, s.service, legacyAccountName(key))
-	if legacyErr != nil {
-		return sanitizeBackendError(legacyErr)
-	}
-	return sanitizeBackendError(currentErr)
+	return sanitizeBackendError(s.backend.Delete(ctx, s.service, accountName(key)))
 }
-
-func legacyAccountName(key Key) string { return key.Tenant + ":" + key.Account }
 
 func validateKey(key Key) error {
 	if !validBindingPart(key.Tenant) || !validBindingPart(key.Account) {

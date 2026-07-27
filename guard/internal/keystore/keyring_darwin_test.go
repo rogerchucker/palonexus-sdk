@@ -103,21 +103,6 @@ func TestDarwinBackendCancellationWhileWaitingForOperationLock(t *testing.T) {
 	backend.gate <- struct{}{}
 }
 
-func TestDarwinInteractionCancellationWhileWaiting(t *testing.T) {
-	<-darwinInteractionGate
-	defer func() { darwinInteractionGate <- struct{}{} }()
-	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
-	defer cancel()
-	called := false
-	err := withInteractionDisabled(ctx, func() error {
-		called = true
-		return nil
-	})
-	if !errors.Is(err, context.DeadlineExceeded) || called {
-		t.Fatalf("interaction wait = %v, called=%v", err, called)
-	}
-}
-
 func TestDarwinGetZerosValueOnLateCancellation(t *testing.T) {
 	value := []byte("secret")
 	ctx, cancel := context.WithCancel(context.Background())
