@@ -6,6 +6,8 @@ import (
 	"crypto/rand"
 	"crypto/rsa"
 	"crypto/sha256"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -44,6 +46,8 @@ type providerFixture struct {
 	jwksStatus      atomic.Int32
 	mutateClaims    func(map[string]any)
 	signingAlg      string
+	revokeBlock     func()
+	refreshBlock    func()
 }
 
 func newProvider(t *testing.T) *providerFixture {
@@ -93,6 +97,9 @@ func newProvider(t *testing.T) *providerFixture {
 		refreshing := r.Form.Get("grant_type") == "refresh_token"
 		if refreshing {
 			p.refreshCount.Add(1)
+			if p.refreshBlock != nil {
+				p.refreshBlock()
+			}
 		} else {
 			sum := sha256.Sum256([]byte(r.Form.Get("code_verifier")))
 			if r.Form.Get("code") != "valid-code" ||
@@ -121,6 +128,9 @@ func newProvider(t *testing.T) *providerFixture {
 		})
 	})
 	mux.HandleFunc("/revoke", func(w http.ResponseWriter, r *http.Request) {
+		if p.revokeBlock != nil {
+			p.revokeBlock()
+		}
 		_ = r.ParseForm()
 		p.mu.Lock()
 		p.revoked = append(p.revoked, r.Form.Get("token"))
@@ -232,20 +242,44 @@ func TestRefreshIsSingleFlightAndLogoutRevokesAndDeletes(t *testing.T) {
 		t.Fatal(err)
 	}
 	var wg sync.WaitGroup
+	results := make(chan Session, 12)
+	errs := make(chan error, 12)
 	for range 12 {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if _, err := m.Refresh(context.Background(), session.ID); err != nil {
-				t.Error(err)
-			}
+			refreshed, refreshErr := m.Refresh(context.Background(), session.ID)
+			results <- refreshed
+			errs <- refreshErr
 		}()
 	}
 	wg.Wait()
+	close(results)
+	close(errs)
 	if got := p.refreshCount.Load(); got != 1 {
 		t.Fatalf("refresh count=%d, want 1", got)
 	}
-	if err := m.Logout(context.Background(), session.ID); err != nil {
+	var current Session
+	successes, stale := 0, 0
+	for result := range results {
+		if result.ID != "" {
+			current = result
+			successes++
+		}
+	}
+	for refreshErr := range errs {
+		switch {
+		case refreshErr == nil:
+		case errors.Is(refreshErr, ErrNoSession):
+			stale++
+		default:
+			t.Fatalf("unexpected refresh result: %v", refreshErr)
+		}
+	}
+	if successes != 1 || stale != 11 {
+		t.Fatalf("refresh ownership results: successes=%d stale=%d", successes, stale)
+	}
+	if err := m.Logout(context.Background(), current.ID); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := m.Refresh(context.Background(), session.ID); !errors.Is(err, ErrNoSession) {
@@ -508,6 +542,125 @@ func TestMultipleLoginReplacesCredentialWithoutOrphan(t *testing.T) {
 	}
 }
 
+func TestRefreshRejectsStaleAndGuessedSessionHandles(t *testing.T) {
+	p := newProvider(t)
+	defer p.Close()
+	m := testManager(t, p)
+	firstRequest, err := m.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.nonce.Store(firstRequest.nonce)
+	firstURL, _ := url.Parse(firstRequest.URL)
+	m.client.Transport = challengeTransport{base: m.client.Transport, challenge: firstURL.Query().Get("code_challenge")}
+	first, err := m.Complete(context.Background(), Callback{
+		State: firstURL.Query().Get("state"), Code: "valid-code",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	second := loginForTest(t, m, p)
+	for _, id := range []string{first.ID, "session_00000000000000000000000000"} {
+		if _, err := m.Refresh(context.Background(), id); !errors.Is(err, ErrNoSession) {
+			t.Fatalf("refresh accepted non-current handle %q: %v", id, err)
+		}
+	}
+	current, err := m.options.Metadata.GetMetadata(context.Background(),
+		state.Binding{Tenant: "tenant", Account: "account"}, state.KindSession)
+	if err != nil || current.SessionID != second.ID || current.Tombstoned {
+		t.Fatalf("non-current refresh changed current session: %#v, %v", current, err)
+	}
+}
+
+func TestLogoutStaleHandlePreservesCurrentSessionAndOrphanLogoutIsIdempotent(t *testing.T) {
+	p := newProvider(t)
+	defer p.Close()
+	m := testManager(t, p)
+	first := loginForTest(t, m, p)
+	second := loginForTest(t, m, p)
+	if err := m.Logout(context.Background(), first.ID); err != nil {
+		t.Fatalf("stale logout was not idempotent: %v", err)
+	}
+	current, err := m.options.Metadata.GetMetadata(context.Background(),
+		state.Binding{Tenant: "tenant", Account: "account"}, state.KindSession)
+	if err != nil || current.SessionID != second.ID {
+		t.Fatalf("stale logout removed current session: %#v, %v", current, err)
+	}
+	if err := m.options.Metadata.DeleteMetadata(context.Background(),
+		state.Binding{Tenant: "tenant", Account: "account"}, state.KindSession); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		err := m.Logout(context.Background(), first.ID)
+		if err != nil && !errors.Is(err, ErrNoSession) && !errors.Is(err, ErrRevocation) {
+			t.Fatalf("orphan cleanup was not idempotent: %v", err)
+		}
+	}
+}
+
+func TestProductionTransportRejectsTLSVerificationBypasses(t *testing.T) {
+	p := newProvider(t)
+	defer p.Close()
+	base := p.server.Client().Transport.(*http.Transport).Clone()
+	cases := map[string]func(*http.Transport){
+		"insecure skip verify": func(tr *http.Transport) { tr.TLSClientConfig.InsecureSkipVerify = true },
+		"verify peer hook": func(tr *http.Transport) {
+			tr.TLSClientConfig.VerifyPeerCertificate = func([][]byte, [][]*x509.Certificate) error { return nil }
+		},
+		"verify connection hook": func(tr *http.Transport) {
+			tr.TLSClientConfig.VerifyConnection = func(tls.ConnectionState) error { return nil }
+		},
+		"dial TLS": func(tr *http.Transport) {
+			tr.DialTLS = func(string, string) (net.Conn, error) { return nil, errors.New("unused") }
+		},
+		"dial TLS context": func(tr *http.Transport) {
+			tr.DialTLSContext = func(context.Context, string, string) (net.Conn, error) { return nil, errors.New("unused") }
+		},
+		"server name override": func(tr *http.Transport) { tr.TLSClientConfig.ServerName = "other.example" },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			tr := base.Clone()
+			if tr.TLSClientConfig == nil {
+				tr.TLSClientConfig = &tls.Config{}
+			}
+			mutate(tr)
+			_, err := New(Options{
+				Issuer: "https://issuer.example", ClientID: "client", Tenant: "tenant", Account: "account",
+				RedirectURI: "http://127.0.0.1:49152/callback", HTTPClient: &http.Client{Transport: tr},
+				Credentials: mustStore(t), Metadata: newMemoryMetadata(), Algorithms: []string{"RS256"},
+			})
+			if !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("unsafe transport accepted: %v", err)
+			}
+		})
+	}
+}
+
+func TestSecureTransportPreservesTrustMaterialAndReplacesNetworkHooks(t *testing.T) {
+	roots := x509.NewCertPool()
+	certificates := []tls.Certificate{{Certificate: [][]byte{{1, 2, 3}}}}
+	base := &http.Transport{
+		Proxy: http.ProxyFromEnvironment,
+		DialContext: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("unsafe custom dial")
+		},
+		TLSClientConfig: &tls.Config{RootCAs: roots, Certificates: certificates, MinVersion: tls.VersionTLS12},
+	}
+	secured, err := secureTransport(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if secured.Proxy != nil || secured.TLSClientConfig.RootCAs != roots ||
+		len(secured.TLSClientConfig.Certificates) != 1 ||
+		secured.TLSClientConfig.MinVersion != tls.VersionTLS12 {
+		t.Fatal("safe TLS trust material was not preserved")
+	}
+	if _, err := secured.DialContext(context.Background(), "tcp", "127.0.0.1:443"); !errors.Is(err, ErrProvider) {
+		t.Fatalf("custom dial hook survived transport hardening: %v", err)
+	}
+}
+
 func TestDiscoveryURLForRootAndPathIssuers(t *testing.T) {
 	cases := map[string]string{
 		"https://issuer.example":         "https://issuer.example/.well-known/openid-configuration",
@@ -539,6 +692,14 @@ func TestForbiddenDestinationRejectsReservedAndDocumentationNetworks(t *testing.
 	}
 	if forbiddenDestination(net.ParseIP("8.8.8.8")) {
 		t.Fatal("public unicast destination rejected")
+	}
+	for _, raw := range []string{
+		"https://100.64.0.1/oidc", "https://192.0.2.1/oidc",
+		"https://198.51.100.1/oidc", "https://203.0.113.1/oidc",
+	} {
+		if validateRemoteURL(raw, false) == nil {
+			t.Fatalf("literal forbidden endpoint accepted: %s", raw)
+		}
 	}
 }
 
@@ -617,7 +778,8 @@ func TestRefreshAndLogoutAcrossManagersCannotResurrectSession(t *testing.T) {
 	}()
 	close(start)
 	wg.Wait()
-	if refreshErr != nil && !errors.Is(refreshErr, ErrNoSession) {
+	if refreshErr != nil && !errors.Is(refreshErr, ErrNoSession) &&
+		!errors.Is(refreshErr, ErrCommitIndeterminate) {
 		t.Fatalf("unexpected refresh result: %v", refreshErr)
 	}
 	if logoutErr != nil {
@@ -654,14 +816,136 @@ func TestRevocationAuthenticatesAndSurfacesFailureAfterLocalCleanup(t *testing.T
 	}
 	p.mu.Unlock()
 
+	m.options.ClientID = "client id:with/slash"
+	m.options.ClientSecret = "secret value+percent%"
+	m.options.RevocationAuthMethod = "client_secret_basic"
+	if err := m.revoke(context.Background(), credential{RefreshToken: "refresh", AccessToken: "access"}); err != nil {
+		t.Fatal(err)
+	}
+	p.mu.Lock()
+	encoded, decodeErr := base64.StdEncoding.DecodeString(strings.TrimPrefix(
+		p.revokeAuth[len(p.revokeAuth)-1], "Basic "))
+	if decodeErr != nil || string(encoded) != url.QueryEscape(m.options.ClientID)+":"+url.QueryEscape(m.options.ClientSecret) {
+		t.Fatalf("basic credentials were not RFC 6749 form-encoded: %q, %v", encoded, decodeErr)
+	}
+	p.mu.Unlock()
+	m.options.ClientID = p.clientID
+	m.options.ClientSecret = "client-secret"
+
 	session := loginForTest(t, m, p)
 	p.revokeStatus.Store(http.StatusServiceUnavailable)
+	p.mu.Lock()
+	beforeRevoke := len(p.revoked)
+	p.mu.Unlock()
 	if err := m.Logout(context.Background(), session.ID); !errors.Is(err, ErrPartial) || !errors.Is(err, ErrRevocation) {
 		t.Fatalf("revocation failure not surfaced as partial: %v", err)
 	}
+	p.mu.Lock()
+	if got := len(p.revoked) - beforeRevoke; got != 2 {
+		p.mu.Unlock()
+		t.Fatalf("revocation failure stopped before independently attempting both tokens: %d", got)
+	}
+	p.mu.Unlock()
 	if _, err := m.options.Credentials.Get(context.Background(),
 		credentialKey(m.options.Tenant, m.options.Account, session.ID)); !errors.Is(err, keystore.ErrNotFound) {
 		t.Fatalf("local credential survived revocation outage: %v", err)
+	}
+}
+
+func TestHangingRevocationCannotKeepLocalSessionLive(t *testing.T) {
+	p := newProvider(t)
+	defer p.Close()
+	entered, release := make(chan struct{}), make(chan struct{})
+	p.revokeBlock = func() {
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	m := testManager(t, p)
+	session := loginForTest(t, m, p)
+	done := make(chan error, 1)
+	go func() { done <- m.Logout(context.Background(), session.ID) }()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("revocation request did not start")
+	}
+	metadataResult := make(chan error, 1)
+	go func() {
+		_, err := m.options.Metadata.GetMetadata(context.Background(),
+			state.Binding{Tenant: "tenant", Account: "account"}, state.KindSession)
+		metadataResult <- err
+	}()
+	select {
+	case err := <-metadataResult:
+		if !errors.Is(err, state.ErrNotFound) {
+			close(release)
+			<-done
+			t.Fatalf("session metadata remained live during hanging revocation: %v", err)
+		}
+	case <-time.After(100 * time.Millisecond):
+		close(release)
+		<-done
+		t.Fatal("hanging revocation retained the global state lock")
+	}
+	if _, err := m.options.Credentials.Get(context.Background(),
+		credentialKey("tenant", "account", session.ID)); !errors.Is(err, keystore.ErrNotFound) {
+		t.Fatalf("credential remained live during hanging revocation: %v", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestLogoutStateLockFailureStillDeletesCredentialAndReportsUncertainInvalidation(t *testing.T) {
+	p := newProvider(t)
+	defer p.Close()
+	metadata := &faultMetadata{memoryMetadata: newMemoryMetadata()}
+	credentials := mustStore(t)
+	m, err := newForTesting(Options{
+		Issuer: p.server.URL, ClientID: p.clientID, Tenant: "tenant", Account: "account",
+		RedirectURI: "http://127.0.0.1:49152/callback", HTTPClient: p.server.Client(),
+		Credentials: credentials, Metadata: metadata, Algorithms: []string{"RS256"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := loginForTest(t, m, p)
+	metadata.failBefore.Store(true)
+	err = m.Logout(context.Background(), session.ID)
+	if !errors.Is(err, ErrPartial) || !errors.Is(err, ErrCommitIndeterminate) {
+		t.Fatalf("lock failure did not report uncertain invalidation: %v", err)
+	}
+	if _, err := credentials.Get(context.Background(),
+		credentialKey("tenant", "account", session.ID)); !errors.Is(err, keystore.ErrNotFound) {
+		t.Fatalf("credential survived state lock failure: %v", err)
+	}
+}
+
+func TestLogoutCorruptCredentialFailsRevocationButStillRemovesLocalSession(t *testing.T) {
+	p := newProvider(t)
+	defer p.Close()
+	m := testManager(t, p)
+	session := loginForTest(t, m, p)
+	if err := m.options.Credentials.Put(context.Background(),
+		credentialKey("tenant", "account", session.ID), []byte("{corrupt")); err != nil {
+		t.Fatal(err)
+	}
+	err := m.Logout(context.Background(), session.ID)
+	if !errors.Is(err, ErrPartial) || !errors.Is(err, ErrRevocation) {
+		t.Fatalf("corrupt credential did not surface revocation uncertainty: %v", err)
+	}
+	if _, err := m.options.Metadata.GetMetadata(context.Background(),
+		state.Binding{Tenant: "tenant", Account: "account"}, state.KindSession); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("corrupt credential prevented metadata cleanup: %v", err)
+	}
+	if _, err := m.options.Credentials.Get(context.Background(),
+		credentialKey("tenant", "account", session.ID)); !errors.Is(err, keystore.ErrNotFound) {
+		t.Fatalf("corrupt credential survived logout: %v", err)
 	}
 }
 
@@ -700,7 +984,7 @@ func TestRefreshCommitFailureTombstonesWithoutRestoringConsumedToken(t *testing.
 		t.Fatal(err)
 	}
 	session := loginForTest(t, m, p)
-	metadata.failAfter.Store(true)
+	metadata.failBeforeCall.Store(metadata.calls.Load() + 2)
 	if _, err := m.Refresh(context.Background(), session.ID); !errors.Is(err, ErrCommitIndeterminate) {
 		t.Fatalf("refresh commit failure was not indeterminate: %v", err)
 	}
@@ -711,6 +995,145 @@ func TestRefreshCommitFailureTombstonesWithoutRestoringConsumedToken(t *testing.
 	if _, err := credentials.Get(context.Background(),
 		credentialKey("tenant", "account", session.ID)); !errors.Is(err, keystore.ErrNotFound) {
 		t.Fatalf("consumed refresh token was restored: %v", err)
+	}
+}
+
+func TestRefreshCleanupFailuresAreTypedAndReservationRemainsFailClosed(t *testing.T) {
+	p := newProvider(t)
+	defer p.Close()
+	metadata := &faultMetadata{memoryMetadata: newMemoryMetadata()}
+	credentials := &faultCredentials{Store: mustStore(t)}
+	m, err := newForTesting(Options{
+		Issuer: p.server.URL, ClientID: p.clientID, Tenant: "tenant", Account: "account",
+		RedirectURI: "http://127.0.0.1:49152/callback", HTTPClient: p.server.Client(),
+		Credentials: credentials, Metadata: metadata, Algorithms: []string{"RS256"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := loginForTest(t, m, p)
+	metadata.failBeforeFrom.Store(metadata.calls.Load() + 2)
+	credentials.failDelete = true
+	_, err = m.Refresh(context.Background(), session.ID)
+	if !errors.Is(err, ErrPartial) || !errors.Is(err, ErrCommitIndeterminate) {
+		t.Fatalf("cleanup uncertainty was not typed: %v", err)
+	}
+	partial := &PartialError{}
+	if !errors.As(err, &partial) || !partial.LocalCleanupFailed || !partial.CommitUncertain {
+		t.Fatalf("cleanup dimensions were not retained: %#v", err)
+	}
+	if _, retryErr := m.Refresh(context.Background(), session.ID); retryErr == nil {
+		t.Fatalf("uncertain refresh reservation became usable: %v", retryErr)
+	}
+}
+
+func TestRefreshPersistsReservationBeforeNetworkAndDoesNotHoldStateLock(t *testing.T) {
+	p := newProvider(t)
+	defer p.Close()
+	tempRoot, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	root := filepath.Join(tempRoot, "state")
+	metadata, err := state.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer metadata.Close()
+	other, err := state.New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer other.Close()
+	m, err := newForTesting(Options{
+		Issuer: p.server.URL, ClientID: p.clientID, Tenant: "tenant", Account: "account",
+		RedirectURI: "http://127.0.0.1:49152/callback", HTTPClient: p.server.Client(),
+		Credentials: mustStore(t), Metadata: metadata, Algorithms: []string{"RS256"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	session := loginForTest(t, m, p)
+	entered, release := make(chan struct{}), make(chan struct{})
+	base := m.client.Transport
+	m.client.Transport = roundTripFunc(func(request *http.Request) (*http.Response, error) {
+		if request.URL.Path == "/token" {
+			record, getErr := other.GetMetadata(context.Background(),
+				state.Binding{Tenant: "tenant", Account: "account"}, state.KindSession)
+			if getErr != nil || !record.Tombstoned || record.SessionID != session.ID || record.OperationID == "" {
+				t.Errorf("refresh reached provider without durable reservation: %#v, %v", record, getErr)
+			}
+			close(entered)
+			<-release
+		}
+		return base.RoundTrip(request)
+	})
+	done := make(chan error, 1)
+	go func() {
+		_, refreshErr := m.Refresh(context.Background(), session.ID)
+		done <- refreshErr
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not reach provider")
+	}
+	if err := other.PutMetadata(context.Background(),
+		state.Binding{Tenant: "tenant", Account: "other"}, state.Metadata{Kind: state.KindRouting, RouteID: "route-default"}); err != nil {
+		t.Fatalf("slow IdP call held root state lock: %v", err)
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSupersedingLoginSurvivesInFlightRefreshCleanup(t *testing.T) {
+	p := newProvider(t)
+	defer p.Close()
+	m := testManager(t, p)
+	firstRequest, err := m.Begin(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.nonce.Store(firstRequest.nonce)
+	firstURL, _ := url.Parse(firstRequest.URL)
+	m.client.Transport = challengeTransport{base: m.client.Transport, challenge: firstURL.Query().Get("code_challenge")}
+	first, err := m.Complete(context.Background(), Callback{
+		State: firstURL.Query().Get("state"), Code: "valid-code",
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	entered, release := make(chan struct{}), make(chan struct{})
+	p.refreshBlock = func() {
+		select {
+		case <-entered:
+		default:
+			close(entered)
+		}
+		<-release
+	}
+	done := make(chan error, 1)
+	go func() {
+		_, err := m.Refresh(context.Background(), first.ID)
+		done <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("refresh did not reach provider")
+	}
+	second := loginForTest(t, m, p)
+	p.mutateClaims = func(claims map[string]any) { claims["nonce"] = firstRequest.nonce }
+	close(release)
+	if err := <-done; !errors.Is(err, ErrCommitIndeterminate) {
+		t.Fatalf("superseded refresh returned unexpected result: %v", err)
+	}
+	current, err := m.options.Metadata.GetMetadata(context.Background(),
+		state.Binding{Tenant: "tenant", Account: "account"}, state.KindSession)
+	if err != nil || current.SessionID != second.ID || current.Tombstoned {
+		t.Fatalf("refresh cleanup removed superseding login: %#v, %v", current, err)
 	}
 }
 
@@ -736,18 +1159,76 @@ func TestInitialCredentialWriteAndCleanupFailureIsIndeterminate(t *testing.T) {
 	}
 }
 
+func TestInitialMetadataCommitReconcilesPostWriteAndCleansPreWrite(t *testing.T) {
+	p := newProvider(t)
+	defer p.Close()
+	t.Run("post-write is committed success", func(t *testing.T) {
+		metadata := &faultMetadata{memoryMetadata: newMemoryMetadata()}
+		metadata.failAfterCall.Store(1)
+		m, err := newForTesting(Options{
+			Issuer: p.server.URL, ClientID: p.clientID, Tenant: "tenant", Account: "post",
+			RedirectURI: "http://127.0.0.1:49152/callback", HTTPClient: p.server.Client(),
+			Credentials: mustStore(t), Metadata: metadata, Algorithms: []string{"RS256"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if session := loginForTest(t, m, p); session.ID == "" {
+			t.Fatal("reconciled committed login returned no session")
+		}
+	})
+	t.Run("pre-write leaves no credential", func(t *testing.T) {
+		metadata := &faultMetadata{memoryMetadata: newMemoryMetadata()}
+		metadata.failBeforeCall.Store(1)
+		credentials := &faultCredentials{Store: mustStore(t)}
+		m, err := newForTesting(Options{
+			Issuer: p.server.URL, ClientID: p.clientID, Tenant: "tenant", Account: "pre",
+			RedirectURI: "http://127.0.0.1:49152/callback", HTTPClient: p.server.Client(),
+			Credentials: credentials, Metadata: metadata, Algorithms: []string{"RS256"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		request, err := m.Begin(context.Background())
+		if err != nil {
+			t.Fatal(err)
+		}
+		p.nonce.Store(request.nonce)
+		u, _ := url.Parse(request.URL)
+		m.client.Transport = challengeTransport{base: m.client.Transport, challenge: u.Query().Get("code_challenge")}
+		if _, err := m.Complete(context.Background(), Callback{
+			State: u.Query().Get("state"), Code: "valid-code",
+		}); !errors.Is(err, ErrCommitIndeterminate) {
+			t.Fatalf("pre-write failure was not indeterminate: %v", err)
+		}
+		if metadata.memoryMetadata.ok {
+			t.Fatal("pre-write failure unexpectedly installed session metadata")
+		}
+		if _, err := credentials.Get(context.Background(), credentials.lastPut); !errors.Is(err, keystore.ErrNotFound) {
+			t.Fatalf("pre-write failure orphaned credential: %v", err)
+		}
+	})
+}
+
 type faultMetadata struct {
 	*memoryMetadata
-	failAfter atomic.Bool
+	failAfter      atomic.Bool
+	failBefore     atomic.Bool
+	calls          atomic.Int32
+	failAfterCall  atomic.Int32
+	failBeforeCall atomic.Int32
+	failBeforeFrom atomic.Int32
 }
 
 type faultCredentials struct {
 	*keystore.Store
 	failPutAfter bool
 	failDelete   bool
+	lastPut      keystore.Key
 }
 
 func (f *faultCredentials) Put(ctx context.Context, key keystore.Key, value []byte) error {
+	f.lastPut = key
 	err := f.Store.Put(ctx, key, value)
 	if err == nil && f.failPutAfter {
 		f.failPutAfter = false
@@ -764,8 +1245,15 @@ func (f *faultCredentials) Delete(ctx context.Context, key keystore.Key) error {
 }
 
 func (m *faultMetadata) WithSessionTransaction(ctx context.Context, binding state.Binding, transaction state.SessionTransaction) error {
+	call := m.calls.Add(1)
+	if m.failBefore.CompareAndSwap(true, false) ||
+		(m.failBeforeCall.Load() != 0 && m.failBeforeCall.Load() == call) ||
+		(m.failBeforeFrom.Load() != 0 && call >= m.failBeforeFrom.Load()) {
+		return state.ErrUnsafePath
+	}
 	err := m.memoryMetadata.WithSessionTransaction(ctx, binding, transaction)
-	if err == nil && m.failAfter.CompareAndSwap(true, false) {
+	if err == nil && (m.failAfter.CompareAndSwap(true, false) ||
+		(m.failAfterCall.Load() != 0 && m.failAfterCall.Load() == call)) {
 		return state.ErrDurabilityIndeterminate
 	}
 	return err

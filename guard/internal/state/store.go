@@ -52,6 +52,7 @@ type Metadata struct {
 	ExpiresAt        time.Time `json:"expiresAt,omitempty"`
 	Generation       uint64    `json:"generation,omitempty"`
 	Tombstoned       bool      `json:"tombstoned,omitempty"`
+	OperationID      string    `json:"operationId,omitempty"`
 }
 
 type SessionTransaction func(current Metadata, found bool) (next *Metadata, err error)
@@ -133,10 +134,11 @@ func (s *Store) recordName(binding Binding, kind Kind) (string, error) {
 }
 
 var (
-	routeIDPattern = regexp.MustCompile(`^route-[a-z0-9][a-z0-9-]{0,62}$`)
-	sessionPattern = regexp.MustCompile(`^session_[0-7][0-9A-HJKMNP-TV-Z]{25}$`)
-	reconPattern   = regexp.MustCompile(`^recon_[0-7][0-9A-HJKMNP-TV-Z]{25}$`)
-	hashPattern    = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
+	routeIDPattern   = regexp.MustCompile(`^route-[a-z0-9][a-z0-9-]{0,62}$`)
+	sessionPattern   = regexp.MustCompile(`^session_[0-7][0-9A-HJKMNP-TV-Z]{25}$`)
+	operationPattern = regexp.MustCompile(`^operation_[0-7][0-9A-HJKMNP-TV-Z]{25}$`)
+	reconPattern     = regexp.MustCompile(`^recon_[0-7][0-9A-HJKMNP-TV-Z]{25}$`)
+	hashPattern      = regexp.MustCompile(`^sha256:[0-9a-f]{64}$`)
 )
 
 func validateMetadata(metadata Metadata) error {
@@ -147,13 +149,16 @@ func validateMetadata(metadata Metadata) error {
 	switch metadata.Kind {
 	case KindRouting:
 		if len(metadata.RouteID) > 48 || !routeIDPattern.MatchString(metadata.RouteID) || metadata.SessionID != "" ||
-			metadata.ReconciliationID != "" || metadata.ReferenceHash != "" || !metadata.ExpiresAt.IsZero() {
+			metadata.ReconciliationID != "" || metadata.ReferenceHash != "" || !metadata.ExpiresAt.IsZero() ||
+			metadata.OperationID != "" {
 			return ErrUnsafePayload
 		}
 	case KindSession:
 		if !sessionPattern.MatchString(metadata.SessionID) || metadata.RouteID != "" ||
 			metadata.ReconciliationID != "" || metadata.ReferenceHash != "" ||
-			(!metadata.Tombstoned && metadata.ExpiresAt.IsZero()) {
+			(!metadata.Tombstoned && metadata.ExpiresAt.IsZero()) ||
+			(!metadata.Tombstoned && metadata.OperationID != "") ||
+			(metadata.Tombstoned && metadata.OperationID != "" && !operationPattern.MatchString(metadata.OperationID)) {
 			return ErrUnsafePayload
 		}
 		if metadata.Tombstoned && (metadata.Generation == 0 || !metadata.ExpiresAt.IsZero()) {
@@ -162,7 +167,7 @@ func validateMetadata(metadata Metadata) error {
 	case KindReconciliation:
 		if !reconPattern.MatchString(metadata.ReconciliationID) || !hashPattern.MatchString(metadata.ReferenceHash) ||
 			metadata.RouteID != "" || metadata.SessionID != "" || !metadata.ExpiresAt.IsZero() ||
-			metadata.Generation != 0 || metadata.Tombstoned {
+			metadata.Generation != 0 || metadata.Tombstoned || metadata.OperationID != "" {
 			return ErrUnsafePayload
 		}
 	default:

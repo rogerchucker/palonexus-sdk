@@ -661,3 +661,18 @@ func TestSessionTransactionSerializesAcrossStoreInstancesAndPreservesRouting(t *
 		t.Fatalf("session transaction damaged routing metadata: %v", err)
 	}
 }
+
+func TestSessionOperationIdentifierIsAcceptedOnlyForTombstones(t *testing.T) {
+	active := Metadata{
+		Kind: KindSession, SessionID: "session_00000000000000000000000000",
+		Generation: 1, ExpiresAt: time.Now().Add(time.Hour), OperationID: "operation_00000000000000000000000000",
+	}
+	if err := validateMetadata(active); !errors.Is(err, ErrUnsafePayload) {
+		t.Fatalf("active session accepted operation identifier: %v", err)
+	}
+	active.ExpiresAt = time.Time{}
+	active.Tombstoned = true
+	if err := validateMetadata(active); err != nil {
+		t.Fatalf("reserved session rejected: %v", err)
+	}
+}

@@ -37,13 +37,15 @@ type PartialError struct {
 	RevocationFailed   bool
 	LocalCleanupFailed bool
 	CommitUncertain    bool
+	Cause              error
 }
 
 func (e *PartialError) Error() string { return ErrPartial.Error() }
 func (e *PartialError) Is(target error) bool {
 	return target == ErrPartial ||
 		(target == ErrRevocation && e.RevocationFailed) ||
-		(target == ErrCommitIndeterminate && e.CommitUncertain)
+		(target == ErrCommitIndeterminate && e.CommitUncertain) ||
+		(e.Cause != nil && errors.Is(e.Cause, target))
 }
 
 type verifiedClaims struct {
@@ -125,30 +127,39 @@ func (m *Manager) Complete(ctx context.Context, callback Callback) (Session, err
 	}
 	stored := credential{SessionID: sessionID, Subject: claims.Subject, Nonce: selected.nonce, AccessToken: token.AccessToken, RefreshToken: refresh, ExpiresAt: expires}
 	result := Session{ID: sessionID, Subject: claims.Subject, ExpiresAt: expires}
+	if err := m.putCredential(ctx, stored); err != nil {
+		if cleanupErr := m.options.Credentials.Delete(context.WithoutCancel(ctx),
+			credentialKey(m.options.Tenant, m.options.Account, sessionID)); cleanupErr != nil {
+			return Session{}, &PartialError{LocalCleanupFailed: true, CommitUncertain: true}
+		}
+		return Session{}, ErrStorage
+	}
 	var previous state.Metadata
 	var hadPrevious bool
+	var generation uint64
 	binding := state.Binding{Tenant: m.options.Tenant, Account: m.options.Account}
 	err = m.options.Metadata.WithSessionTransaction(ctx, binding, func(current state.Metadata, found bool) (*state.Metadata, error) {
 		previous, hadPrevious = current, found && !current.Tombstoned
-		generation := uint64(1)
+		generation = 1
 		if found {
 			generation = current.Generation + 1
-		}
-		if err := m.putCredential(ctx, stored); err != nil {
-			return nil, err
 		}
 		next := state.Metadata{Kind: state.KindSession, SessionID: sessionID, Generation: generation, ExpiresAt: expires}
 		return &next, nil
 	})
 	if err != nil {
 		if errors.Is(err, state.ErrDurabilityIndeterminate) {
-			return result, ErrCommitIndeterminate
+			current, getErr := m.options.Metadata.GetMetadata(context.WithoutCancel(ctx), binding, state.KindSession)
+			if getErr == nil && !current.Tombstoned && current.SessionID == sessionID &&
+				current.Generation == generation {
+				return result, nil
+			}
 		}
 		cleanupErr := m.options.Credentials.Delete(context.WithoutCancel(ctx), credentialKey(m.options.Tenant, m.options.Account, sessionID))
 		if cleanupErr != nil {
-			return Session{}, ErrCommitIndeterminate
+			return Session{}, &PartialError{LocalCleanupFailed: true, CommitUncertain: true}
 		}
-		return Session{}, ErrStorage
+		return Session{}, ErrCommitIndeterminate
 	}
 	if hadPrevious && previous.SessionID != sessionID {
 		if err := m.options.Credentials.Delete(context.WithoutCancel(ctx),
@@ -226,58 +237,137 @@ func (m *Manager) putCredential(ctx context.Context, value credential) error {
 
 func (m *Manager) Refresh(ctx context.Context, sessionID string) (Session, error) {
 	binding := state.Binding{Tenant: m.options.Tenant, Account: m.options.Account}
-	var result Session
-	var oldID, newID string
-	exchanged := false
-	err := m.options.Metadata.WithSessionTransaction(ctx, binding, func(current state.Metadata, found bool) (*state.Metadata, error) {
+	value, err := m.loadCredential(ctx, sessionID)
+	if err != nil {
+		return Session{}, err
+	}
+	operationID, err := newOperationID()
+	if err != nil {
+		return Session{}, ErrStorage
+	}
+	var reservation state.Metadata
+	err = m.options.Metadata.WithSessionTransaction(ctx, binding, func(current state.Metadata, found bool) (*state.Metadata, error) {
 		if !found || current.Tombstoned {
 			return nil, ErrNoSession
 		}
 		if current.SessionID != sessionID {
-			value, loadErr := m.loadCredential(ctx, current.SessionID)
-			if loadErr != nil {
-				return nil, loadErr
-			}
-			result = Session{ID: value.SessionID, Subject: value.Subject, ExpiresAt: value.ExpiresAt}
-			return &current, nil
+			return nil, ErrNoSession
 		}
-		value, loadErr := m.loadCredential(ctx, current.SessionID)
-		if loadErr != nil {
-			return nil, loadErr
+		reservation = state.Metadata{
+			Kind: state.KindSession, SessionID: sessionID, Generation: current.Generation + 1,
+			Tombstoned: true, OperationID: operationID,
 		}
-		token, refreshErr := m.exchangeRefresh(ctx, value)
-		if refreshErr != nil {
-			return nil, refreshErr
-		}
-		exchanged = true
-		newID, refreshErr = newSessionID()
-		if refreshErr != nil {
-			return nil, ErrCommitIndeterminate
-		}
-		nextCredential := credential{SessionID: newID, Subject: value.Subject, Nonce: value.Nonce, AccessToken: token.AccessToken,
-			RefreshToken: token.RefreshToken, ExpiresAt: token.Expiry, RefreshedAt: m.options.Now()}
-		if putErr := m.putCredential(ctx, nextCredential); putErr != nil {
-			return nil, ErrCommitIndeterminate
-		}
-		oldID = current.SessionID
-		next := state.Metadata{Kind: state.KindSession, SessionID: newID, Generation: current.Generation + 1, ExpiresAt: token.Expiry}
-		result = Session{ID: newID, Subject: value.Subject, ExpiresAt: token.Expiry}
-		return &next, nil
+		return &reservation, nil
 	})
 	if err != nil {
-		if exchanged {
-			m.tombstoneAfterFailedRefresh(binding, oldID, newID)
-			return Session{}, ErrCommitIndeterminate
+		if errors.Is(err, state.ErrDurabilityIndeterminate) {
+			current, getErr := m.options.Metadata.GetMetadata(context.WithoutCancel(ctx), binding, state.KindSession)
+			if getErr == nil && sameReservation(current, reservation) {
+				err = nil
+			}
 		}
-		return Session{}, err
+		if err != nil {
+			return Session{}, mapStateError(err)
+		}
 	}
-	if oldID != "" {
-		if deleteErr := m.options.Credentials.Delete(context.WithoutCancel(ctx),
-			credentialKey(m.options.Tenant, m.options.Account, oldID)); deleteErr != nil {
-			return result, &PartialError{LocalCleanupFailed: true}
+
+	token, err := m.exchangeRefresh(ctx, value)
+	if err != nil {
+		return Session{}, m.cleanupConsumedSession(binding, reservation, "", err)
+	}
+	newID, err := newSessionID()
+	if err != nil {
+		return Session{}, m.cleanupConsumedSession(binding, reservation, "", ErrCommitIndeterminate)
+	}
+	nextCredential := credential{
+		SessionID: newID, Subject: value.Subject, Nonce: value.Nonce, AccessToken: token.AccessToken,
+		RefreshToken: token.RefreshToken, ExpiresAt: token.Expiry, RefreshedAt: m.options.Now(),
+	}
+	if err := m.putCredential(ctx, nextCredential); err != nil {
+		return Session{}, m.cleanupConsumedSession(binding, reservation, newID, ErrCommitIndeterminate)
+	}
+	next := state.Metadata{
+		Kind: state.KindSession, SessionID: newID, Generation: reservation.Generation + 1,
+		ExpiresAt: token.Expiry,
+	}
+	err = m.options.Metadata.WithSessionTransaction(ctx, binding, func(current state.Metadata, found bool) (*state.Metadata, error) {
+		if !found || !sameReservation(current, reservation) {
+			return nil, ErrCommitIndeterminate
 		}
+		return &next, nil
+	})
+	if errors.Is(err, state.ErrDurabilityIndeterminate) {
+		current, getErr := m.options.Metadata.GetMetadata(context.WithoutCancel(ctx), binding, state.KindSession)
+		if getErr == nil && sameActiveSession(current, next) {
+			err = nil
+		}
+	}
+	if err != nil {
+		return Session{}, m.cleanupConsumedSession(binding, reservation, newID, ErrCommitIndeterminate)
+	}
+	result := Session{ID: newID, Subject: value.Subject, ExpiresAt: token.Expiry}
+	if deleteErr := m.options.Credentials.Delete(context.WithoutCancel(ctx),
+		credentialKey(m.options.Tenant, m.options.Account, sessionID)); deleteErr != nil {
+		return result, &PartialError{LocalCleanupFailed: true}
 	}
 	return result, nil
+}
+
+func newOperationID() (string, error) {
+	id, err := newSessionID()
+	if err != nil {
+		return "", err
+	}
+	return "operation_" + strings.TrimPrefix(id, "session_"), nil
+}
+
+func sameReservation(actual, expected state.Metadata) bool {
+	return actual.Kind == state.KindSession && actual.Tombstoned &&
+		actual.SessionID == expected.SessionID && actual.Generation == expected.Generation &&
+		actual.OperationID == expected.OperationID
+}
+
+func sameActiveSession(actual, expected state.Metadata) bool {
+	return actual.Kind == state.KindSession && !actual.Tombstoned &&
+		actual.SessionID == expected.SessionID && actual.Generation == expected.Generation
+}
+
+func mapStateError(err error) error {
+	if errors.Is(err, ErrNoSession) {
+		return ErrNoSession
+	}
+	return ErrCommitIndeterminate
+}
+
+func (m *Manager) cleanupConsumedSession(binding state.Binding, reservation state.Metadata, newID string, cause error) error {
+	cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	partial := &PartialError{Cause: cause}
+	err := m.options.Metadata.WithSessionTransaction(cleanup, binding, func(current state.Metadata, found bool) (*state.Metadata, error) {
+		if !found {
+			return nil, nil
+		}
+		if !sameReservation(current, reservation) {
+			return &current, nil
+		}
+		return &reservation, nil
+	})
+	if err != nil {
+		partial.CommitUncertain = true
+	}
+	for _, id := range []string{reservation.SessionID, newID} {
+		if id == "" {
+			continue
+		}
+		if err := m.options.Credentials.Delete(cleanup,
+			credentialKey(m.options.Tenant, m.options.Account, id)); err != nil {
+			partial.LocalCleanupFailed = true
+		}
+	}
+	if partial.CommitUncertain || partial.LocalCleanupFailed {
+		return partial
+	}
+	return cause
 }
 
 func (m *Manager) loadCredential(ctx context.Context, sessionID string) (credential, error) {
@@ -328,62 +418,45 @@ func (m *Manager) exchangeRefresh(ctx context.Context, value credential) (*oauth
 	return token, nil
 }
 
-func (m *Manager) tombstoneAfterFailedRefresh(binding state.Binding, oldID, newID string) {
-	cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	_ = m.options.Metadata.WithSessionTransaction(cleanup, binding, func(current state.Metadata, found bool) (*state.Metadata, error) {
-		generation := uint64(1)
-		selected := oldID
-		if found {
-			generation = current.Generation + 1
-			selected = current.SessionID
-		}
-		if selected == "" {
-			selected = newID
-		}
-		tombstone := state.Metadata{Kind: state.KindSession, SessionID: selected, Generation: generation, Tombstoned: true}
-		return &tombstone, nil
-	})
-	for _, id := range []string{oldID, newID} {
-		if id != "" {
-			_ = m.options.Credentials.Delete(cleanup, credentialKey(m.options.Tenant, m.options.Account, id))
-		}
-	}
-}
-
 func (m *Manager) Logout(ctx context.Context, sessionID string) error {
 	binding := state.Binding{Tenant: m.options.Tenant, Account: m.options.Account}
-	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
-	defer cancel()
 	partial := &PartialError{}
-	transactionErr := m.options.Metadata.WithSessionTransaction(cleanup, binding, func(current state.Metadata, found bool) (*state.Metadata, error) {
-		if !found || current.Tombstoned {
-			return nil, ErrNoSession
+	localContext, cancelLocal := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
+	defer cancelLocal()
+	value, loadErr := m.loadCredential(localContext, sessionID)
+	if loadErr != nil && !errors.Is(loadErr, ErrNoSession) {
+		partial.RevocationFailed = m.discovery.RevocationEndpoint != ""
+	}
+	transactionErr := m.options.Metadata.WithSessionTransaction(localContext, binding, func(current state.Metadata, found bool) (*state.Metadata, error) {
+		if !found {
+			return nil, nil
 		}
-		value, loadErr := m.loadCredential(cleanup, current.SessionID)
-		if loadErr != nil {
-			partial.LocalCleanupFailed = true
-		} else if revokeErr := m.revoke(ctx, value); revokeErr != nil {
-			partial.RevocationFailed = true
-		}
-		if deleteErr := m.options.Credentials.Delete(cleanup,
-			credentialKey(m.options.Tenant, m.options.Account, current.SessionID)); deleteErr != nil {
-			partial.LocalCleanupFailed = true
+		if current.SessionID != sessionID {
+			return &current, nil
 		}
 		return nil, nil
 	})
 	if errors.Is(transactionErr, state.ErrCorrupt) {
-		partial.LocalCleanupFailed = true
-		_ = m.options.Credentials.Delete(cleanup, credentialKey(m.options.Tenant, m.options.Account, sessionID))
-		if err := m.options.Metadata.DeleteMetadata(cleanup, binding, state.KindSession); err != nil {
-			partial.LocalCleanupFailed = true
+		if err := m.options.Metadata.DeleteMetadata(localContext, binding, state.KindSession); err != nil {
+			partial.CommitUncertain = true
 		}
 		transactionErr = nil
 	}
 	if transactionErr != nil {
-		return transactionErr
+		partial.CommitUncertain = true
 	}
-	if partial.LocalCleanupFailed || partial.RevocationFailed {
+	if deleteErr := m.options.Credentials.Delete(localContext,
+		credentialKey(m.options.Tenant, m.options.Account, sessionID)); deleteErr != nil {
+		partial.LocalCleanupFailed = true
+	}
+	if loadErr == nil {
+		revokeContext, cancelRevoke := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		if revokeErr := m.revoke(revokeContext, value); revokeErr != nil {
+			partial.RevocationFailed = true
+		}
+		cancelRevoke()
+	}
+	if partial.LocalCleanupFailed || partial.RevocationFailed || partial.CommitUncertain {
 		return partial
 	}
 	return nil
@@ -396,6 +469,7 @@ func (m *Manager) revoke(ctx context.Context, value credential) error {
 	if err := ctx.Err(); err != nil {
 		return ErrRevocation
 	}
+	failed := false
 	for _, item := range []struct{ token, hint string }{
 		{value.RefreshToken, "refresh_token"}, {value.AccessToken, "access_token"},
 	} {
@@ -406,21 +480,26 @@ func (m *Manager) revoke(ctx context.Context, value credential) error {
 		}
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.discovery.RevocationEndpoint, strings.NewReader(form.Encode()))
 		if err != nil {
-			return ErrRevocation
+			failed = true
+			continue
 		}
 		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
 		if m.options.RevocationAuthMethod == "client_secret_basic" {
-			req.SetBasicAuth(m.options.ClientID, m.options.ClientSecret)
+			req.SetBasicAuth(url.QueryEscape(m.options.ClientID), url.QueryEscape(m.options.ClientSecret))
 		}
 		resp, err := m.client.Do(req)
 		if err != nil {
-			return ErrRevocation
+			failed = true
+			continue
 		}
 		_, readErr := io.Copy(io.Discard, io.LimitReader(resp.Body, 4097))
 		closeErr := resp.Body.Close()
 		if readErr != nil || closeErr != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
-			return ErrRevocation
+			failed = true
 		}
+	}
+	if failed {
+		return ErrRevocation
 	}
 	return nil
 }

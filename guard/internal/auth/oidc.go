@@ -134,9 +134,10 @@ func New(options Options) (*Manager, error) {
 		if !ok {
 			return nil, ErrInvalidConfig
 		}
-		secured := base.Clone()
-		secured.Proxy = nil
-		secured.DialContext = safeDial
+		secured, err := secureTransport(base)
+		if err != nil {
+			return nil, ErrInvalidConfig
+		}
 		options.HTTPClient = &http.Client{Timeout: options.HTTPClient.Timeout, Transport: secured}
 	}
 	if options.Credentials == nil || options.Metadata == nil || options.ClientID == "" ||
@@ -182,6 +183,34 @@ func New(options Options) (*Manager, error) {
 		return nil, err
 	}
 	return m, nil
+}
+
+func secureTransport(base *http.Transport) (*http.Transport, error) {
+	if base == nil || unsafeTransport(base) {
+		return nil, ErrInvalidConfig
+	}
+	secured := base.Clone()
+	secured.Proxy = nil
+	secured.DialContext = safeDial
+	secured.DialTLS = nil
+	secured.DialTLSContext = nil
+	if secured.TLSClientConfig != nil {
+		secured.TLSClientConfig = secured.TLSClientConfig.Clone()
+	}
+	return secured, nil
+}
+
+func unsafeTransport(transport *http.Transport) bool {
+	if transport == nil {
+		return false
+	}
+	if transport.DialTLS != nil || transport.DialTLSContext != nil {
+		return true
+	}
+	tlsConfig := transport.TLSClientConfig
+	return tlsConfig != nil && (tlsConfig.InsecureSkipVerify ||
+		tlsConfig.VerifyPeerCertificate != nil || tlsConfig.VerifyConnection != nil ||
+		tlsConfig.ServerName != "")
 }
 
 func boundedTimeout(value time.Duration) time.Duration {
@@ -382,7 +411,7 @@ func validateRemoteURL(raw string, allowLocal bool) error {
 	if u.Scheme != "https" {
 		return ErrInvalidConfig
 	}
-	if ip != nil && (ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified()) {
+	if ip != nil && forbiddenDestination(ip) {
 		return ErrInvalidConfig
 	}
 	return nil
