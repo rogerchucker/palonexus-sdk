@@ -4,12 +4,15 @@ package reconcile
 
 import (
 	"context"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -32,6 +35,31 @@ var (
 	b1 = Binding{Tenant: "tenant-a", Subject: "subject-a"}
 )
 
+type testAuthority struct {
+	subject string
+	org     bool
+}
+
+type fixedResolver []net.IPAddr
+
+func (r fixedResolver) LookupIPAddr(context.Context, string) ([]net.IPAddr, error) { return r, nil }
+
+func (a testAuthority) AuthorizeDiscard(_ context.Context, binding Binding, authority p.DiscardAuthorityType) error {
+	if authority == p.DiscardAuthorityTypeAuthenticatedUser && binding.Subject == a.subject {
+		return nil
+	}
+	if authority == p.DiscardAuthorityTypeOrganizationRetentionPolicy && a.org {
+		return nil
+	}
+	return ErrUnauthorized
+}
+func (a testAuthority) AuthorizeManualRetry(_ context.Context, binding Binding) error {
+	if binding.Subject == a.subject || a.org {
+		return nil
+	}
+	return ErrUnauthorized
+}
+
 func pending() p.ReconciliationRecord {
 	clientHash := p.SHA256Digest("sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa")
 	serverHash := p.SHA256Digest("sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb")
@@ -47,6 +75,18 @@ func pending() p.ReconciliationRecord {
 		BatchSequence: 0, DeliveryPolicy: p.DeliveryPolicy{MaxAttempts: 3, MaxTotalAttempts: 5, BaseDelaySeconds: 5, MaxDelaySeconds: 60},
 		AttemptCount: 0, DeliveryDisposition: p.DeliveryDispositionAutomatic, State: p.ReconciliationStatePending,
 	}
+}
+
+func batchRecord(sequence int, suffix byte) p.ReconciliationRecord {
+	record := pending()
+	last := string(suffix)
+	record.ReconciliationID = p.ReconciliationID("recon_01J5ABCDEFGHJKMNPQRSTVWXY" + last)
+	record.ActionID = p.ActionID("act_01J5ABCDEFGHJKMNPQRSTVWXY" + last)
+	record.RequestID = p.RequestID("req_01J5ABCDEFGHJKMNPQRSTVWXY" + last)
+	record.CorrelationID = p.CorrelationID("corr_01J5ABCDEFGHJKMNPQRSTVWXY" + last)
+	record.AuthorizationIdempotencyKey = p.AuthorizationIdempotencyKey("authz_01J5ABCDEFGHJKMNPQRSTVWXY" + last)
+	record.BatchSequence = p.JSONInteger(sequence)
+	return record
 }
 
 func TestQueueLifecycleDedupeCrashRecoveryAndConflict(t *testing.T) {
@@ -85,7 +125,7 @@ func TestQueueLifecycleDedupeCrashRecoveryAndConflict(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer q.Close()
-	recovered, err := q.Recover(ctx, b1, t0.Add(2*time.Second))
+	recovered, err := q.Get(ctx, b1, record.ReconciliationID)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -172,9 +212,17 @@ func TestHTTPTransportIsStrictBoundedAndRedactsAuthorization(t *testing.T) {
 			`ef28a07d036d06a118e72c15fe30347821a29f4e845769fee1f8e18c3ef11238","acknowledgedAt":"2026-07-25T20:00:05Z"}`))
 	}))
 	defer server.Close()
-	transport, err := NewHTTPTransport(HTTPConfig{Endpoint: server.URL, Client: server.Client(), Token: func(context.Context) (string, error) {
-		return "super-secret-bearer", nil
-	}, Binding: b1, ClientID: "registered-codex"})
+	roots := x509.NewCertPool()
+	roots.AddCert(server.Certificate())
+	ownedToken := []byte("super-secret-bearer")
+	transport, err := newHTTPTransportWithNetwork(HTTPConfig{Endpoint: server.URL, RootCAs: roots, Token: func(context.Context) ([]byte, error) {
+		return ownedToken, nil
+	}, Binding: b1, ClientID: "registered-codex"}, networkControls{
+		resolver: fixedResolver{{IP: net.ParseIP("93.184.216.34")}},
+		dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -185,8 +233,26 @@ func TestHTTPTransportIsStrictBoundedAndRedactsAuthorization(t *testing.T) {
 	if gotAuth != "Bearer super-secret-bearer" {
 		t.Fatalf("authorization not sent")
 	}
+	for _, value := range ownedToken {
+		if value != 0 {
+			t.Fatal("owned token was not wiped")
+		}
+	}
 	if err != nil && strings.Contains(err.Error(), "super-secret") {
 		t.Fatalf("secret leaked: %v", err)
+	}
+}
+
+func TestDialResolvedRejectsEntireMixedDNSAnswerBeforeDial(t *testing.T) {
+	called := false
+	_, err := dialResolved(context.Background(), "tcp", "api.example:443",
+		fixedResolver{{IP: net.ParseIP("93.184.216.34")}, {IP: net.ParseIP("127.0.0.1")}},
+		func(context.Context, string, string) (net.Conn, error) {
+			called = true
+			return nil, errors.New("called")
+		})
+	if !errors.Is(err, ErrTransport) || called {
+		t.Fatalf("mixed answer was dialed: %v called=%v", err, called)
 	}
 }
 
@@ -226,7 +292,7 @@ func TestQueueRejectsUnsafeRootsAndRecordInodes(t *testing.T) {
 
 func TestQueueBoundsCancellationAndAuthorizedDiscard(t *testing.T) {
 	ctx := context.Background()
-	q, err := Open(Config{Root: queueRoot(t), MaxRecords: 1, MaxBytes: 1 << 20})
+	q, err := Open(Config{Root: queueRoot(t), MaxRecords: 1, MaxBytes: 1 << 20, Authority: testAuthority{subject: b1.Subject}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -241,6 +307,7 @@ func TestQueueBoundsCancellationAndAuthorizedDiscard(t *testing.T) {
 	other.RequestID = "req_01J5ABCDEFGHJKMNPQRSTVWXY1"
 	other.CorrelationID = "corr_01J5ABCDEFGHJKMNPQRSTVWXY1"
 	other.AuthorizationIdempotencyKey = "authz_01J5ABCDEFGHJKMNPQRSTVWXY1"
+	other.BatchID = "batch_01J5ABCDEFGHJKMNPQRSTVWXY1"
 	if err := q.Enqueue(ctx, b1, other); !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("want full, got %v", err)
 	}
@@ -249,12 +316,114 @@ func TestQueueBoundsCancellationAndAuthorizedDiscard(t *testing.T) {
 	if _, err := q.Get(cancelled, b1, record.ReconciliationID); !errors.Is(err, context.Canceled) {
 		t.Fatalf("want cancellation, got %v", err)
 	}
-	if _, err := q.Discard(ctx, b1, record.ReconciliationID, t0.Add(time.Minute), p.DiscardAuthorityTypeOrganizationRetentionPolicy, "retention_window_elapsed", false); !errors.Is(err, ErrRejected) {
+	if _, err := q.Discard(ctx, b1, record.ReconciliationID, t0.Add(time.Minute), p.DiscardAuthorityTypeOrganizationRetentionPolicy, "retention_window_elapsed"); !errors.Is(err, ErrUnauthorized) {
 		t.Fatalf("untrusted policy discard: %v", err)
 	}
-	discarded, err := q.Discard(ctx, b1, record.ReconciliationID, t0.Add(time.Minute), p.DiscardAuthorityTypeAuthenticatedUser, "user_retention_request", false)
+	discarded, err := q.Discard(ctx, b1, record.ReconciliationID, t0.Add(time.Minute), p.DiscardAuthorityTypeAuthenticatedUser, "user_retention_request")
 	if err != nil || discarded.State != p.ReconciliationStateDiscarded {
 		t.Fatalf("discard: %v %+v", err, discarded)
+	}
+}
+
+func TestOpenRecoversEverySendingRecordBeforeUse(t *testing.T) {
+	root := queueRoot(t)
+	config := Config{Root: root, MaxRecords: 8, MaxBytes: 1 << 20}
+	q, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first := pending()
+	second := pending()
+	second.ReconciliationID = "recon_01J5ABCDEFGHJKMNPQRSTVWXY1"
+	second.ActionID = "act_01J5ABCDEFGHJKMNPQRSTVWXY1"
+	second.RequestID = "req_01J5ABCDEFGHJKMNPQRSTVWXY1"
+	second.CorrelationID = "corr_01J5ABCDEFGHJKMNPQRSTVWXY1"
+	second.AuthorizationIdempotencyKey = "authz_01J5ABCDEFGHJKMNPQRSTVWXY1"
+	second.BatchID = "batch_01J5ABCDEFGHJKMNPQRSTVWXY1"
+	for _, record := range []p.ReconciliationRecord{first, second} {
+		if err := q.Enqueue(context.Background(), b1, record); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := q.Claim(context.Background(), b1, t0.Add(time.Second)); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := q.Close(); err != nil {
+		t.Fatal(err)
+	}
+	q, err = Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	for _, record := range []p.ReconciliationRecord{first, second} {
+		got, getErr := q.Get(context.Background(), b1, record.ReconciliationID)
+		if getErr != nil || got.State != p.ReconciliationStatePending || got.AttemptCount != 1 {
+			t.Fatalf("not recovered: %v %+v", getErr, got)
+		}
+	}
+}
+
+func TestAcknowledgementIdempotencyRequiresExactFullReceipt(t *testing.T) {
+	q, err := Open(Config{Root: queueRoot(t), MaxRecords: 8, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.Enqueue(context.Background(), b1, pending()); err != nil {
+		t.Fatal(err)
+	}
+	sending, err := q.Claim(context.Background(), b1, t0.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := NewReceipt(sending, "receipt_01J5ABCDEFGHJKMNPQRSTVWXY0", t0.Add(2*time.Second), b1, sending.ClientID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = q.Acknowledge(context.Background(), b1, sending.ReconciliationID, receipt); err != nil {
+		t.Fatal(err)
+	}
+	changed := receipt
+	changed.AcknowledgedAt = p.RFC3339Timestamp(t0.Add(3 * time.Second).Format(time.RFC3339))
+	if _, err = q.Acknowledge(context.Background(), b1, sending.ReconciliationID, changed); !errors.Is(err, ErrConflict) {
+		t.Fatalf("nonidentical receipt accepted: %v", err)
+	}
+}
+
+func TestManualRetryRequiresTrustedAuthorityAndHonorsTotalLimit(t *testing.T) {
+	auth := testAuthority{subject: b1.Subject}
+	q, err := Open(Config{Root: queueRoot(t), MaxRecords: 8, MaxBytes: 1 << 20, Authority: auth})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	record := pending()
+	record.DeliveryPolicy.MaxAttempts = 1
+	record.DeliveryPolicy.MaxTotalAttempts = 2
+	if err := q.Enqueue(context.Background(), b1, record); err != nil {
+		t.Fatal(err)
+	}
+	sending, err := q.Claim(context.Background(), b1, t0.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	manual, err := q.Fail(context.Background(), b1, sending.ReconciliationID, t0.Add(2*time.Second), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if manual.DeliveryDisposition != p.DeliveryDispositionManualIntervention {
+		t.Fatalf("not manual: %+v", manual)
+	}
+	retried, err := q.ManualRetry(context.Background(), b1, record.ReconciliationID, t0.Add(3*time.Second))
+	if err != nil || retried.State != p.ReconciliationStateSending || retried.AttemptCount != 2 {
+		t.Fatalf("retry: %v %+v", err, retried)
+	}
+	if _, err := q.Fail(context.Background(), b1, record.ReconciliationID, t0.Add(4*time.Second), true); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.ManualRetry(context.Background(), b1, record.ReconciliationID, t0.Add(5*time.Second)); !errors.Is(err, ErrAttemptLimit) {
+		t.Fatalf("total limit bypassed: %v", err)
 	}
 }
 
@@ -357,4 +526,178 @@ func FuzzReconciliationRecordValidation(f *testing.F) {
 		}
 		_, _ = validateRecord(record, maxRecordBytesDefault)
 	})
+}
+
+func TestOrderedBatchCheckpointRejectsGapsAndResumesPrunedPrefix(t *testing.T) {
+	root := queueRoot(t)
+	config := Config{Root: root, MaxRecords: 8, MaxBytes: 1 << 20}
+	q, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err := q.Enqueue(context.Background(), b1, batchRecord(1, '1')); !errors.Is(err, ErrConflict) {
+		t.Fatalf("gap accepted: %v", err)
+	}
+	first, second := batchRecord(0, '0'), batchRecord(1, '1')
+	if err := q.Enqueue(context.Background(), b1, first); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Enqueue(context.Background(), b1, second); err != nil {
+		t.Fatal(err)
+	}
+	duplicate := batchRecord(1, '2')
+	if err := q.Enqueue(context.Background(), b1, duplicate); !errors.Is(err, ErrConflict) {
+		t.Fatalf("duplicate sequence accepted: %v", err)
+	}
+	sending, err := q.Claim(context.Background(), b1, t0.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if sending.ReconciliationID != first.ReconciliationID {
+		t.Fatalf("reordered batch: %s", sending.ReconciliationID)
+	}
+	receipt, err := NewReceipt(sending, "receipt_01J5ABCDEFGHJKMNPQRSTVWXY0", t0.Add(2*time.Second), b1, sending.ClientID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := q.Acknowledge(context.Background(), b1, sending.ReconciliationID, receipt); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Remove(filepath.Join(root, recordName(first.ReconciliationID))); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Close(); err != nil {
+		t.Fatal(err)
+	}
+	q, err = Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	next, err := q.Claim(context.Background(), b1, t0.Add(3*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if next.ReconciliationID != second.ReconciliationID {
+		t.Fatalf("pruned checkpoint resumed wrong record: %s", next.ReconciliationID)
+	}
+}
+
+func TestPermanentDeliveryErrorIsHeldUntilAuthorizedManualRetry(t *testing.T) {
+	q, err := Open(Config{Root: queueRoot(t), MaxRecords: 8, MaxBytes: 1 << 20, Authority: testAuthority{subject: b1.Subject}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	record := pending()
+	if err := q.Enqueue(context.Background(), b1, record); err != nil {
+		t.Fatal(err)
+	}
+	uploader := Uploader{Queue: q, Binding: b1, Clock: func() time.Time { return t0.Add(time.Second) },
+		Send: func(context.Context, p.ReconciliationRecord) (Receipt, error) {
+			return Receipt{}, &DeliveryError{Class: DeliveryAuthentication}
+		}}
+	if err := uploader.Attempt(context.Background()); !errors.Is(err, ErrRejected) {
+		t.Fatalf("typed permanent error lost: %v", err)
+	}
+	class, err := q.HeldError(context.Background(), b1, record.ReconciliationID)
+	if err != nil || class != DeliveryAuthentication {
+		t.Fatalf("hold: %v %s", err, class)
+	}
+	if _, err := q.Claim(context.Background(), b1, t0.Add(2*time.Second)); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("held item retried: %v", err)
+	}
+	if _, err := q.ManualRetry(context.Background(), b1, record.ReconciliationID, t0.Add(2*time.Second)); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSemanticValidationRejectsCrossFieldAndTimestampViolations(t *testing.T) {
+	cases := []p.ReconciliationRecord{}
+	base := pending()
+	bad := base
+	stamp1 := p.RFC3339Timestamp(t0.Add(-time.Second).Format(time.RFC3339))
+	bad.AttemptCount = 1
+	bad.LastAttemptAt = &stamp1
+	bad.State = p.ReconciliationStateSending
+	cases = append(cases, bad)
+	bad = base
+	bad.AttemptCount = 3
+	stamp2 := p.RFC3339Timestamp(t0.Add(time.Second).Format(time.RFC3339))
+	bad.LastAttemptAt = &stamp2
+	cases = append(cases, bad)
+	bad = base
+	bad.DeliveryDisposition = p.DeliveryDispositionManualIntervention
+	reason := "attempt_limit_reached"
+	bad.ManualReasonCode = &reason
+	cases = append(cases, bad)
+	for index, record := range cases {
+		if _, err := validateRecord(record, maxRecordBytesDefault); err == nil {
+			t.Fatalf("case %d accepted", index)
+		}
+	}
+}
+
+func TestCommittedReconciliationVectorsMatchQueueValidator(t *testing.T) {
+	root := filepath.Join("..", "..", "..", "protocol", "test-vectors", "reconciliation")
+	valid, err := filepath.Glob(filepath.Join(root, "valid", "*.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	invalid, err := filepath.Glob(filepath.Join(root, "invalid", "*.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range valid {
+		document, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		record, parseErr := p.ParseReconciliationRecord(document)
+		if parseErr != nil {
+			t.Fatalf("%s: %v", path, parseErr)
+		}
+		if _, validateErr := validateRecord(record, maxRecordBytesDefault); validateErr != nil {
+			t.Fatalf("%s: %v", path, validateErr)
+		}
+	}
+	for _, path := range invalid {
+		document, readErr := os.ReadFile(path)
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		record, parseErr := p.ParseReconciliationRecord(document)
+		if parseErr == nil {
+			if _, validateErr := validateRecord(record, maxRecordBytesDefault); validateErr == nil {
+				t.Fatalf("invalid accepted: %s", path)
+			}
+		}
+	}
+}
+
+func TestCloseWaitsForActiveOperationsWithoutFDReuse(t *testing.T) {
+	for iteration := 0; iteration < 20; iteration++ {
+		q, err := Open(Config{Root: queueRoot(t), MaxRecords: 8, MaxBytes: 1 << 20})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := q.Enqueue(context.Background(), b1, pending()); err != nil {
+			t.Fatal(err)
+		}
+		var wg sync.WaitGroup
+		for worker := 0; worker < 8; worker++ {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for count := 0; count < 20; count++ {
+					_, _ = q.Get(context.Background(), b1, pending().ReconciliationID)
+					runtime.Gosched()
+				}
+			}()
+		}
+		wg.Add(1)
+		go func() { defer wg.Done(); _ = q.Close() }()
+		wg.Wait()
+	}
 }

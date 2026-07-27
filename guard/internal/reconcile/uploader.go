@@ -3,11 +3,17 @@ package reconcile
 import (
 	"bytes"
 	"context"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/json"
 	"errors"
 	"io"
+	"net"
 	"net/http"
+	"net/netip"
 	"net/url"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -16,38 +22,98 @@ import (
 
 type HTTPConfig struct {
 	Endpoint string
-	Client   *http.Client
-	Token    func(context.Context) (string, error)
+	RootCAs  *x509.CertPool
+	Token    func(context.Context) ([]byte, error)
 	Binding  Binding
 	ClientID string
+	Clock    func() time.Time
+	Timeout  time.Duration
 }
 
 type HTTPTransport struct {
 	endpoint string
 	client   *http.Client
-	token    func(context.Context) (string, error)
+	token    func(context.Context) ([]byte, error)
 	binding  Binding
 	clientID string
+	clock    func() time.Time
 }
 
+type ipResolver interface {
+	LookupIPAddr(context.Context, string) ([]net.IPAddr, error)
+}
+type contextDialer func(context.Context, string, string) (net.Conn, error)
+type networkControls struct {
+	resolver ipResolver
+	dial     contextDialer
+}
+
+var endpointDNSLabel = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
+
 func NewHTTPTransport(config HTTPConfig) (*HTTPTransport, error) {
-	endpoint, err := url.Parse(config.Endpoint)
-	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil ||
-		endpoint.Fragment != "" || endpoint.RawQuery != "" || !validBinding(config.Binding) || config.ClientID == "" || config.Token == nil {
+	return newHTTPTransport(config, networkControls{})
+}
+
+func newHTTPTransportWithNetwork(config HTTPConfig, controls networkControls) (*HTTPTransport, error) {
+	if controls.resolver == nil || controls.dial == nil {
 		return nil, ErrUnsafeRecord
 	}
-	client := config.Client
-	if client == nil {
-		client = &http.Client{Timeout: 10 * time.Second}
-	} else {
-		copy := *client
-		if copy.Timeout <= 0 || copy.Timeout > 60*time.Second {
-			copy.Timeout = 10 * time.Second
-		}
-		client = &copy
+	return newHTTPTransport(config, controls)
+}
+
+func newHTTPTransport(config HTTPConfig, controls networkControls) (*HTTPTransport, error) {
+	endpoint, err := url.Parse(config.Endpoint)
+	if err != nil || endpoint.Scheme != "https" || endpoint.Host == "" || endpoint.User != nil ||
+		endpoint.Fragment != "" || endpoint.RawQuery != "" || endpoint.Opaque != "" || endpoint.RawPath != "" ||
+		!validEndpointPath(endpoint.Path) || !validEndpointHost(endpoint) ||
+		!validBinding(config.Binding) || config.ClientID == "" || config.Token == nil {
+		return nil, ErrUnsafeRecord
 	}
+	if config.Timeout == 0 {
+		config.Timeout = 10 * time.Second
+	}
+	if config.Timeout < time.Millisecond || config.Timeout > 15*time.Second {
+		return nil, ErrUnsafeRecord
+	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
+	transport.Proxy = nil
+	transport.DisableCompression = true
+	transport.DisableKeepAlives = true
+	transport.ForceAttemptHTTP2 = false
+	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
+	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
+	if config.RootCAs != nil {
+		subjects := config.RootCAs.Subjects()
+		total := 0
+		for _, subject := range subjects {
+			total += len(subject)
+		}
+		if len(subjects) > 128 || total > 1<<20 {
+			return nil, ErrUnsafeRecord
+		}
+		tlsConfig.RootCAs = config.RootCAs.Clone()
+	}
+	transport.TLSClientConfig = tlsConfig
+	resolver := controls.resolver
+	if resolver == nil {
+		resolver = net.DefaultResolver
+	}
+	dial := controls.dial
+	if dial == nil {
+		dialer := &net.Dialer{}
+		dial = dialer.DialContext
+	}
+	transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+		return dialResolved(ctx, network, address, resolver, dial)
+	}
+	client := &http.Client{Transport: transport, Timeout: config.Timeout}
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	return &HTTPTransport{endpoint: endpoint.String(), client: client, token: config.Token, binding: config.Binding, clientID: config.ClientID}, nil
+	clock := config.Clock
+	if clock == nil {
+		clock = time.Now
+	}
+	return &HTTPTransport{endpoint: endpoint.String(), client: client, token: config.Token,
+		binding: config.Binding, clientID: config.ClientID, clock: clock}, nil
 }
 
 func (t *HTTPTransport) Send(ctx context.Context, record p.ReconciliationRecord) (Receipt, error) {
@@ -59,25 +125,45 @@ func (t *HTTPTransport) Send(ctx context.Context, record p.ReconciliationRecord)
 		return Receipt{}, err
 	}
 	token, err := t.token(ctx)
-	if err != nil || token == "" || strings.ContainsAny(token, "\r\n") || len(token) > 8192 {
+	if err != nil || len(token) == 0 || bytes.ContainsAny(token, "\r\n") || len(token) > 8192 {
+		wipe(token)
 		return Receipt{}, ErrTransport
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, t.endpoint, bytes.NewReader(body))
 	if err != nil {
 		return Receipt{}, ErrTransport
 	}
-	request.Header.Set("Authorization", "Bearer "+token)
+	request.GetBody = nil
+	request.Header.Set("Authorization", "Bearer "+string(token))
 	request.Header.Set("Content-Type", "application/json")
 	request.Header.Set("Accept", "application/json")
-	response, err := t.client.Do(request)
+	response, err := func() (*http.Response, error) {
+		defer func() { request.Header.Del("Authorization"); wipe(token) }()
+		return t.client.Do(request)
+	}()
 	if err != nil {
-		return Receipt{}, safeError(err)
+		return Receipt{}, &DeliveryError{Class: DeliveryTransient}
 	}
 	defer response.Body.Close()
-	if response.StatusCode < 200 || response.StatusCode >= 300 ||
-		!strings.HasPrefix(strings.ToLower(response.Header.Get("Content-Type")), "application/json") {
+	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBytes))
-		return Receipt{}, ErrRejected
+		switch response.StatusCode {
+		case http.StatusUnauthorized, http.StatusForbidden:
+			return Receipt{}, &DeliveryError{Class: DeliveryAuthentication}
+		case http.StatusConflict:
+			return Receipt{}, &DeliveryError{Class: DeliveryConflict}
+		case http.StatusTooManyRequests:
+			return Receipt{}, &DeliveryError{Class: DeliveryRateLimit, RetryAfter: parseRetryAfter(response.Header.Get("Retry-After"))}
+		default:
+			if response.StatusCode >= 500 {
+				return Receipt{}, &DeliveryError{Class: DeliveryTransient}
+			}
+			return Receipt{}, &DeliveryError{Class: DeliveryRejected}
+		}
+	}
+	if !strings.HasPrefix(strings.ToLower(response.Header.Get("Content-Type")), "application/json") {
+		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBytes))
+		return Receipt{}, &DeliveryError{Class: DeliveryRejected}
 	}
 	document, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
 	if err != nil || len(document) > maxResponseBytes {
@@ -97,7 +183,124 @@ func (t *HTTPTransport) Send(ctx context.Context, record p.ReconciliationRecord)
 	if err != nil {
 		return Receipt{}, ErrRejected
 	}
-	return NewReceipt(record, public.ReceiptID, at, t.binding, t.clientID)
+	receipt, err := NewReceipt(record, public.ReceiptID, at, t.binding, t.clientID)
+	if err != nil {
+		return Receipt{}, err
+	}
+	receipt.VerifiedAt = t.clock().UTC()
+	if at.After(receipt.VerifiedAt) {
+		return Receipt{}, ErrRejected
+	}
+	return receipt, nil
+}
+
+func validEndpointPath(path string) bool {
+	if path == "" {
+		return true
+	}
+	if !strings.HasPrefix(path, "/") || strings.ContainsAny(path, "\\\r\n") || strings.Contains(path, "//") {
+		return false
+	}
+	for _, segment := range strings.Split(path, "/") {
+		if segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+func validEndpointHost(endpoint *url.URL) bool {
+	host := endpoint.Hostname()
+	if host == "" || strings.Contains(host, "%") {
+		return false
+	}
+	if port := endpoint.Port(); port != "" {
+		value, err := strconv.Atoi(port)
+		if err != nil || value < 1 || value > 65535 {
+			return false
+		}
+	}
+	if ip := net.ParseIP(host); ip != nil {
+		return true
+	}
+	if len(host) > 253 || strings.HasPrefix(host, ".") || strings.HasSuffix(host, ".") {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if !endpointDNSLabel.MatchString(label) {
+			return false
+		}
+	}
+	return true
+}
+
+func wipe(value []byte) {
+	for index := range value {
+		value[index] = 0
+	}
+}
+
+func dialResolved(ctx context.Context, network, address string, resolver ipResolver, dial contextDialer) (net.Conn, error) {
+	if network != "tcp" && network != "tcp4" && network != "tcp6" {
+		return nil, ErrTransport
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, ErrTransport
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return nil, ErrTransport
+	}
+	ips, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil || len(ips) == 0 || len(ips) > 64 {
+		return nil, ErrTransport
+	}
+	for _, candidate := range ips {
+		if candidate.Zone != "" || unsafeIP(candidate.IP) {
+			return nil, ErrTransport
+		}
+	}
+	return dial(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+}
+
+func unsafeIP(ip net.IP) bool {
+	address, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true
+	}
+	address = address.Unmap()
+	if !address.IsGlobalUnicast() {
+		return true
+	}
+	for _, prefix := range unsafeDestinationPrefixes {
+		if prefix.Contains(address) {
+			return true
+		}
+	}
+	return false
+}
+
+var unsafeDestinationPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"), netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"), netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"), netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.0.0.0/24"), netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.168.0.0/16"), netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"), netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("224.0.0.0/4"), netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("64:ff9b:1::/48"), netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001::/23"), netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"), netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fe80::/10"), netip.MustParsePrefix("ff00::/8"),
+}
+
+func parseRetryAfter(value string) time.Duration {
+	seconds, err := strconv.ParseUint(value, 10, 32)
+	if err != nil || seconds > 86_400 {
+		return 0
+	}
+	return time.Duration(seconds) * time.Second
 }
 
 // Uploader performs one explicit delivery attempt. Scheduling and retries are
@@ -120,9 +323,26 @@ func (u Uploader) Attempt(ctx context.Context) error {
 	}
 	receipt, sendErr := u.Send(ctx, record)
 	if sendErr != nil {
-		_, persistErr := u.Queue.Fail(ctx, u.Binding, record.ReconciliationID, u.Clock().UTC(), true)
+		class := DeliveryTransient
+		var delivery *DeliveryError
+		if errors.As(sendErr, &delivery) {
+			class = delivery.Class
+		}
+		var persistErr error
+		if class == DeliveryTransient || class == DeliveryRateLimit {
+			minimum := time.Duration(0)
+			if delivery != nil {
+				minimum = delivery.RetryAfter
+			}
+			_, persistErr = u.Queue.impl.fail(ctx, u.Binding, record.ReconciliationID, u.Clock().UTC(), true, minimum)
+		} else {
+			persistErr = u.Queue.impl.hold(ctx, u.Binding, record.ReconciliationID, class)
+		}
 		if persistErr != nil {
 			return errors.Join(safeError(sendErr), persistErr)
+		}
+		if delivery != nil {
+			return delivery
 		}
 		return safeError(sendErr)
 	}

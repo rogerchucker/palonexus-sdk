@@ -30,6 +30,8 @@ var (
 	ErrClosed       = errors.New("reconciliation queue is closed")
 	ErrTransport    = errors.New("reconciliation transport unavailable")
 	ErrRejected     = errors.New("reconciliation upload rejected")
+	ErrUnauthorized = errors.New("reconciliation authority required")
+	ErrAttemptLimit = errors.New("reconciliation attempt limit reached")
 )
 
 const (
@@ -42,12 +44,47 @@ type Binding struct {
 	Subject string
 }
 
+type DeliveryErrorClass string
+
+const (
+	DeliveryTransient      DeliveryErrorClass = "transient"
+	DeliveryRateLimit      DeliveryErrorClass = "rate_limit"
+	DeliveryRejected       DeliveryErrorClass = "rejected"
+	DeliveryConflict       DeliveryErrorClass = "conflict"
+	DeliveryAuthentication DeliveryErrorClass = "authentication"
+)
+
+type DeliveryError struct {
+	Class      DeliveryErrorClass
+	RetryAfter time.Duration
+}
+
+func (e *DeliveryError) Error() string { return "reconciliation delivery " + string(e.Class) }
+func (e *DeliveryError) Unwrap() error {
+	if e != nil && (e.Class == DeliveryTransient || e.Class == DeliveryRateLimit) {
+		return ErrTransport
+	}
+	if e != nil && e.Class == DeliveryConflict {
+		return ErrConflict
+	}
+	return ErrRejected
+}
+
 type Config struct {
 	Root           string
 	MaxRecords     int
 	MaxBytes       int64
 	MaxRecordBytes int
 	Jitter         func(time.Duration) time.Duration
+	Authority      AuthorityVerifier
+}
+
+// AuthorityVerifier is implemented by the authenticated session/policy layer.
+// Queue callers cannot substitute a boolean authority claim; the queue invokes
+// this trusted dependency for every privileged transition.
+type AuthorityVerifier interface {
+	AuthorizeDiscard(context.Context, Binding, p.DiscardAuthorityType) error
+	AuthorizeManualRetry(context.Context, Binding) error
 }
 
 type Queue struct {
@@ -62,15 +99,19 @@ type Receipt struct {
 	AcknowledgedAt   p.RFC3339Timestamp
 	Tenant           string
 	ClientID         string
+	VerifiedAt       time.Time
 }
 
 type queueImpl interface {
 	enqueue(context.Context, Binding, p.ReconciliationRecord) error
 	claim(context.Context, Binding, time.Time) (p.ReconciliationRecord, error)
 	recover(context.Context, Binding, time.Time) (p.ReconciliationRecord, error)
-	fail(context.Context, Binding, p.ReconciliationID, time.Time, bool) (p.ReconciliationRecord, error)
+	fail(context.Context, Binding, p.ReconciliationID, time.Time, bool, time.Duration) (p.ReconciliationRecord, error)
 	ack(context.Context, Binding, p.ReconciliationID, Receipt) (p.ReconciliationRecord, error)
 	discard(context.Context, Binding, p.ReconciliationID, time.Time, p.DiscardAuthorityType, string, bool) (p.ReconciliationRecord, error)
+	manualRetry(context.Context, Binding, p.ReconciliationID, time.Time) (p.ReconciliationRecord, error)
+	hold(context.Context, Binding, p.ReconciliationID, DeliveryErrorClass) error
+	held(context.Context, Binding, p.ReconciliationID) (DeliveryErrorClass, error)
 	get(context.Context, Binding, p.ReconciliationID) (p.ReconciliationRecord, error)
 	close() error
 }
@@ -129,7 +170,7 @@ func (q *Queue) Fail(ctx context.Context, b Binding, id p.ReconciliationID, now 
 	if q == nil || q.impl == nil {
 		return p.ReconciliationRecord{}, ErrClosed
 	}
-	return q.impl.fail(ctx, b, id, now, retryable)
+	return q.impl.fail(ctx, b, id, now, retryable, 0)
 }
 func (q *Queue) Acknowledge(ctx context.Context, b Binding, id p.ReconciliationID, receipt Receipt) (p.ReconciliationRecord, error) {
 	if q == nil || q.impl == nil {
@@ -137,11 +178,23 @@ func (q *Queue) Acknowledge(ctx context.Context, b Binding, id p.ReconciliationI
 	}
 	return q.impl.ack(ctx, b, id, receipt)
 }
-func (q *Queue) Discard(ctx context.Context, b Binding, id p.ReconciliationID, now time.Time, authority p.DiscardAuthorityType, reason string, retentionAuthority bool) (p.ReconciliationRecord, error) {
+func (q *Queue) Discard(ctx context.Context, b Binding, id p.ReconciliationID, now time.Time, authority p.DiscardAuthorityType, reason string) (p.ReconciliationRecord, error) {
 	if q == nil || q.impl == nil {
 		return p.ReconciliationRecord{}, ErrClosed
 	}
-	return q.impl.discard(ctx, b, id, now, authority, reason, retentionAuthority)
+	return q.impl.discard(ctx, b, id, now, authority, reason, false)
+}
+func (q *Queue) ManualRetry(ctx context.Context, b Binding, id p.ReconciliationID, now time.Time) (p.ReconciliationRecord, error) {
+	if q == nil || q.impl == nil {
+		return p.ReconciliationRecord{}, ErrClosed
+	}
+	return q.impl.manualRetry(ctx, b, id, now)
+}
+func (q *Queue) HeldError(ctx context.Context, b Binding, id p.ReconciliationID) (DeliveryErrorClass, error) {
+	if q == nil || q.impl == nil {
+		return "", ErrClosed
+	}
+	return q.impl.held(ctx, b, id)
 }
 func (q *Queue) Get(ctx context.Context, b Binding, id p.ReconciliationID) (p.ReconciliationRecord, error) {
 	if q == nil || q.impl == nil {
@@ -203,10 +256,64 @@ func validateRecord(record p.ReconciliationRecord, max int) ([]byte, error) {
 			return nil, ErrUnsafeRecord
 		}
 	}
+	if (parsed.AttemptCount == 0) != (parsed.LastAttemptAt == nil) {
+		return nil, ErrUnsafeRecord
+	}
+	if parsed.DeliveryDisposition == p.DeliveryDispositionAutomatic && parsed.AttemptCount > policy.MaxAttempts {
+		return nil, ErrUnsafeRecord
+	}
+	if parsed.DeliveryDisposition == p.DeliveryDispositionManualIntervention && parsed.AttemptCount < policy.MaxAttempts {
+		return nil, ErrUnsafeRecord
+	}
+	if parsed.State == p.ReconciliationStatePending &&
+		parsed.DeliveryDisposition == p.DeliveryDispositionAutomatic && parsed.AttemptCount >= policy.MaxAttempts {
+		return nil, ErrUnsafeRecord
+	}
+	if parsed.State == p.ReconciliationStateRetryWait && parsed.AttemptCount >= policy.MaxAttempts {
+		return nil, ErrUnsafeRecord
+	}
+	if parsed.NextAttemptAt != nil {
+		next, e := parseTime(*parsed.NextAttemptAt)
+		if e != nil || parsed.LastAttemptAt == nil || !next.After(timeMust(parsed.LastAttemptAt)) {
+			return nil, ErrUnsafeRecord
+		}
+	}
+	if parsed.AcknowledgedAt != nil {
+		acknowledged, e := parseTime(*parsed.AcknowledgedAt)
+		if e != nil || parsed.LastAttemptAt == nil || acknowledged.Before(timeMust(parsed.LastAttemptAt)) {
+			return nil, ErrUnsafeRecord
+		}
+	}
+	if parsed.DiscardedAt != nil {
+		discarded, e := parseTime(*parsed.DiscardedAt)
+		if e != nil || discarded.Before(observed) {
+			return nil, ErrUnsafeRecord
+		}
+	}
+	if parsed.State == p.ReconciliationStateAcknowledged {
+		if parsed.Acknowledgement == nil || parsed.AcknowledgedAt == nil {
+			return nil, ErrUnsafeRecord
+		}
+		hash, hashErr := evidenceHashUnchecked(parsed)
+		left, leftErr := parseTime(parsed.Acknowledgement.AcknowledgedAt)
+		right, rightErr := parseTime(*parsed.AcknowledgedAt)
+		if hashErr != nil || leftErr != nil || rightErr != nil ||
+			parsed.Acknowledgement.ReconciliationID != parsed.ReconciliationID ||
+			parsed.Acknowledgement.EvidenceHash != hash || !left.Equal(right) {
+			return nil, ErrUnsafeRecord
+		}
+	}
 	return wire, nil
 }
 
 func evidenceHash(record p.ReconciliationRecord) (p.SHA256Digest, error) {
+	if _, err := validateRecord(record, maxRecordBytesDefault); err != nil {
+		return "", err
+	}
+	return evidenceHashUnchecked(record)
+}
+
+func evidenceHashUnchecked(record p.ReconciliationRecord) (p.SHA256Digest, error) {
 	// State fields are deliberately excluded, matching the protocol's immutable evidence body.
 	body := struct {
 		SchemaVersion               p.SchemaVersion               `json:"schemaVersion"`
@@ -254,7 +361,8 @@ func NewReceipt(record p.ReconciliationRecord, id p.ReceiptID, at time.Time, bin
 		return Receipt{}, err
 	}
 	return Receipt{ReceiptID: id, ReconciliationID: record.ReconciliationID, EvidenceHash: hash,
-		AcknowledgedAt: p.RFC3339Timestamp(at.UTC().Format(time.RFC3339Nano)), Tenant: binding.Tenant, ClientID: clientID}, nil
+		AcknowledgedAt: p.RFC3339Timestamp(at.UTC().Format(time.RFC3339Nano)), Tenant: binding.Tenant,
+		ClientID: clientID, VerifiedAt: at.UTC()}, nil
 }
 
 func timeMust(value *p.RFC3339Timestamp) time.Time {
