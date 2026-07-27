@@ -125,6 +125,7 @@ class _ApprovalBinding:
     client_scope_hash: str
     authoritative_scope_hash: str
     decision_id: str
+    audit_ref: str
     approval_id: str
     approval_expires_at: datetime
 
@@ -685,6 +686,7 @@ class ScriptedEngine:
                         client_scope_hash=client_scope_hash,
                         authoritative_scope_hash=str(result.authoritative_scope_hash),
                         decision_id=str(result.decision_id),
+                        audit_ref=str(result.audit_ref),
                         approval_id=str(result.approval.approval_id),
                         approval_expires_at=datetime.fromisoformat(
                             str(result.approval.expires_at).replace("Z", "+00:00")
@@ -839,6 +841,9 @@ class ScriptedEngine:
                     or checked_approval_id in self._approvals
                 ):
                     raise AuthorizationUnavailable() from None
+                # Preserve the deterministic testing engine's allocation
+                # boundary while binding the record to the decision's audit.
+                self._new_id("audit")
                 document: dict[str, wire.JSONValue] = {
                     "schemaVersion": "1",
                     "approvalId": binding.approval_id,
@@ -850,7 +855,7 @@ class ScriptedEngine:
                     "expiresAt": _timestamp(binding.approval_expires_at),
                     "requesterRef": "subject:testing-requester",
                     "authorizationDecisionId": binding.decision_id,
-                    "creationAuditRef": self._new_id("audit"),
+                    "creationAuditRef": binding.audit_ref,
                 }
                 record = wire.parse_approval(document)
                 approval_call = self._prepared_call(

@@ -37,20 +37,37 @@ _LANGCHAIN_EXPORTS = frozenset(
         "validate_authorized_middleware_stack",
     }
 )
+_LANGGRAPH_EXPORTS = frozenset(
+    {
+        "LANGGRAPH_SCOPE_KEY",
+        "LangGraphApprovalExpired",
+        "LangGraphApprovalRequired",
+        "LangGraphApprovalScopeMismatch",
+        "LangGraphAuthorizationUnavailable",
+        "LangGraphInvalidDecision",
+        "LangGraphPolicyDenied",
+        "LangGraphCredentialRevoked",
+        "PaloNexusLangGraphNode",
+    }
+)
 
 
 def __getattr__(name: str) -> Any:
-    if name not in _LANGCHAIN_EXPORTS:
+    if name not in _LANGCHAIN_EXPORTS | _LANGGRAPH_EXPORTS:
         raise AttributeError(name)
     if name == "MissingIntegrationDependency":
         return MissingIntegrationDependency
+    if name in _LANGGRAPH_EXPORTS:
+        from . import langgraph
+
+        return getattr(langgraph, name)
     from . import langchain
 
     return getattr(langchain, name)
 
 
 def __dir__() -> list[str]:
-    return sorted(_LANGCHAIN_EXPORTS)
+    return sorted(_LANGCHAIN_EXPORTS | _LANGGRAPH_EXPORTS)
 
 
-__all__ = sorted(_LANGCHAIN_EXPORTS)
+__all__ = sorted(_LANGCHAIN_EXPORTS | _LANGGRAPH_EXPORTS)

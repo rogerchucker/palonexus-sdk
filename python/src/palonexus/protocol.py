@@ -793,6 +793,54 @@ class ActionRequestBuilder:
             raise
         return resumed
 
+    def _restore_original_for_resume(
+        self,
+        request_document: object,
+        *,
+        client_scope_hash: str,
+    ) -> _PreparedAction:
+        """Restore only the authorization half of a checkpointed action.
+
+        Framework adapters checkpoint protocol data, never an execution
+        envelope. This validator recreates the sealed original required by the
+        approval binding while deliberately restoring no executable value.
+        """
+
+        try:
+            if not isinstance(request_document, dict):
+                raise TypeError
+            request = _wire.parse_action(request_document)
+            request.validate_structural()
+            if (
+                request.adapter != self._adapter
+                or request.resume_from_approval_id is not None
+                or type(client_scope_hash) is not str
+                or _canonical.client_scope_hash(request.to_dict())
+                != client_scope_hash
+            ):
+                raise ValueError
+            target_document = request.target.to_dict()
+            canonical_target = _canonical.validated_target(target_document)
+            if canonical_target["resourceHash"] != str(request.target.resource_hash):
+                raise ValueError
+            return _PreparedAction(
+                _CAPABILITY,
+                key=self._seal_key,
+                request=request,
+                client_scope_hash=client_scope_hash,
+                target_nonce=secrets.token_bytes(16),
+                kind=str(request.target.kind),
+                buffer=bytearray(),
+            )
+        except (
+            AttributeError,
+            KeyError,
+            TypeError,
+            ValueError,
+            _canonical.CanonicalizationError,
+        ):
+            raise _invalid() from None
+
     def _prepare_resume(
         self,
         original: _PreparedAction,

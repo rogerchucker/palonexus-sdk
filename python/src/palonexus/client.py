@@ -550,6 +550,68 @@ class AuthorizationClient:
                 except BaseException:
                     pass
 
+    def resume_checkpoint(
+        self,
+        builder: ActionRequestBuilder,
+        current: _PreparedAction,
+        *,
+        original_request: object,
+        client_scope_hash: str,
+        prior_decision: object,
+        pending_approval: object,
+        deadline: float | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> _PreparedAction:
+        """Resume a validated durable framework checkpoint.
+
+        The checkpoint contains authorization protocol data only. The current
+        executable target must be freshly projected and sealed by ``builder``.
+        Approval status is always fetched from the trusted approval transport;
+        checkpoint or human-provided status is never treated as authority.
+        """
+
+        original: _PreparedAction | None = None
+        try:
+            if not isinstance(prior_decision, dict) or not isinstance(
+                pending_approval, dict
+            ):
+                raise TypeError
+            original = builder._restore_original_for_resume(  # noqa: SLF001
+                original_request,
+                client_scope_hash=client_scope_hash,
+            )
+            decision = AuthorizationDecision._from_protocol(
+                _wire.parse_decision(prior_decision)
+            )
+            expected = ApprovalRecord._from_protocol(
+                _wire.parse_approval(pending_approval)
+            )
+        except Exception:
+            if original is not None:
+                original.close()
+            raise ApprovalScopeMismatch() from None
+        try:
+            approval = self.get_approval(
+                expected.approval_id,
+                expected=expected,
+                deadline=deadline,
+                cancelled=cancelled,
+            )
+            return self.resume(
+                builder,
+                original,
+                current,
+                decision,
+                approval,
+                deadline=deadline,
+                cancelled=cancelled,
+            )
+        finally:
+            try:
+                original.close()
+            except BaseException:
+                pass
+
     def close(self) -> None:
         """Wait for active calls, then close an owned transport exactly once."""
 

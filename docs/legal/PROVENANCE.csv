@@ -157,3 +157,6 @@ python/src/palonexus/integrations/langchain.py,rogerchucker/palonexus-sdk,WORKTR
 python/tests/integrations/test_langchain.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/integrations/test_langchain.py,PaloNexus,yes,new,MIT,rogerchucker
 examples/langchain/main.py,rogerchucker/palonexus-sdk,WORKTREE,examples/langchain/main.py,PaloNexus,yes,new,MIT,rogerchucker
 examples/langchain/README.md,rogerchucker/palonexus-sdk,WORKTREE,examples/langchain/README.md,PaloNexus,yes,new,MIT,rogerchucker
+python/src/palonexus/integrations/langgraph.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/integrations/langgraph.py,PaloNexus,yes,new,MIT,rogerchucker
+python/tests/integrations/test_langgraph.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/integrations/test_langgraph.py,PaloNexus,yes,new,MIT,rogerchucker
+examples/langgraph/main.py,rogerchucker/palonexus-sdk,WORKTREE,examples/langgraph/main.py,PaloNexus,yes,new,MIT,rogerchucker

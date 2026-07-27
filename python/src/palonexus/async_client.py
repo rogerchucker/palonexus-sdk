@@ -359,6 +359,66 @@ class AsyncAuthorizationClient:
                 except BaseException:
                     pass
 
+    async def resume_checkpoint(
+        self,
+        builder: ActionRequestBuilder,
+        current: _PreparedAction,
+        *,
+        original_request: object,
+        client_scope_hash: str,
+        prior_decision: object,
+        pending_approval: object,
+        deadline: float | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> _PreparedAction:
+        """Asynchronously resume a validated durable framework checkpoint."""
+
+        from ._generated import protocol as _wire
+        from .client import AuthorizationDecision
+        from .errors import ApprovalScopeMismatch
+
+        original: _PreparedAction | None = None
+        try:
+            if not isinstance(prior_decision, dict) or not isinstance(
+                pending_approval, dict
+            ):
+                raise TypeError
+            original = builder._restore_original_for_resume(  # noqa: SLF001
+                original_request,
+                client_scope_hash=client_scope_hash,
+            )
+            decision = AuthorizationDecision._from_protocol(
+                _wire.parse_decision(prior_decision)
+            )
+            expected = ApprovalRecord._from_protocol(
+                _wire.parse_approval(pending_approval)
+            )
+        except Exception:
+            if original is not None:
+                original.close()
+            raise ApprovalScopeMismatch() from None
+        try:
+            approval = await self.get_approval(
+                expected.approval_id,
+                expected=expected,
+                deadline=deadline,
+                cancelled=cancelled,
+            )
+            return await self.resume(
+                builder,
+                original,
+                current,
+                decision,
+                approval,
+                deadline=deadline,
+                cancelled=cancelled,
+            )
+        finally:
+            try:
+                original.close()
+            except BaseException:
+                pass
+
     async def _finish_close(self) -> None:
         async with self._condition:
             while self._active:

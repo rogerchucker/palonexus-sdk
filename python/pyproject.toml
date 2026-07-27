@@ -55,6 +55,10 @@ langchain = [
     "langchain>=1,<2",
     "langchain-core>=1,<2",
 ]
+langgraph = [
+    "langchain-core>=1,<2",
+    "langgraph>=1,<2",
+]
 
 [tool.hatch.version]
 source = "vcs"
