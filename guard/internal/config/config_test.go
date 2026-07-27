@@ -88,6 +88,43 @@ func TestLoadAcceptsHTTPSAndReturnsImmutableCopies(t *testing.T) {
 	}
 }
 
+func TestLoadRetainsProductionIdentityAndSecurityDigestIncludesCABytes(t *testing.T) {
+	ca := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(ca, testCertificatePEM(t), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Replace(
+		validConfig("https://decision.example.com"),
+		`"trusted_ca_file": ""`,
+		`"trusted_ca_file": "`+ca+`",
+		"tenant_id":"tenant-a",
+		"account_id":"account-a",
+		"client_id":"codex",
+		"state_dir":"/var/lib/palonexus-state"`,
+		1,
+	)
+	cfg, err := Load(writeConfig(t, body), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cfg.TenantID() != "tenant-a" || cfg.AccountID() != "account-a" ||
+		cfg.ClientID() != "codex" || cfg.StateDir() != "/var/lib/palonexus-state" {
+		t.Fatalf("identity configuration not retained")
+	}
+	before := cfg.Digest()
+	mutated := append([]byte(nil), testCertificatePEM(t)...)
+	if err := os.WriteFile(ca, mutated, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	after, err := Load(writeConfig(t, strings.Replace(body, ca, ca, 1)), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before == after.Digest() {
+		t.Fatal("trusted CA bytes were omitted from security digest")
+	}
+}
+
 func TestLoadRejectsNonHTTPSEndpoints(t *testing.T) {
 	for _, endpoint := range []string{
 		"http://decision.example.com",

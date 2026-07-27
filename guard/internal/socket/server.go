@@ -27,6 +27,7 @@ const (
 	DefaultSocketName  = "guard.sock"
 	defaultMaxRequest  = 1 << 20
 	defaultIOTimeout   = 5 * time.Second
+	minLifecycleProof  = time.Second
 	defaultMaxClients  = 64
 	defaultMaxHandlers = 16
 	hardMaxConcurrency = 256
@@ -35,6 +36,7 @@ const (
 // Handler must honor context cancellation. The server bounds detached handlers
 // that ignore cancellation, but cannot forcibly terminate Go code.
 type Handler func(context.Context, []byte) ([]byte, error)
+type ControlHandler func(context.Context, []byte) ([]byte, bool)
 
 type CloseError struct {
 	Operation string
@@ -48,6 +50,7 @@ func (err *CloseError) Error() string {
 func (err *CloseError) Unwrap() error { return err.Err }
 
 var ErrRecoveryAmbiguous = errors.New("socket: recovery requires manual cleanup")
+var ErrProbeUntrusted = errors.New("socket: peer readiness could not be proven")
 
 type RecoveryAmbiguousError struct {
 	Artifact string
@@ -68,6 +71,7 @@ type Config struct {
 	IOTimeout             time.Duration
 	RequestTimeout        time.Duration
 	Handler               Handler
+	ControlHandler        ControlHandler
 	// beforeBind is a test seam for exercising pathname replacement races.
 	beforeBind func()
 	// afterValidationBeforeBind exercises the final pathname race window.
@@ -300,7 +304,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.afterStageBind != nil {
 		cfg.afterStageBind(stagePath)
 	}
-	if err := proveListenerPath(listener, stagePath, cfg.IOTimeout); err != nil {
+	if err := proveListenerPath(listener, stagePath, lifecycleProofBudget(cfg.IOTimeout)); err != nil {
 		_ = listener.Close()
 		return fail(err)
 	}
@@ -387,7 +391,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.beforeListenerProof != nil {
 		cfg.beforeListenerProof(path)
 	}
-	if err := proveListenerPath(listener, path, cfg.IOTimeout); err != nil {
+	if err := proveListenerPath(listener, path, lifecycleProofBudget(cfg.IOTimeout)); err != nil {
 		return cleanupListener(err)
 	}
 	finalNode, err := inspectAt(dir, cfg.SocketName)
@@ -517,7 +521,7 @@ func recoverLifecycle(
 		return err
 	}
 	path := filepath.Join(cfg.RuntimeDir, candidates[0].name)
-	if probeGuard(path, cfg.IOTimeout) != probeRefused {
+	if probeGuard(path, lifecycleProofBudget(cfg.IOTimeout)) != probeRefused {
 		return errors.New("socket: lifecycle candidate may still be active")
 	}
 	if err := verifyRuntimeDir(dir, cfg.RuntimeDir, dirInfo); err != nil {
@@ -543,13 +547,36 @@ const (
 	challengePIDField = "serverPid"
 )
 
+func lifecycleProofBudget(operational time.Duration) time.Duration {
+	if operational < minLifecycleProof {
+		return minLifecycleProof
+	}
+	return operational
+}
+
 func probeGuard(path string, timeout time.Duration) probeResult {
+	_, result := probeGuardPID(path, timeout)
+	return result
+}
+
+// Probe verifies that path reaches a live PaloNexus guard owned by the current
+// user and returns the kernel-authenticated peer PID. It never classifies a
+// malformed, unreachable, or wrong-user peer as ready.
+func Probe(path string, timeout time.Duration) (int, error) {
+	pid, result := probeGuardPID(path, timeout)
+	if result != probeActive {
+		return 0, ErrProbeUntrusted
+	}
+	return pid, nil
+}
+
+func probeGuardPID(path string, timeout time.Duration) (int, probeResult) {
 	if timeout <= 0 || timeout > time.Second {
 		timeout = time.Second
 	}
 	var nonce [32]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
-		return probeAmbiguous
+		return 0, probeAmbiguous
 	}
 	value := base64.RawURLEncoding.EncodeToString(nonce[:])
 	request, _ := json.Marshal(map[string]string{challengeField: value})
@@ -558,40 +585,40 @@ func probeGuard(path string, timeout time.Duration) probeResult {
 	if err != nil {
 		var operation *net.OpError
 		if errors.As(err, &operation) && errors.Is(operation.Err, syscall.ECONNREFUSED) {
-			return probeRefused
+			return 0, probeRefused
 		}
-		return probeAmbiguous
+		return 0, probeAmbiguous
 	}
 	defer conn.Close()
 	uid, err := peerUID(conn)
 	if err != nil || uid != currentUID() {
-		return probeAmbiguous
+		return 0, probeAmbiguous
 	}
 	connectedPID, err := peerPID(conn)
 	if err != nil || connectedPID <= 0 {
-		return probeAmbiguous
+		return 0, probeAmbiguous
 	}
 	_ = conn.SetDeadline(time.Now().Add(timeout))
 	if _, err := conn.Write(request); err != nil {
-		return probeAmbiguous
+		return 0, probeAmbiguous
 	}
 	response, err := bufio.NewReaderSize(conn, 256).ReadBytes('\n')
 	if err != nil || len(response) > 256 || len(response) < 2 ||
 		response[len(response)-1] != '\n' {
-		return probeAmbiguous
+		return 0, probeAmbiguous
 	}
 	object, err := decodeTopLevelObject(response[:len(response)-1])
 	if err != nil || len(object) != 2 {
-		return probeAmbiguous
+		return 0, probeAmbiguous
 	}
 	var returned string
 	var claimedPID int
 	if json.Unmarshal(object[challengeField], &returned) != nil ||
 		json.Unmarshal(object[challengePIDField], &claimedPID) != nil ||
 		returned != value || claimedPID <= 0 || claimedPID != connectedPID {
-		return probeAmbiguous
+		return 0, probeAmbiguous
 	}
-	return probeActive
+	return connectedPID, probeActive
 }
 
 func challengeResponse(frame []byte) ([]byte, bool) {
@@ -792,6 +819,12 @@ func (s *Server) handle(parent context.Context, conn *net.UnixConn) {
 	}
 	ctx, cancel := context.WithTimeout(parent, s.cfg.RequestTimeout)
 	defer cancel()
+	if s.cfg.ControlHandler != nil {
+		if response, handled := s.cfg.ControlHandler(ctx, frame[:len(frame)-1]); handled {
+			s.write(conn, normalizeHandlerResponse(response, s.cfg.MaxRequestBytes))
+			return
+		}
+	}
 	response := processFrameLimited(
 		ctx, frame, s.cfg.MaxRequestBytes, s.cfg.Handler, s.handlerSlots,
 	)
@@ -861,6 +894,9 @@ func processFrameLimited(
 	if version != "1" {
 		return failure(protocol.ProtocolErrorCodeUnsupportedProtocol, false)
 	}
+	if _, err := protocol.ParseActionRequest(document); err != nil {
+		return failure(protocol.ProtocolErrorCodeInvalidRequest, false)
+	}
 	type handlerResult struct {
 		response []byte
 		err      error
@@ -896,7 +932,10 @@ func processFrameLimited(
 	if result.err != nil {
 		return failure(protocol.ProtocolErrorCodeAuthorizationUnavailable, true)
 	}
-	response := result.response
+	return normalizeHandlerResponse(result.response, maximum)
+}
+
+func normalizeHandlerResponse(response []byte, maximum int) []byte {
 	response = bytes.TrimSpace(response)
 	if len(response) == 0 || len(response) > maximum || !json.Valid(response) {
 		return failure(protocol.ProtocolErrorCodeInvalidDecision, false)
@@ -911,6 +950,24 @@ func processFrameLimited(
 		return failure(protocol.ProtocolErrorCodeInvalidDecision, false)
 	}
 	return append(compact.Bytes(), '\n')
+}
+
+// ProcessFrame applies the exact production socket framing, protocol, handler,
+// timeout, and response-validation boundary without opening a socket.
+func ProcessFrame(
+	ctx context.Context,
+	document []byte,
+	maximum int,
+	handler Handler,
+) []byte {
+	if maximum == 0 {
+		maximum = defaultMaxRequest
+	}
+	if ctx == nil || handler == nil || maximum < 1 || maximum > defaultMaxRequest {
+		return failure(protocol.ProtocolErrorCodeAuthorizationUnavailable, true)
+	}
+	frame := append(append([]byte(nil), document...), '\n')
+	return processFrameLimited(ctx, frame, maximum, handler, nil)
 }
 
 func decodeTopLevelObject(document []byte) (map[string]json.RawMessage, error) {
