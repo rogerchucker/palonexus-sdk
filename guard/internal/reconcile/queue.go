@@ -1,0 +1,301 @@
+// Package reconcile provides a durable, bounded, at-least-once evidence queue.
+// It persists only the closed reconciliation protocol record; raw resources,
+// request bodies, credentials, and arbitrary server responses have no place in
+// this API or its on-disk envelope.
+package reconcile
+
+import (
+	"context"
+	"crypto/sha256"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"math"
+	"regexp"
+	"time"
+
+	"github.com/rogerchucker/palonexus-sdk/guard/internal/normalize"
+	p "github.com/rogerchucker/palonexus-sdk/guard/pkg/protocol"
+)
+
+var (
+	ErrNotFound     = errors.New("reconciliation record not found")
+	ErrNotReady     = errors.New("reconciliation record is not ready")
+	ErrConflict     = errors.New("reconciliation idempotency conflict")
+	ErrCorrupt      = errors.New("reconciliation queue is corrupt")
+	ErrUnsafePath   = errors.New("unsafe reconciliation queue path")
+	ErrUnsafeRecord = errors.New("unsafe reconciliation record")
+	ErrQueueFull    = errors.New("reconciliation queue capacity exceeded")
+	ErrClosed       = errors.New("reconciliation queue is closed")
+	ErrTransport    = errors.New("reconciliation transport unavailable")
+	ErrRejected     = errors.New("reconciliation upload rejected")
+)
+
+const (
+	maxRecordBytesDefault = 65_536
+	maxResponseBytes      = 16_384
+)
+
+type Binding struct {
+	Tenant  string
+	Subject string
+}
+
+type Config struct {
+	Root           string
+	MaxRecords     int
+	MaxBytes       int64
+	MaxRecordBytes int
+	Jitter         func(time.Duration) time.Duration
+}
+
+type Queue struct {
+	impl queueImpl
+	root string
+}
+
+type Receipt struct {
+	ReceiptID        p.ReceiptID
+	ReconciliationID p.ReconciliationID
+	EvidenceHash     p.SHA256Digest
+	AcknowledgedAt   p.RFC3339Timestamp
+	Tenant           string
+	ClientID         string
+}
+
+type queueImpl interface {
+	enqueue(context.Context, Binding, p.ReconciliationRecord) error
+	claim(context.Context, Binding, time.Time) (p.ReconciliationRecord, error)
+	recover(context.Context, Binding, time.Time) (p.ReconciliationRecord, error)
+	fail(context.Context, Binding, p.ReconciliationID, time.Time, bool) (p.ReconciliationRecord, error)
+	ack(context.Context, Binding, p.ReconciliationID, Receipt) (p.ReconciliationRecord, error)
+	discard(context.Context, Binding, p.ReconciliationID, time.Time, p.DiscardAuthorityType, string, bool) (p.ReconciliationRecord, error)
+	get(context.Context, Binding, p.ReconciliationID) (p.ReconciliationRecord, error)
+	close() error
+}
+
+func Open(config Config) (*Queue, error) {
+	if config.MaxRecords <= 0 || config.MaxRecords > 100_000 || config.MaxBytes <= 0 || config.MaxBytes > 1<<30 {
+		return nil, ErrUnsafePath
+	}
+	if config.MaxRecordBytes == 0 {
+		config.MaxRecordBytes = maxRecordBytesDefault
+	}
+	if config.MaxRecordBytes < 1024 || config.MaxRecordBytes > maxRecordBytesDefault {
+		return nil, ErrUnsafePath
+	}
+	if config.Jitter == nil {
+		config.Jitter = func(time.Duration) time.Duration { return 0 }
+	}
+	impl, err := openQueue(config)
+	if err != nil {
+		return nil, err
+	}
+	return &Queue{impl: impl, root: config.Root}, nil
+}
+
+func (q *Queue) Root() string {
+	if q == nil {
+		return ""
+	}
+	return q.root
+}
+func (q *Queue) Close() error {
+	if q == nil || q.impl == nil {
+		return ErrClosed
+	}
+	return q.impl.close()
+}
+func (q *Queue) Enqueue(ctx context.Context, b Binding, r p.ReconciliationRecord) error {
+	if q == nil || q.impl == nil {
+		return ErrClosed
+	}
+	return q.impl.enqueue(ctx, b, r)
+}
+func (q *Queue) Claim(ctx context.Context, b Binding, now time.Time) (p.ReconciliationRecord, error) {
+	if q == nil || q.impl == nil {
+		return p.ReconciliationRecord{}, ErrClosed
+	}
+	return q.impl.claim(ctx, b, now)
+}
+func (q *Queue) Recover(ctx context.Context, b Binding, now time.Time) (p.ReconciliationRecord, error) {
+	if q == nil || q.impl == nil {
+		return p.ReconciliationRecord{}, ErrClosed
+	}
+	return q.impl.recover(ctx, b, now)
+}
+func (q *Queue) Fail(ctx context.Context, b Binding, id p.ReconciliationID, now time.Time, retryable bool) (p.ReconciliationRecord, error) {
+	if q == nil || q.impl == nil {
+		return p.ReconciliationRecord{}, ErrClosed
+	}
+	return q.impl.fail(ctx, b, id, now, retryable)
+}
+func (q *Queue) Acknowledge(ctx context.Context, b Binding, id p.ReconciliationID, receipt Receipt) (p.ReconciliationRecord, error) {
+	if q == nil || q.impl == nil {
+		return p.ReconciliationRecord{}, ErrClosed
+	}
+	return q.impl.ack(ctx, b, id, receipt)
+}
+func (q *Queue) Discard(ctx context.Context, b Binding, id p.ReconciliationID, now time.Time, authority p.DiscardAuthorityType, reason string, retentionAuthority bool) (p.ReconciliationRecord, error) {
+	if q == nil || q.impl == nil {
+		return p.ReconciliationRecord{}, ErrClosed
+	}
+	return q.impl.discard(ctx, b, id, now, authority, reason, retentionAuthority)
+}
+func (q *Queue) Get(ctx context.Context, b Binding, id p.ReconciliationID) (p.ReconciliationRecord, error) {
+	if q == nil || q.impl == nil {
+		return p.ReconciliationRecord{}, ErrClosed
+	}
+	return q.impl.get(ctx, b, id)
+}
+
+var (
+	bindingPart = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._~-]{0,127}$`)
+	safeReason  = regexp.MustCompile(`^[a-z][a-z0-9]*(?:_[a-z0-9]+)*$`)
+	receiptID   = regexp.MustCompile(`^receipt_[0-7][0-9A-HJKMNP-TV-Z]{25}$`)
+)
+
+func validBinding(b Binding) bool {
+	return bindingPart.MatchString(b.Tenant) && bindingPart.MatchString(b.Subject)
+}
+
+func parseTime(value p.RFC3339Timestamp) (time.Time, error) {
+	if len(value) == 0 || len(value) > 128 {
+		return time.Time{}, ErrUnsafeRecord
+	}
+	result, err := time.Parse(time.RFC3339Nano, string(value))
+	if err != nil {
+		return time.Time{}, ErrUnsafeRecord
+	}
+	return result, nil
+}
+
+func validateRecord(record p.ReconciliationRecord, max int) ([]byte, error) {
+	wire, err := json.Marshal(record)
+	if err != nil || len(wire) > max {
+		return nil, ErrUnsafeRecord
+	}
+	parsed, err := p.ParseReconciliationRecord(wire)
+	if err != nil {
+		return nil, ErrUnsafeRecord
+	}
+	if parsed.Extensions != nil && len(*parsed.Extensions) != 0 {
+		return nil, ErrUnsafeRecord
+	}
+	if !safeReason.MatchString(parsed.ReasonCode) {
+		return nil, ErrUnsafeRecord
+	}
+	observed, err := parseTime(parsed.ObservedAt)
+	if err != nil {
+		return nil, err
+	}
+	policy := parsed.DeliveryPolicy
+	if policy.MaxAttempts < 1 || policy.MaxAttempts > 100 || policy.MaxTotalAttempts < policy.MaxAttempts ||
+		policy.MaxTotalAttempts > 100 || policy.BaseDelaySeconds < 1 || policy.BaseDelaySeconds > 3600 ||
+		policy.MaxDelaySeconds < policy.BaseDelaySeconds || policy.MaxDelaySeconds > 86400 ||
+		parsed.AttemptCount < 0 || parsed.AttemptCount > policy.MaxTotalAttempts {
+		return nil, ErrUnsafeRecord
+	}
+	if parsed.LastAttemptAt != nil {
+		last, e := parseTime(*parsed.LastAttemptAt)
+		if e != nil || last.Before(observed) {
+			return nil, ErrUnsafeRecord
+		}
+	}
+	return wire, nil
+}
+
+func evidenceHash(record p.ReconciliationRecord) (p.SHA256Digest, error) {
+	// State fields are deliberately excluded, matching the protocol's immutable evidence body.
+	body := struct {
+		SchemaVersion               p.SchemaVersion               `json:"schemaVersion"`
+		ReconciliationID            p.ReconciliationID            `json:"reconciliationId"`
+		ActionID                    p.ActionID                    `json:"actionId"`
+		RequestID                   p.RequestID                   `json:"requestId"`
+		DecisionID                  *p.DecisionID                 `json:"decisionId,omitempty"`
+		CorrelationID               p.CorrelationID               `json:"correlationId"`
+		AuthorizationIdempotencyKey p.AuthorizationIdempotencyKey `json:"authorizationIdempotencyKey"`
+		ClientID                    string                        `json:"clientId"`
+		Action                      p.ActionName                  `json:"action"`
+		TargetKind                  p.TargetKind                  `json:"targetKind"`
+		ClientScopeHash             *p.SHA256Digest               `json:"clientScopeHash,omitempty"`
+		AuthoritativeScopeHash      *p.SHA256Digest               `json:"authoritativeScopeHash,omitempty"`
+		Outcome                     p.ReconciliationOutcome       `json:"outcome"`
+		ReasonCode                  string                        `json:"reasonCode"`
+		ObservedAt                  p.RFC3339Timestamp            `json:"observedAt"`
+		BatchID                     p.BatchID                     `json:"batchId"`
+		BatchSequence               p.JSONInteger                 `json:"batchSequence"`
+		DeliveryPolicy              p.DeliveryPolicy              `json:"deliveryPolicy"`
+		Extensions                  *map[string]any               `json:"extensions,omitempty"`
+	}{record.SchemaVersion, record.ReconciliationID, record.ActionID, record.RequestID, record.DecisionID,
+		record.CorrelationID, record.AuthorizationIdempotencyKey, record.ClientID, record.Action, record.TargetKind,
+		record.ClientScopeHash, record.AuthoritativeScopeHash, record.Outcome, record.ReasonCode, record.ObservedAt,
+		record.BatchID, record.BatchSequence, record.DeliveryPolicy, record.Extensions}
+	wire, err := json.Marshal(body)
+	if err != nil {
+		return "", ErrUnsafeRecord
+	}
+	canonical, err := normalize.CanonicalJSON(wire)
+	if err != nil {
+		return "", ErrUnsafeRecord
+	}
+	sum := sha256.Sum256(canonical)
+	return p.SHA256Digest("sha256:" + hex.EncodeToString(sum[:])), nil
+}
+
+func NewReceipt(record p.ReconciliationRecord, id p.ReceiptID, at time.Time, binding Binding, clientID string) (Receipt, error) {
+	if !validBinding(binding) || !receiptID.MatchString(string(id)) || clientID != record.ClientID ||
+		at.IsZero() || at.Before(timeMust(record.LastAttemptAt)) {
+		return Receipt{}, ErrRejected
+	}
+	hash, err := evidenceHash(record)
+	if err != nil {
+		return Receipt{}, err
+	}
+	return Receipt{ReceiptID: id, ReconciliationID: record.ReconciliationID, EvidenceHash: hash,
+		AcknowledgedAt: p.RFC3339Timestamp(at.UTC().Format(time.RFC3339Nano)), Tenant: binding.Tenant, ClientID: clientID}, nil
+}
+
+func timeMust(value *p.RFC3339Timestamp) time.Time {
+	if value == nil {
+		return time.Time{}
+	}
+	result, _ := time.Parse(time.RFC3339Nano, string(*value))
+	return result
+}
+
+func retryDelay(record p.ReconciliationRecord, jitter func(time.Duration) time.Duration) (time.Duration, error) {
+	if record.AttemptCount < 1 {
+		return 0, ErrUnsafeRecord
+	}
+	exp := math.Min(float64(record.AttemptCount-1), 62)
+	base := time.Duration(record.DeliveryPolicy.BaseDelaySeconds) * time.Second
+	maximum := time.Duration(record.DeliveryPolicy.MaxDelaySeconds) * time.Second
+	delay := time.Duration(float64(base) * math.Pow(2, exp))
+	if delay > maximum || delay < 0 {
+		delay = maximum
+	}
+	extra := jitter(delay)
+	if extra < 0 || extra > maximum-delay {
+		return 0, ErrUnsafeRecord
+	}
+	return delay + extra, nil
+}
+
+func safeError(err error) error {
+	switch {
+	case err == nil:
+		return nil
+	case errors.Is(err, context.Canceled):
+		return context.Canceled
+	case errors.Is(err, context.DeadlineExceeded):
+		return context.DeadlineExceeded
+	case errors.Is(err, ErrTransport):
+		return ErrTransport
+	case errors.Is(err, ErrRejected):
+		return ErrRejected
+	default:
+		return fmt.Errorf("%w", ErrTransport)
+	}
+}
