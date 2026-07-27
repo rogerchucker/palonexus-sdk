@@ -251,3 +251,9 @@ guard/internal/daemon/running_executable_darwin.go,rogerchucker/palonexus-sdk,WO
 guard/internal/daemon/running_executable_linux.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/running_executable_linux.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/daemon/started_process_darwin.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/started_process_darwin.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/daemon/started_process_linux.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/started_process_linux.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/cli/plugin_command.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/cli/plugin_command.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/plugin/install.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/plugin/install.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/plugin/install_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/plugin/install_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/plugin/native.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/plugin/native.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/plugin/native_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/plugin/native_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/cli/status_command.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/cli/status_command.go,PaloNexus,yes,new,MIT,rogerchucker

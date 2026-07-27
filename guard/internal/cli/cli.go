@@ -82,6 +82,11 @@ func RunWithDaemonIO(
 		return 0
 	}
 	if args[0] == "--version" {
+		if len(args) == 2 && args[1] == "--json" {
+			_, _ = fmt.Fprintf(stdout,
+				"{\"name\":\"palonexus\",\"version\":%q,\"protocolVersion\":\"1.0\"}\n", Version)
+			return 0
+		}
 		if len(args) != 1 {
 			return invalidArguments(stderr, "")
 		}
@@ -93,6 +98,9 @@ func RunWithDaemonIO(
 	if _, ok := commands[command]; !ok {
 		_, _ = io.WriteString(stderr, "palonexus: unknown command\n")
 		return 2
+	}
+	if command == "plugin" && len(args) > 1 {
+		return runPluginCommand(args[1:], stdout, stderr)
 	}
 	if len(args) == 2 && (args[1] == "-h" || args[1] == "--help") {
 		_, _ = fmt.Fprintf(stdout, "Usage: palonexus %s\n", command)
@@ -126,6 +134,9 @@ func RunWithDaemonIO(
 	if command == "guard" && len(args) == 3 && daemon != nil &&
 		args[1] == "check" && args[2] == "--one-shot" {
 		return daemonCheck(ctx, stdin, stdout, stderr, daemon, true)
+	}
+	if command == "status" && len(args) > 1 {
+		return runStatusCommand(args[1:], stdout, stderr)
 	}
 	if len(args) != 1 {
 		return invalidArguments(stderr, command)
