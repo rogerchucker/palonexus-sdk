@@ -5,6 +5,7 @@ package reconcile
 import (
 	"bytes"
 	"context"
+	"encoding/hex"
 	"encoding/json"
 	"encoding/pem"
 	"errors"
@@ -1036,6 +1037,28 @@ func TestEnqueueCapacityAndFaultRecoverAtomically(t *testing.T) {
 	if err = q.Enqueue(context.Background(), b1, pending()); err == nil {
 		t.Fatal("fault ignored")
 	}
+	q.impl.(*unixQueue).afterCheckpointCreate = nil
+	conflicting := batchRecord(0, '1')
+	if err = q.Enqueue(context.Background(), b1, conflicting); !errors.Is(err, ErrConflict) {
+		t.Fatalf("same handle did not recover/fence journal: %v", err)
+	}
+	if got, getErr := q.Get(context.Background(), b1, pending().ReconciliationID); getErr != nil ||
+		got.ReconciliationID != pending().ReconciliationID {
+		t.Fatalf("same-handle recovery lost original: %#v %v", got, getErr)
+	}
+	entries, listErr := os.ReadDir(root)
+	if listErr != nil {
+		t.Fatal(listErr)
+	}
+	transactionCount := 0
+	for _, entry := range entries {
+		if isTransactionName(entry.Name()) {
+			transactionCount++
+		}
+	}
+	if transactionCount != 0 {
+		t.Fatalf("repeated recovery left %d journals", transactionCount)
+	}
 	_ = q.Close()
 	q, err = Open(config)
 	if err != nil {
@@ -1111,6 +1134,101 @@ func TestImmutableRootLockCannotBeBypassedByReplacingMetadataLock(t *testing.T) 
 	defer cancel()
 	if err = q.Enqueue(ctx, b1, pending()); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("replaceable metadata lock bypassed root inode lock: %v", err)
+	}
+}
+
+func TestTransactionRemovalPreservesReplacementAndReportsAmbiguity(t *testing.T) {
+	root := queueRoot(t)
+	q, err := Open(Config{Root: root, MaxRecords: 8, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	replacement := []byte(`{"replacement":"must-not-be-unlinked"}`)
+	impl := q.impl.(*unixQueue)
+	impl.beforeTransactionRemove = func(name string) error {
+		impl.beforeTransactionRemove = nil
+		path := filepath.Join(root, name)
+		if err := os.Rename(path, filepath.Join(root, ".captured-original")); err != nil {
+			return err
+		}
+		return os.WriteFile(path, replacement, 0o600)
+	}
+	if err = q.Enqueue(context.Background(), b1, pending()); !errors.Is(err, ErrDurabilityIndeterminate) {
+		t.Fatalf("replacement race was not ambiguous: %v", err)
+	}
+	entries, err := os.ReadDir(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	found := false
+	for _, entry := range entries {
+		if !strings.HasPrefix(entry.Name(), ".done-") {
+			continue
+		}
+		document, readErr := os.ReadFile(filepath.Join(root, entry.Name()))
+		if readErr != nil {
+			t.Fatal(readErr)
+		}
+		if bytes.Equal(document, replacement) {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatal("replacement transaction was deleted")
+	}
+}
+
+func TestCraftedEnqueueJournalCannotCreateSequenceGapBeforeFailing(t *testing.T) {
+	root := queueRoot(t)
+	q, err := Open(Config{Root: root, MaxRecords: 8, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	first := batchRecord(0, '0')
+	if err = q.Enqueue(context.Background(), b1, first); err != nil {
+		t.Fatal(err)
+	}
+	impl := q.impl.(*unixQueue)
+	checkpoint, err := impl.readCheckpoint(first.BatchID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	gapped := batchRecord(2, '2')
+	hash, err := evidenceHash(gapped)
+	if err != nil {
+		t.Fatal(err)
+	}
+	env := diskEnvelope{Version: envelopeVersion, TenantHash: hashBinding(b1, true),
+		SubjectHash: hashBinding(b1, false), EvidenceHash: hash, Record: gapped}
+	transaction := batchTransaction{
+		Version: envelopeVersion, Operation: "enqueue", RecordName: recordName(gapped.ReconciliationID),
+		CheckpointName: checkpointName(gapped.BatchID), OldCheckpointDigest: hex.EncodeToString(checkpoint.digest[:]),
+		NewEnvelope: env, NewCheckpoint: checkpoint,
+	}
+	document, _ := json.Marshal(transaction)
+	name := ".txn-00000000000000000000000000000001"
+	if err = impl.atomicWrite(context.Background(), name, document, nil); err != nil {
+		t.Fatal(err)
+	}
+	persisted, snapshot, err := impl.readSafeFile(name, maxTransactionBytes)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parsed, err := decodeBatchTransaction(persisted)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = impl.applyTransaction(context.Background(), name, parsed, snapshot); !errors.Is(err, ErrConflict) {
+		t.Fatalf("crafted gap journal accepted: %v", err)
+	}
+	if _, err = impl.read(recordName(gapped.ReconciliationID)); !errors.Is(err, ErrNotFound) {
+		t.Fatalf("crafted record mutated queue before rejection: %v", err)
+	}
+	after, err := impl.readCheckpoint(first.BatchID)
+	if err != nil || after.digest != checkpoint.digest {
+		t.Fatalf("checkpoint mutated before rejection: %v", err)
 	}
 }
 

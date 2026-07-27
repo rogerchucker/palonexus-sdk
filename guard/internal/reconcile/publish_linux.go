@@ -30,3 +30,13 @@ func publishAtomic(dirFD int, temporary, target string, expected *diskEnvelope) 
 	}
 	return nil
 }
+
+func quarantineAtomicNoReplace(dirFD int, source, target string) error {
+	if err := unix.Renameat2(dirFD, source, dirFD, target, unix.RENAME_NOREPLACE); err != nil {
+		if errors.Is(err, unix.EEXIST) {
+			return ErrConflict
+		}
+		return ErrUnsafePath
+	}
+	return nil
+}

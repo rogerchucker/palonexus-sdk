@@ -72,16 +72,18 @@ type fileSnapshot struct {
 }
 
 type unixQueue struct {
-	rootFD                 int
-	root                   string
-	rootDev                uint64
-	rootIno                uint64
-	config                 Config
-	lifecycle              sync.RWMutex
-	mu                     sync.Mutex
-	closed                 bool
-	afterTransactionRecord func() error
-	afterCheckpointCreate  func() error
+	rootFD                  int
+	root                    string
+	rootDev                 uint64
+	rootIno                 uint64
+	config                  Config
+	lifecycle               sync.RWMutex
+	mu                      sync.Mutex
+	closed                  bool
+	needsRecovery           bool
+	afterTransactionRecord  func() error
+	afterCheckpointCreate   func() error
+	beforeTransactionRemove func(string) error
 }
 
 var rootCoordinators sync.Map
@@ -258,6 +260,21 @@ func (q *unixQueue) withLock(ctx context.Context, fn func() error) error {
 		before.Dev != after.Dev || before.Ino != after.Ino {
 		return ErrUnsafePath
 	}
+	// Every operation fences journals first, including journals left by another
+	// process or by an earlier ambiguous call on this still-open handle.
+	if err := q.recoverTransactions(ctx); err != nil {
+		return err
+	}
+	if err := q.validateAll(); err != nil {
+		return err
+	}
+	if err := q.reconcileCheckpoints(ctx); err != nil {
+		return err
+	}
+	if err := q.validateAllBatchGroups(); err != nil {
+		return err
+	}
+	q.clearRecoveryNeeded()
 	if err := fn(); err != nil {
 		return err
 	}
@@ -1357,11 +1374,20 @@ func (q *unixQueue) commitBatchTransaction(ctx context.Context, env diskEnvelope
 	if err := q.atomicWrite(ctx, name, document, nil); err != nil {
 		return err
 	}
-	_, snapshot, err := q.readSafeFile(name, maxTransactionBytes)
+	q.markRecoveryNeeded()
+	persisted, snapshot, err := q.readSafeFile(name, maxTransactionBytes)
 	if err != nil {
 		return err
 	}
-	return q.applyTransaction(ctx, name, transaction, snapshot)
+	transaction, err = decodeBatchTransaction(persisted)
+	if err != nil {
+		return err
+	}
+	if err := q.applyTransaction(ctx, name, transaction, snapshot); err != nil {
+		return err
+	}
+	q.clearRecoveryNeeded()
+	return nil
 }
 
 func (q *unixQueue) commitEnqueueTransaction(ctx context.Context, transaction batchTransaction) error {
@@ -1377,11 +1403,43 @@ func (q *unixQueue) commitEnqueueTransaction(ctx context.Context, transaction ba
 	if err := q.atomicWrite(ctx, name, document, nil); err != nil {
 		return err
 	}
-	_, snapshot, err := q.readSafeFile(name, maxTransactionBytes)
+	q.markRecoveryNeeded()
+	persisted, snapshot, err := q.readSafeFile(name, maxTransactionBytes)
 	if err != nil {
 		return err
 	}
-	return q.applyTransaction(ctx, name, transaction, snapshot)
+	transaction, err = decodeBatchTransaction(persisted)
+	if err != nil {
+		return err
+	}
+	if err := q.applyTransaction(ctx, name, transaction, snapshot); err != nil {
+		return err
+	}
+	q.clearRecoveryNeeded()
+	return nil
+}
+
+func (q *unixQueue) markRecoveryNeeded() {
+	q.mu.Lock()
+	q.needsRecovery = true
+	q.mu.Unlock()
+}
+
+func (q *unixQueue) clearRecoveryNeeded() {
+	q.mu.Lock()
+	q.needsRecovery = false
+	q.mu.Unlock()
+}
+
+func decodeBatchTransaction(document []byte) (batchTransaction, error) {
+	var transaction batchTransaction
+	decoder := json.NewDecoder(bytes.NewReader(document))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&transaction) != nil || decoder.Decode(&struct{}{}) != io.EOF ||
+		transaction.Version != envelopeVersion {
+		return batchTransaction{}, ErrCorrupt
+	}
+	return transaction, nil
 }
 
 func (q *unixQueue) recoverTransactions(ctx context.Context) error {
@@ -1408,17 +1466,15 @@ func (q *unixQueue) recoverTransactions(ctx context.Context) error {
 			}
 			return readErr
 		}
-		var transaction batchTransaction
-		decoder := json.NewDecoder(bytes.NewReader(document))
-		decoder.DisallowUnknownFields()
-		if decoder.Decode(&transaction) != nil || decoder.Decode(&struct{}{}) != io.EOF || transaction.Version != envelopeVersion {
+		transaction, decodeErr := decodeBatchTransaction(document)
+		if decodeErr != nil {
 			if quarantineErr := q.quarantine(name); quarantineErr != nil {
 				return errors.Join(ErrCorrupt, quarantineErr)
 			}
 			continue
 		}
 		if err := q.applyTransaction(ctx, name, transaction, snapshot); err != nil {
-			if errors.Is(err, ErrCorrupt) {
+			if errors.Is(err, ErrCorrupt) || errors.Is(err, ErrConflict) {
 				if quarantineErr := q.quarantine(name); quarantineErr != nil {
 					return errors.Join(err, quarantineErr)
 				}
@@ -1554,6 +1610,9 @@ func (q *unixQueue) applyEnqueueTransaction(ctx context.Context, name string, tr
 	if err != nil || hash != transaction.NewEnvelope.EvidenceHash {
 		return ErrCorrupt
 	}
+	if err := q.validateEnqueueTransactionAuthority(transaction); err != nil {
+		return err
+	}
 	checkpointWire, err := json.Marshal(transaction.NewCheckpoint)
 	if err != nil || len(checkpointWire) > q.config.MaxRecordBytes {
 		return ErrCorrupt
@@ -1595,12 +1654,125 @@ func (q *unixQueue) applyEnqueueTransaction(ctx context.Context, name string, tr
 	return q.finishTransaction(name, snapshot)
 }
 
+// validateEnqueueTransactionAuthority fences a syntactically valid journal
+// against the current authoritative batch state before either target is
+// written. A crafted journal cannot create a gap, cross an ownership
+// partition, or reuse a sequence for different evidence.
+func (q *unixQueue) validateEnqueueTransactionAuthority(transaction batchTransaction) error {
+	candidate := transaction.NewEnvelope
+	candidateWire, err := json.Marshal(candidate)
+	if err != nil {
+		return ErrCorrupt
+	}
+	candidateDigest := sha256.Sum256(candidateWire)
+	checkpoint, checkpointErr := q.readCheckpointByName(transaction.CheckpointName)
+	if checkpointErr != nil && !errors.Is(checkpointErr, ErrNotFound) {
+		return checkpointErr
+	}
+	if checkpointErr == nil {
+		newCheckpointWire, marshalErr := json.Marshal(transaction.NewCheckpoint)
+		if marshalErr != nil {
+			return ErrCorrupt
+		}
+		checkpointWasCreated := transaction.OldCheckpointDigest == "" &&
+			checkpoint.digest == sha256.Sum256(newCheckpointWire) &&
+			checkpoint.ExpectedNextSequence == 0
+		checkpointWasExisting := transaction.OldCheckpointDigest != "" &&
+			transaction.OldCheckpointDigest == hex.EncodeToString(checkpoint.digest[:])
+		if (!checkpointWasCreated && !checkpointWasExisting) ||
+			checkpoint.BatchID != candidate.Record.BatchID ||
+			checkpoint.ExpectedNextSequence != transaction.NewCheckpoint.ExpectedNextSequence ||
+			len(checkpoint.CompletedPrefix) != len(transaction.NewCheckpoint.CompletedPrefix) {
+			return ErrConflict
+		}
+		for key, entry := range checkpoint.CompletedPrefix {
+			if transaction.NewCheckpoint.CompletedPrefix[key] != entry {
+				return ErrConflict
+			}
+		}
+	} else if transaction.OldCheckpointDigest != "" ||
+		transaction.NewCheckpoint.ExpectedNextSequence != 0 ||
+		len(transaction.NewCheckpoint.CompletedPrefix) != 0 {
+		return ErrConflict
+	}
+
+	names, err := q.names()
+	if err != nil {
+		return err
+	}
+	maxSequence := p.JSONInteger(-1)
+	candidateAlreadyPublished := false
+	for _, recordFile := range names {
+		current, readErr := q.read(recordFile)
+		if readErr != nil {
+			return readErr
+		}
+		if current.Record.BatchID != candidate.Record.BatchID {
+			continue
+		}
+		if current.TenantHash != candidate.TenantHash || current.SubjectHash != candidate.SubjectHash {
+			return ErrConflict
+		}
+		if current.Record.ReconciliationID == candidate.Record.ReconciliationID {
+			if current.digest != candidateDigest || current.EvidenceHash != candidate.EvidenceHash {
+				return ErrConflict
+			}
+			candidateAlreadyPublished = true
+		} else if current.Record.BatchSequence == candidate.Record.BatchSequence {
+			return ErrConflict
+		}
+		if current.Record.State == p.ReconciliationStateDiscarded {
+			return ErrConflict
+		}
+		if current.Record.BatchSequence > maxSequence {
+			maxSequence = current.Record.BatchSequence
+		}
+	}
+	expected := p.JSONInteger(0)
+	if checkpointErr == nil {
+		expected = checkpoint.ExpectedNextSequence
+	}
+	if maxSequence >= expected {
+		expected = maxSequence + 1
+	}
+	if candidateAlreadyPublished {
+		if candidate.Record.BatchSequence >= expected {
+			return ErrConflict
+		}
+		return nil
+	}
+	if candidate.Record.BatchSequence != expected {
+		return ErrConflict
+	}
+	return nil
+}
+
 func (q *unixQueue) finishTransaction(name string, snapshot fileSnapshot) error {
 	_, currentSnapshot, readErr := q.readSafeFile(name, maxTransactionBytes)
 	if readErr != nil || currentSnapshot != snapshot {
 		return ErrDurabilityIndeterminate
 	}
-	if unix.Unlinkat(q.rootFD, name, 0) != nil {
+	if q.beforeTransactionRemove != nil {
+		if err := q.beforeTransactionRemove(name); err != nil {
+			return err
+		}
+	}
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return ErrUnsafePath
+	}
+	quarantined := ".done-" + hex.EncodeToString(token[:])
+	if err := quarantineAtomicNoReplace(q.rootFD, name, quarantined); err != nil {
+		return err
+	}
+	if unix.Fsync(q.rootFD) != nil {
+		return ErrDurabilityIndeterminate
+	}
+	_, movedSnapshot, readErr := q.readSafeFile(quarantined, maxTransactionBytes)
+	if readErr != nil || movedSnapshot != snapshot {
+		return ErrDurabilityIndeterminate
+	}
+	if unix.Unlinkat(q.rootFD, quarantined, 0) != nil {
 		return ErrUnsafePath
 	}
 	if unix.Fsync(q.rootFD) != nil {
