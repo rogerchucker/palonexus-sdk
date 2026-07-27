@@ -80,7 +80,11 @@ locked distribution without contacting the network.
 | filetype | 1.2.0 | MIT | reviewed | Retain supplied license | None supplied | PyPI |
 | google-auth | 2.56.2 | Apache-2.0 | reviewed | Retain supplied license | None supplied | PyPI |
 | google-genai | 2.14.0 | Apache-2.0 | reviewed | Retain supplied license | None supplied | PyPI |
+| github.com/keybase/dbus | v0.0.0-20220506165403-5aa21ea2c23a | BSD-2-Clause | reviewed | Retain supplied license and copyright notices | None supplied | Go module proxy |
+| github.com/keybase/go-keychain | v0.0.1 | MIT | reviewed | Retain supplied license and copyright notices | None supplied | Go module proxy |
+| golang.org/x/crypto | v0.54.0 | BSD-3-Clause | reviewed | Retain supplied license and copyright notices | None supplied | Go module proxy |
 | golang.org/x/net | v0.57.0 | BSD-3-Clause | reviewed | Retain supplied license and copyright notices | None supplied | Go module proxy |
+| golang.org/x/sys | v0.47.0 | BSD-3-Clause | reviewed | Retain supplied license and copyright notices | None supplied | Go module proxy |
 | golang.org/x/text | v0.40.0 | BSD-3-Clause | reviewed | Retain supplied license and copyright notices | None supplied | Go module proxy |
 | hatch-vcs | 0.5.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | hatchling | 1.31.0 | MIT | reviewed | Retain notices | None identified | PyPI |

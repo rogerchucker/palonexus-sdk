@@ -22,6 +22,18 @@ uv run ruff check .
 See [CONTRIBUTING.md](CONTRIBUTING.md) before submitting a change. Security
 reports follow the private process in [SECURITY.md](SECURITY.md).
 
+### Local guard credential storage
+
+The local guard supports macOS and Linux. It stores credentials in the macOS
+Keychain through Security.framework or in an unlocked Linux Secret Service
+collection through an encrypted D-Bus session. A missing or locked native
+store fails closed; the guard does not prompt, shell out with secrets, or fall
+back to plaintext storage. Other operating systems are currently unsupported.
+
+An AES-GCM file backend exists only for isolated tests. It is disabled unless
+the caller uses the explicit testing-only constructor flag and is never
+selected by native backend discovery.
+
 ## License
 
 Source code is licensed under the MIT License. PaloNexus names and logos are
