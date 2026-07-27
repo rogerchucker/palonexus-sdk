@@ -2,6 +2,14 @@
 """Public PaloNexus Python SDK API."""
 
 from .context import atask, task
+from .credentials import (
+    AsyncCredentialProvider,
+    Credential,
+    CredentialAcquisitionCancelled,
+    CredentialUnavailable,
+    InvalidCredentialDeadline,
+    SyncCredentialProvider,
+)
 from .errors import (
     ApprovalExpired,
     ApprovalRequired,
@@ -20,6 +28,15 @@ from .errors import (
 )
 from .models import ActionRequest, ActionTarget, DecisionOutcome, TaskContext
 from .protocol import ActionRequestBuilder
+from .redaction import Redactor
+from .retry import (
+    CompletionState,
+    RetryDecision,
+    RetryFailure,
+    RetryPolicy,
+    RetryPolicyError,
+    RetryReason,
+)
 
 __all__ = [
     "ActionRequest",
@@ -28,17 +45,30 @@ __all__ = [
     "ApprovalExpired",
     "ApprovalRequired",
     "ApprovalScopeMismatch",
+    "AsyncCredentialProvider",
     "AuthenticationFailed",
     "AuthorizationUnavailable",
+    "CompletionState",
+    "Credential",
+    "CredentialAcquisitionCancelled",
+    "CredentialUnavailable",
     "CredentialRevoked",
     "DecisionOutcome",
     "IdempotencyConflict",
     "InvalidDecision",
+    "InvalidCredentialDeadline",
     "InvalidRequest",
     "MissingIdentity",
     "ModelValidationError",
     "PaloNexusError",
     "PolicyDenied",
+    "Redactor",
+    "RetryDecision",
+    "RetryFailure",
+    "RetryPolicy",
+    "RetryPolicyError",
+    "RetryReason",
+    "SyncCredentialProvider",
     "TaskContext",
     "UnsupportedProtocol",
     "atask",
