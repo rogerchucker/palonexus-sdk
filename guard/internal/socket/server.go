@@ -48,6 +48,7 @@ func (err *CloseError) Error() string {
 func (err *CloseError) Unwrap() error { return err.Err }
 
 var ErrRecoveryAmbiguous = errors.New("socket: recovery requires manual cleanup")
+var ErrProbeUntrusted = errors.New("socket: peer readiness could not be proven")
 
 type RecoveryAmbiguousError struct {
 	Artifact string
@@ -544,12 +545,28 @@ const (
 )
 
 func probeGuard(path string, timeout time.Duration) probeResult {
+	_, result := probeGuardPID(path, timeout)
+	return result
+}
+
+// Probe verifies that path reaches a live PaloNexus guard owned by the current
+// user and returns the kernel-authenticated peer PID. It never classifies a
+// malformed, unreachable, or wrong-user peer as ready.
+func Probe(path string, timeout time.Duration) (int, error) {
+	pid, result := probeGuardPID(path, timeout)
+	if result != probeActive {
+		return 0, ErrProbeUntrusted
+	}
+	return pid, nil
+}
+
+func probeGuardPID(path string, timeout time.Duration) (int, probeResult) {
 	if timeout <= 0 || timeout > time.Second {
 		timeout = time.Second
 	}
 	var nonce [32]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
-		return probeAmbiguous
+		return 0, probeAmbiguous
 	}
 	value := base64.RawURLEncoding.EncodeToString(nonce[:])
 	request, _ := json.Marshal(map[string]string{challengeField: value})
@@ -558,40 +575,40 @@ func probeGuard(path string, timeout time.Duration) probeResult {
 	if err != nil {
 		var operation *net.OpError
 		if errors.As(err, &operation) && errors.Is(operation.Err, syscall.ECONNREFUSED) {
-			return probeRefused
+			return 0, probeRefused
 		}
-		return probeAmbiguous
+		return 0, probeAmbiguous
 	}
 	defer conn.Close()
 	uid, err := peerUID(conn)
 	if err != nil || uid != currentUID() {
-		return probeAmbiguous
+		return 0, probeAmbiguous
 	}
 	connectedPID, err := peerPID(conn)
 	if err != nil || connectedPID <= 0 {
-		return probeAmbiguous
+		return 0, probeAmbiguous
 	}
 	_ = conn.SetDeadline(time.Now().Add(timeout))
 	if _, err := conn.Write(request); err != nil {
-		return probeAmbiguous
+		return 0, probeAmbiguous
 	}
 	response, err := bufio.NewReaderSize(conn, 256).ReadBytes('\n')
 	if err != nil || len(response) > 256 || len(response) < 2 ||
 		response[len(response)-1] != '\n' {
-		return probeAmbiguous
+		return 0, probeAmbiguous
 	}
 	object, err := decodeTopLevelObject(response[:len(response)-1])
 	if err != nil || len(object) != 2 {
-		return probeAmbiguous
+		return 0, probeAmbiguous
 	}
 	var returned string
 	var claimedPID int
 	if json.Unmarshal(object[challengeField], &returned) != nil ||
 		json.Unmarshal(object[challengePIDField], &claimedPID) != nil ||
 		returned != value || claimedPID <= 0 || claimedPID != connectedPID {
-		return probeAmbiguous
+		return 0, probeAmbiguous
 	}
-	return probeActive
+	return connectedPID, probeActive
 }
 
 func challengeResponse(frame []byte) ([]byte, bool) {

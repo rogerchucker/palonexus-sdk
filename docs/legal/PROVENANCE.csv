@@ -234,3 +234,8 @@ guard/internal/socket/runtime_unix.go,rogerchucker/palonexus-sdk,WORKTREE,guard/
 guard/internal/socket/runtime_unsupported.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/socket/runtime_unsupported.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/socket/server.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/socket/server.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/socket/server_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/socket/server_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/daemon/autostart.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/autostart.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/daemon/daemon.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/daemon.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/daemon/daemon_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/daemon_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/daemon/process_darwin.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/process_darwin.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/daemon/process_linux.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/process_linux.go,PaloNexus,yes,new,MIT,rogerchucker
