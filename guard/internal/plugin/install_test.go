@@ -26,10 +26,14 @@ type fakeNative struct {
 	mu           sync.Mutex
 	target       Target
 	version      string
+	guardVersion string
 	hostVersion  string
 	marketplace  string
 	home         string
+	primaryHome  string
 	installed    bool
+	enabled      bool
+	nativeErrors []string
 	commands     []NativeCommand
 	failAt       int
 	failContains string
@@ -39,10 +43,15 @@ func (f *fakeNative) Run(_ context.Context, command NativeCommand) ([]byte, erro
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.commands = append(f.commands, command)
+	commandHome := ""
 	for _, variable := range command.Env {
 		if strings.HasPrefix(variable, "HOME=") {
-			f.home = strings.TrimPrefix(variable, "HOME=")
+			commandHome = strings.TrimPrefix(variable, "HOME=")
 		}
+	}
+	isPrimary := commandHome == f.primaryHome
+	if isPrimary {
+		f.home = commandHome
 	}
 	if f.failAt > 0 && len(f.commands) == f.failAt {
 		return nil, errors.New("native failure")
@@ -54,11 +63,14 @@ func (f *fakeNative) Run(_ context.Context, command NativeCommand) ([]byte, erro
 	}
 	if args == "--version --json" {
 		return []byte(fmt.Sprintf(
-			`{"name":"palonexus","version":%q,"protocolVersion":"1.0"}`, f.version,
+			`{"name":"palonexus","version":%q,"protocolVersion":"1.0"}`, f.guardVersion,
 		)), nil
 	}
 	if args == "status --json" {
-		return []byte(`{"authenticated":false,"ready":true}`), nil
+		return []byte(fmt.Sprintf(
+			`{"name":"palonexus","version":%q,"protocolVersion":"1.0","authenticated":false,"ready":true,"loginRequired":true}`,
+			f.guardVersion,
+		)), nil
 	}
 	if args == "--version" {
 		if f.target == ClaudeCode {
@@ -73,6 +85,9 @@ func (f *fakeNative) Run(_ context.Context, command NativeCommand) ([]byte, erro
 		return []byte("codex-cli 0.145.0\n"), nil
 	}
 	if strings.Contains(args, "marketplace add") {
+		if !isPrimary {
+			return []byte(`{}`), nil
+		}
 		f.marketplace = command.Args[len(command.Args)-1]
 		if data, err := os.ReadFile(filepath.Join(f.marketplace, markerName)); err == nil {
 			var marker ownershipMarker
@@ -83,16 +98,21 @@ func (f *fakeNative) Run(_ context.Context, command NativeCommand) ([]byte, erro
 		return []byte(`{}`), nil
 	}
 	if strings.Contains(args, "marketplace remove") {
+		if !isPrimary {
+			return []byte(`{}`), nil
+		}
 		f.marketplace = ""
 		return []byte(`{}`), nil
 	}
 	if strings.Contains(args, " plugin install ") || strings.HasPrefix(args, "plugin install ") ||
 		strings.Contains(args, "plugin add") {
 		f.installed = true
+		f.enabled = true
 		return []byte(`{}`), nil
 	}
 	if strings.Contains(args, "plugin uninstall") || strings.Contains(args, "plugin remove") {
 		f.installed = false
+		f.enabled = false
 		return []byte(`{}`), nil
 	}
 	if args == "plugin validate --strict "+f.marketplace || strings.HasPrefix(args, "plugin validate --strict ") {
@@ -109,13 +129,32 @@ func (f *fakeNative) Run(_ context.Context, command NativeCommand) ([]byte, erro
 		if f.target == ClaudeCode {
 			pluginPath = filepath.Join(f.home, ".claude", "plugins", "cache", "palonexus-sdk", "palonexus", f.version)
 			return []byte(fmt.Sprintf(
-				`[{"id":"palonexus@palonexus-sdk","version":%q,"scope":"user","installPath":%q}]`,
-				f.version, pluginPath,
+				`[{"id":"palonexus@palonexus-sdk","version":%q,"scope":"user","installPath":%q,"enabled":%t,"errors":%s}]`,
+				f.version, pluginPath, f.enabled, mustJSON(f.nativeErrors),
 			)), nil
 		}
 		return []byte(fmt.Sprintf(
-			`{"installed":[{"pluginId":"palonexus@palonexus-sdk","version":%q,"installed":true,"marketplaceName":"palonexus-sdk","source":{"source":"local","path":%q},"marketplaceSource":{"sourceType":"local","source":%q}}],"available":[]}`,
-			f.version, pluginPath, f.marketplace,
+			`{"installed":[{"pluginId":"palonexus@palonexus-sdk","version":%q,"installed":true,"enabled":%t,"errors":%s,"marketplaceName":"palonexus-sdk","source":{"source":"local","path":%q},"marketplaceSource":{"sourceType":"local","source":%q}}],"available":[]}`,
+			f.version, f.enabled, mustJSON(f.nativeErrors), pluginPath, f.marketplace,
+		)), nil
+	}
+	if args == "plugin marketplace list --json" {
+		if f.target == ClaudeCode {
+			if f.marketplace == "" {
+				return []byte(`[]`), nil
+			}
+			return []byte(fmt.Sprintf(
+				`[{"name":"palonexus-sdk","source":"directory","path":%q,"installLocation":%q}]`,
+				f.marketplace, f.marketplace,
+			)), nil
+		}
+		if f.marketplace == "" {
+			return []byte(`{"marketplaces":[]}`), nil
+		}
+		return []byte(fmt.Sprintf(
+			`{"marketplaces":[{"name":"palonexus-sdk","root":%q,"marketplaceSource":{"sourceType":"local","source":%q}}]}`,
+			f.marketplace,
+			f.marketplace,
 		)), nil
 	}
 	return []byte(`{}`), nil
@@ -145,9 +184,15 @@ func fixture(t *testing.T, target Target, version string) Options {
 		t.Fatal(err)
 	}
 	pluginManifest := fmt.Sprintf(
-		`{"name":"palonexus","version":%q,"description":"PaloNexus governed actions","license":"MIT","author":{"name":"PaloNexus"},"hooks":"./hooks/hooks.json","skills":"./skills/"}`,
+		`{"name":"palonexus","version":%q,"description":"PaloNexus governed actions","license":"MIT","author":{"name":"PaloNexus"},"skills":"./skills/"}`,
 		version,
 	)
+	if target == Codex {
+		pluginManifest = fmt.Sprintf(
+			`{"name":"palonexus","version":%q,"description":"PaloNexus governed actions","license":"MIT","author":{"name":"PaloNexus"},"hooks":"./hooks/hooks.json","skills":"./skills/"}`,
+			version,
+		)
+	}
 	if err := os.WriteFile(filepath.Join(pluginRoot, manifestDir, "plugin.json"), []byte(pluginManifest), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -161,10 +206,11 @@ func fixture(t *testing.T, target Target, version string) Options {
 	if err := os.MkdirAll(filepath.Join(pluginRoot, "hooks"), 0o755); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(pluginRoot, "hooks", "hooks.json"), []byte(`{"version":1,"guardConfig":"./guard.json"}`), 0o644); err != nil {
-		t.Fatal(err)
+	hooks := `{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"__PALONEXUS_GUARD__","args":["guard","check"],"timeout":30}]}]}}`
+	if target == Codex {
+		hooks = `{"hooks":{"PreToolUse":[{"matcher":".*","hooks":[{"type":"command","command":"'__PALONEXUS_GUARD__' guard check","timeout":30}]}]}}`
 	}
-	if err := os.WriteFile(filepath.Join(pluginRoot, "hooks", "guard.json"), []byte(`{"guardPath":"__PALONEXUS_GUARD__","argv":["guard","check"]}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(pluginRoot, "hooks", "hooks.json"), []byte(hooks), 0o644); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(pluginRoot, "skills"), 0o755); err != nil {
@@ -191,7 +237,7 @@ func fixture(t *testing.T, target Target, version string) Options {
 	if err := os.WriteFile(host, []byte("#!/bin/sh\nexit 0\n"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	runner := &fakeNative{target: target, version: version}
+	runner := &fakeNative{target: target, version: version, guardVersion: version, primaryHome: home}
 	return Options{
 		Home: home, SourceDir: source, GuardPath: guard, HostPath: host,
 		Version: version, Runner: runner,
@@ -205,16 +251,22 @@ func uninstallOptions(options Options) Options {
 func setFixtureVersion(t *testing.T, target Target, options *Options, version string) {
 	t.Helper()
 	options.Version = version
-	options.Runner.(*fakeNative).version = version
+	options.Runner.(*fakeNative).guardVersion = version
 	manifestDirectory := ".claude-plugin"
 	if target == Codex {
 		manifestDirectory = ".codex-plugin"
 	}
 	manifestPath := filepath.Join(options.SourceDir, "plugins", installName, manifestDirectory, "plugin.json")
 	manifest := fmt.Sprintf(
-		`{"name":"palonexus","version":%q,"description":"PaloNexus governed actions","license":"MIT","author":{"name":"PaloNexus"},"hooks":"./hooks/hooks.json","skills":"./skills/"}`,
+		`{"name":"palonexus","version":%q,"description":"PaloNexus governed actions","license":"MIT","author":{"name":"PaloNexus"},"skills":"./skills/"}`,
 		version,
 	)
+	if target == Codex {
+		manifest = fmt.Sprintf(
+			`{"name":"palonexus","version":%q,"description":"PaloNexus governed actions","license":"MIT","author":{"name":"PaloNexus"},"hooks":"./hooks/hooks.json","skills":"./skills/"}`,
+			version,
+		)
+	}
 	if err := os.WriteFile(manifestPath, []byte(manifest), 0o644); err != nil {
 		t.Fatal(err)
 	}
@@ -428,7 +480,53 @@ func TestRollbackRestoresExactPreviousPlugin(t *testing.T) {
 			if before != after {
 				t.Fatalf("rollback mismatch\nbefore=%s\nafter=%s", before, after)
 			}
+			runner := options.Runner.(*fakeNative)
+			if !runner.installed || runner.version != "1.0.0" ||
+				!sameCanonicalPath(runner.marketplace, result.Path) {
+				t.Fatalf("native rollback mismatch at %s: %#v", boundary, runner)
+			}
 		})
+	}
+}
+
+func TestMarkerlessUninstallNeverTouchesNativeState(t *testing.T) {
+	options := fixture(t, ClaudeCode, "1.0.0")
+	runner := options.Runner.(*fakeNative)
+	runner.installed = true
+	runner.enabled = true
+	runner.marketplace = filepath.Join(options.Home, "foreign-marketplace")
+	beforeCommands := len(runner.commands)
+	result, err := Uninstall(context.Background(), ClaudeCode, uninstallOptions(options))
+	if err != nil || result.Changed {
+		t.Fatalf("markerless uninstall = %#v, %v", result, err)
+	}
+	if len(runner.commands) != beforeCommands+1 { // host capability probe only
+		t.Fatalf("markerless uninstall invoked native mutation: %#v", runner.commands[beforeCommands:])
+	}
+	if !runner.installed || runner.marketplace == "" {
+		t.Fatal("markerless uninstall changed foreign native state")
+	}
+}
+
+func TestFreshInstallRejectsForeignNativeRegistrationWithoutMutation(t *testing.T) {
+	options := fixture(t, Codex, "1.0.0")
+	runner := options.Runner.(*fakeNative)
+	runner.installed = true
+	runner.enabled = true
+	runner.version = "9.9.9"
+	runner.marketplace = filepath.Join(options.Home, "foreign-marketplace")
+	if _, err := Install(context.Background(), Codex, options); err == nil {
+		t.Fatal("foreign native registration was replaced")
+	}
+	if !runner.installed || runner.version != "9.9.9" ||
+		runner.marketplace != filepath.Join(options.Home, "foreign-marketplace") {
+		t.Fatalf("foreign native registration mutated: %#v", runner)
+	}
+	for _, command := range runner.commands {
+		args := strings.Join(command.Args, " ")
+		if strings.Contains(args, "plugin remove") || strings.Contains(args, "marketplace remove") {
+			t.Fatalf("foreign native state removal attempted: %q", args)
+		}
 	}
 }
 
@@ -506,7 +604,10 @@ func TestCrashRecoveryRestoresInstallAndCompletesUninstall(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(filepath.Join(parent, journalName),
-			mustJSON(transactionJournal{Schema: 1, Operation: "install"}), 0o600); err != nil {
+			mustJSON(transactionJournal{
+				Schema: 1, Operation: "install", Phase: "local-prepared",
+				PreviousVersion: "1.0.0", NextVersion: "2.0.0",
+			}), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		recovered, err := Install(context.Background(), Codex, options)
@@ -532,7 +633,10 @@ func TestCrashRecoveryRestoresInstallAndCompletesUninstall(t *testing.T) {
 			t.Fatal(err)
 		}
 		if err := os.WriteFile(filepath.Join(parent, journalName),
-			mustJSON(transactionJournal{Schema: 1, Operation: "uninstall"}), 0o600); err != nil {
+			mustJSON(transactionJournal{
+				Schema: 1, Operation: "uninstall", Phase: "native-complete",
+				PreviousVersion: "1.0.0",
+			}), 0o600); err != nil {
 			t.Fatal(err)
 		}
 		recovered, err := Uninstall(context.Background(), ClaudeCode, uninstallOptions(options))
@@ -641,10 +745,10 @@ func TestStrictPluginAndMarketplaceManifestsFailClosed(t *testing.T) {
 				t.Fatal(err)
 			}
 		}},
-		{"traversal-hook", func(t *testing.T, options Options) {
-			path := filepath.Join(options.SourceDir, "plugins", installName, ".claude-plugin", "plugin.json")
+		{"invalid-hook-command", func(t *testing.T, options Options) {
+			path := filepath.Join(options.SourceDir, "plugins", installName, "hooks", "hooks.json")
 			data, _ := os.ReadFile(path)
-			data = bytes.Replace(data, []byte(`./hooks/hooks.json`), []byte(`../hooks.json`), 1)
+			data = bytes.Replace(data, []byte(`__PALONEXUS_GUARD__`), []byte(`../guard`), 1)
 			if err := os.WriteFile(path, data, 0o644); err != nil {
 				t.Fatal(err)
 			}
@@ -697,8 +801,8 @@ func TestAmbiguousMarkerAndUnjournaledRecoveryArtifactsFailClosed(t *testing.T) 
 
 func TestDuplicateOrTrailingTransactionJournalFailsClosed(t *testing.T) {
 	for _, document := range []string{
-		`{"schema":1,"schema":1,"operation":"install"}`,
-		"{\"schema\":1,\"operation\":\"install\"}\n{}",
+		`{"schema":1,"schema":1,"operation":"install","phase":"local-prepared","nextVersion":"1.0.0"}`,
+		"{\"schema\":1,\"operation\":\"install\",\"phase\":\"local-prepared\",\"nextVersion\":\"1.0.0\"}\n{}",
 	} {
 		options := fixture(t, Codex, "1.0.0")
 		result, err := Install(context.Background(), Codex, options)

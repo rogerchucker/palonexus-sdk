@@ -153,10 +153,16 @@ func guardAuthenticationStatus(ctx context.Context, target Target, options Optio
 		return "unknown"
 	}
 	var status struct {
-		Authenticated bool `json:"authenticated"`
-		Ready         bool `json:"ready"`
+		Name            string `json:"name"`
+		Version         string `json:"version"`
+		ProtocolVersion string `json:"protocolVersion"`
+		Authenticated   bool   `json:"authenticated"`
+		Ready           bool   `json:"ready"`
+		LoginRequired   bool   `json:"loginRequired"`
 	}
-	if decodeStrictDocument(output, &status) != nil {
+	if decodeStrictDocument(output, &status) != nil || status.Name != "palonexus" ||
+		status.Version != options.Version || status.ProtocolVersion != "1.0" ||
+		status.LoginRequired == status.Authenticated {
 		return "unknown"
 	}
 	if status.Authenticated && status.Ready {
@@ -227,20 +233,141 @@ func nativeValidate(ctx context.Context, target Target, options Options, marketp
 		_, err := runNative(ctx, target, options, "plugin", "validate", "--strict", marketplacePath)
 		return err
 	}
-	// Codex 0.145 validates a local marketplace as part of the native
-	// marketplace-add operation; there is no standalone validate subcommand.
-	if _, err := runNative(ctx, target, options, "plugin", "marketplace", "add", "--json", marketplacePath); err != nil {
+	// Codex 0.145 validates only while adding a marketplace. Use a disposable
+	// native home so validation can never replace a live registration.
+	validationHome, err := os.MkdirTemp("", "palonexus-codex-validation-")
+	if err != nil {
+		return errors.New("create Codex validation home")
+	}
+	defer os.RemoveAll(validationHome)
+	if err := os.Chmod(validationHome, 0o700); err != nil {
+		return errors.New("secure Codex validation home")
+	}
+	validationOptions := options
+	validationOptions.Home = validationHome
+	if err := ensureNativeHome(validationHome, Codex); err != nil {
 		return err
 	}
-	if _, err := runNative(ctx, target, options, "plugin", "marketplace", "remove", "palonexus-sdk"); err != nil {
+	if _, err := runNative(ctx, target, validationOptions, "plugin", "marketplace", "add", "--json", marketplacePath); err != nil {
+		return err
+	}
+	if _, err := runNative(ctx, target, validationOptions, "plugin", "marketplace", "remove", "palonexus-sdk"); err != nil {
 		return errors.New("Codex marketplace validation cleanup failed")
 	}
 	return nil
 }
 
-func nativeReplace(ctx context.Context, target Target, options Options, marketplacePath, version string) error {
-	if err := nativeRemove(ctx, target, options, false); err != nil {
+func nativeReplace(
+	ctx context.Context,
+	target Target,
+	options Options,
+	marketplacePath, version, previousVersion string,
+) error {
+	if previousVersion == "" {
+		if err := verifyNativeInstalled(ctx, target, options, "", "", false); err != nil {
+			return errors.New("foreign native plugin registration")
+		}
+		absent, err := nativeMarketplaceAbsent(ctx, target, options)
+		if err != nil || !absent {
+			return errors.New("foreign native marketplace registration")
+		}
+	} else {
+		if err := nativeRemoveOwned(ctx, target, options, marketplacePath, previousVersion); err != nil {
+			return err
+		}
+	}
+	var err error
+	marketplaceAdded := false
+	if target == ClaudeCode {
+		_, err = runNative(ctx, target, options, "plugin", "marketplace", "add", "--scope", "user", marketplacePath)
+		marketplaceAdded = err == nil
+		if err == nil {
+			_, err = runNative(ctx, target, options, "plugin", "install", "--scope", "user", "palonexus@palonexus-sdk")
+		}
+	} else {
+		_, err = runNative(ctx, target, options, "plugin", "marketplace", "add", "--json", marketplacePath)
+		marketplaceAdded = err == nil
+		if err == nil {
+			_, err = runNative(ctx, target, options, "plugin", "add", "--json", "palonexus@palonexus-sdk")
+		}
+	}
+	if err != nil {
+		if marketplaceAdded {
+			_ = nativeRemoveMarketplaceOwned(ctx, target, options, marketplacePath)
+		}
 		return err
+	}
+	return verifyNativeInstalled(ctx, target, options, marketplacePath, version, true)
+}
+
+func nativeRemoveMarketplaceOwned(
+	ctx context.Context,
+	target Target,
+	options Options,
+	marketplacePath string,
+) error {
+	owned, err := nativeMarketplaceOwned(ctx, target, options, marketplacePath)
+	if err != nil || !owned {
+		return errors.New("native marketplace is not owned by PaloNexus")
+	}
+	_, err = runNative(ctx, target, options, "plugin", "marketplace", "remove", marketplaceName)
+	return err
+}
+
+func nativeMarketplaceOwned(
+	ctx context.Context,
+	target Target,
+	options Options,
+	marketplacePath string,
+) (bool, error) {
+	output, err := runNative(ctx, target, options, "plugin", "marketplace", "list", "--json")
+	if err != nil {
+		return false, err
+	}
+	owned := false
+	if target == ClaudeCode {
+		var records []struct {
+			Name            string `json:"name"`
+			Source          string `json:"source"`
+			Path            string `json:"path"`
+			InstallLocation string `json:"installLocation"`
+		}
+		if decodeExactJSON(output, &records) != nil {
+			return false, errors.New("invalid Claude marketplace list")
+		}
+		for _, record := range records {
+			if record.Name == marketplaceName {
+				owned = record.Source == "directory" &&
+					sameCanonicalPath(record.Path, marketplacePath) &&
+					sameCanonicalPath(record.InstallLocation, marketplacePath)
+			}
+		}
+	} else {
+		var document struct {
+			Marketplaces []struct {
+				Name              string `json:"name"`
+				MarketplaceSource struct {
+					SourceType string `json:"sourceType"`
+					Source     string `json:"source"`
+				} `json:"marketplaceSource"`
+			} `json:"marketplaces"`
+		}
+		if decodeExactJSON(output, &document) != nil {
+			return false, errors.New("invalid Codex marketplace list")
+		}
+		for _, record := range document.Marketplaces {
+			if record.Name == marketplaceName {
+				owned = record.MarketplaceSource.SourceType == "local" &&
+					sameCanonicalPath(record.MarketplaceSource.Source, marketplacePath)
+			}
+		}
+	}
+	return owned, nil
+}
+
+func nativeRestore(ctx context.Context, target Target, options Options, marketplacePath, version string) error {
+	if err := verifyNativeInstalled(ctx, target, options, marketplacePath, version, true); err == nil {
+		return nil
 	}
 	var err error
 	if target == ClaudeCode {
@@ -255,12 +382,24 @@ func nativeReplace(ctx context.Context, target Target, options Options, marketpl
 		}
 	}
 	if err != nil {
-		return err
+		return errors.New("restore native plugin registration")
 	}
 	return verifyNativeInstalled(ctx, target, options, marketplacePath, version, true)
 }
 
-func nativeRemove(ctx context.Context, target Target, options Options, verify bool) error {
+func nativeRemoveOwned(
+	ctx context.Context,
+	target Target,
+	options Options,
+	marketplacePath, version string,
+) error {
+	if err := verifyNativeInstalled(ctx, target, options, marketplacePath, version, true); err != nil {
+		return errors.New("native plugin is not owned by PaloNexus")
+	}
+	owned, err := nativeMarketplaceOwned(ctx, target, options, marketplacePath)
+	if err != nil || !owned {
+		return errors.New("native marketplace is not owned by PaloNexus")
+	}
 	var pluginErr, marketplaceErr error
 	if target == ClaudeCode {
 		_, pluginErr = runNative(ctx, target, options, "plugin", "uninstall", "--scope", "user", "palonexus@palonexus-sdk")
@@ -280,10 +419,7 @@ func nativeRemove(ctx context.Context, target Target, options Options, verify bo
 			return marketplaceErr
 		}
 	}
-	if verify {
-		return verifyNativeInstalled(ctx, target, options, "", "", false)
-	}
-	return nil
+	return verifyNativeInstalled(ctx, target, options, "", "", false)
 }
 
 func nativeMarketplaceAbsent(ctx context.Context, target Target, options Options) (bool, error) {
@@ -335,17 +471,20 @@ func verifyNativeInstalled(
 	found := false
 	if target == ClaudeCode {
 		var records []struct {
-			ID          string `json:"id"`
-			Version     string `json:"version"`
-			InstallPath string `json:"installPath"`
-			Scope       string `json:"scope"`
+			ID          string   `json:"id"`
+			Version     string   `json:"version"`
+			InstallPath string   `json:"installPath"`
+			Scope       string   `json:"scope"`
+			Enabled     bool     `json:"enabled"`
+			Errors      []string `json:"errors"`
 		}
 		if err := decodeExactJSON(output, &records); err != nil || len(records) > 4096 {
 			return errors.New("invalid Claude plugin list")
 		}
 		for _, record := range records {
 			if record.ID == "palonexus@palonexus-sdk" {
-				if found || record.Version != version || record.Scope != "user" ||
+				if found || !record.Enabled || len(record.Errors) != 0 ||
+					record.Version != version || record.Scope != "user" ||
 					!pathWithinMarketplace(record.InstallPath,
 						filepath.Join(options.Home, ".claude", "plugins", "cache", "palonexus-sdk")) {
 					return errors.New("unexpected Claude plugin registration")
@@ -356,10 +495,12 @@ func verifyNativeInstalled(
 	} else {
 		var document struct {
 			Installed []struct {
-				PluginID        string `json:"pluginId"`
-				Version         string `json:"version"`
-				Installed       bool   `json:"installed"`
-				MarketplaceName string `json:"marketplaceName"`
+				PluginID        string   `json:"pluginId"`
+				Version         string   `json:"version"`
+				Installed       bool     `json:"installed"`
+				Enabled         bool     `json:"enabled"`
+				Errors          []string `json:"errors"`
+				MarketplaceName string   `json:"marketplaceName"`
 				Source          struct {
 					Source string `json:"source"`
 					Path   string `json:"path"`
@@ -376,7 +517,8 @@ func verifyNativeInstalled(
 		}
 		for _, record := range document.Installed {
 			if record.PluginID == "palonexus@palonexus-sdk" {
-				if found || !record.Installed || record.Version != version ||
+				if found || !record.Installed || !record.Enabled || len(record.Errors) != 0 ||
+					record.Version != version ||
 					record.MarketplaceName != "palonexus-sdk" ||
 					record.MarketplaceSource.SourceType != "local" ||
 					!sameCanonicalPath(record.MarketplaceSource.Source, marketplacePath) ||

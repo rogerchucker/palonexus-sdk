@@ -5,6 +5,7 @@
 package plugin
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"os"
@@ -87,22 +88,37 @@ func TestNativeCommandsUseExactArgvAndSanitizedEnvironment(t *testing.T) {
 }
 
 func TestInstalledGuardConfigurationUsesExactValidatedPath(t *testing.T) {
-	options := fixture(t, Codex, "1.0.0")
-	result, err := Install(context.Background(), Codex, options)
-	if err != nil {
-		t.Fatal(err)
+	for _, target := range []Target{ClaudeCode, Codex} {
+		options := fixture(t, target, "1.0.0")
+		result, err := Install(context.Background(), target, options)
+		if err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(filepath.Join(result.Path, "plugins", installName, "hooks", "hooks.json"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !bytes.Contains(data, []byte(options.GuardPath)) ||
+			bytes.Contains(data, []byte("__PALONEXUS_GUARD__")) {
+			t.Fatalf("%s hook does not use exact guard path: %s", target, data)
+		}
 	}
-	data, err := os.ReadFile(filepath.Join(result.Path, "plugins", installName, "hooks", "guard.json"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var document struct {
-		GuardPath string   `json:"guardPath"`
-		Argv      []string `json:"argv"`
-	}
-	if decodeStrictDocument(data, &document) != nil || document.GuardPath != options.GuardPath ||
-		len(document.Argv) != 2 || document.Argv[0] != "guard" || document.Argv[1] != "check" {
-		t.Fatalf("unexpected installed guard configuration: %s", data)
+}
+
+func TestNativeVerificationRejectsDisabledOrErroredPlugin(t *testing.T) {
+	for _, mutate := range []func(*fakeNative){
+		func(r *fakeNative) { r.enabled = false },
+		func(r *fakeNative) { r.nativeErrors = []string{"hook failed validation"} },
+	} {
+		options := fixture(t, ClaudeCode, "1.0.0")
+		runner := options.Runner.(*fakeNative)
+		runner.installed = true
+		runner.marketplace = marketplaceInstallPath(options.Home, ClaudeCode)
+		mutate(runner)
+		if err := verifyNativeInstalled(context.Background(), ClaudeCode, options,
+			runner.marketplace, "1.0.0", true); err == nil {
+			t.Fatal("invalid native plugin was reported installed")
+		}
 	}
 }
 
@@ -135,6 +151,31 @@ func TestNativeFailureRollsBackRegistrationAndMarketplaceExactly(t *testing.T) {
 	if !runner.installed || runner.version != "1.0.0" ||
 		!sameCanonicalPath(runner.marketplace, result.Path) {
 		t.Fatalf("native registration not restored: %#v", runner)
+	}
+}
+
+func TestUninstallNativePartialFailureRestoresRegistration(t *testing.T) {
+	options := fixture(t, ClaudeCode, "1.0.0")
+	result, err := Install(context.Background(), ClaudeCode, options)
+	if err != nil {
+		t.Fatal(err)
+	}
+	before, err := snapshotTree(result.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runner := options.Runner.(*fakeNative)
+	runner.failContains = "marketplace remove"
+	if _, err := Uninstall(context.Background(), ClaudeCode, uninstallOptions(options)); err == nil {
+		t.Fatal("partial native uninstall unexpectedly succeeded")
+	}
+	after, err := snapshotTree(result.Path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before != after || !runner.installed || !runner.enabled ||
+		runner.version != "1.0.0" || !sameCanonicalPath(runner.marketplace, result.Path) {
+		t.Fatalf("partial native uninstall was not rolled back: %#v", runner)
 	}
 }
 
@@ -199,6 +240,10 @@ func TestInstalledHostCLIsRoundTripDisposableHome(t *testing.T) {
 			}
 			if !result.Changed {
 				t.Fatal("native install did not report a change")
+			}
+			owned, err := nativeMarketplaceOwned(context.Background(), target, options, result.Path)
+			if err != nil || !owned {
+				t.Fatalf("native marketplace ownership not discoverable: %v", err)
 			}
 			removed, err := Uninstall(context.Background(), target, uninstallOptions(options))
 			if err != nil {

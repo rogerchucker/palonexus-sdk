@@ -74,6 +74,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stdout, "Usage: palonexus %s\n", command)
 		return 0
 	}
+	if command == "status" && len(args) > 1 {
+		return runStatusCommand(args[1:], stdout, stderr)
+	}
 	if len(args) != 1 {
 		return invalidArguments(stderr, command)
 	}

@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rogerchucker/palonexus-sdk/guard/internal/plugin"
 )
@@ -31,7 +32,7 @@ func (f *cliNativeRunner) Run(_ context.Context, command plugin.NativeCommand) (
 	case args == "--version --json":
 		return []byte(`{"name":"palonexus","version":"dev","protocolVersion":"1.0"}`), nil
 	case args == "status --json":
-		return []byte(`{"authenticated":false,"ready":true}`), nil
+		return []byte(`{"name":"palonexus","version":"dev","protocolVersion":"1.0","authenticated":false,"ready":true,"loginRequired":true}`), nil
 	case args == "--version":
 		return []byte("2.1.219 (Claude Code)\n"), nil
 	case strings.HasPrefix(args, "plugin validate --strict "):
@@ -53,8 +54,16 @@ func (f *cliNativeRunner) Run(_ context.Context, command plugin.NativeCommand) (
 			return []byte(`[]`), nil
 		}
 		return []byte(fmt.Sprintf(
-			`[{"id":"palonexus@palonexus-sdk","version":"dev","scope":"user","installPath":%q}]`,
+			`[{"id":"palonexus@palonexus-sdk","version":"dev","scope":"user","enabled":true,"errors":[],"installPath":%q}]`,
 			filepath.Join(f.home, ".claude", "plugins", "cache", "palonexus-sdk", "palonexus", "dev"),
+		)), nil
+	case args == "plugin marketplace list --json":
+		if f.marketplace == "" {
+			return []byte(`[]`), nil
+		}
+		return []byte(fmt.Sprintf(
+			`[{"name":"palonexus-sdk","source":"directory","path":%q,"installLocation":%q}]`,
+			f.marketplace, f.marketplace,
 		)), nil
 	default:
 		return []byte(`{}`), nil
@@ -122,6 +131,41 @@ func TestVersionJSONReportsGuardIdentityAndProtocol(t *testing.T) {
 		stdout != "{\"name\":\"palonexus\",\"version\":\"1.2.3-test\",\"protocolVersion\":\"1.0\"}\n" ||
 		stderr != "" {
 		t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+}
+
+func TestStatusJSONReportsReadinessWithoutIdentity(t *testing.T) {
+	original := statusRuntime
+	t.Cleanup(func() { statusRuntime = original })
+	statusRuntime = func(context.Context) runtimeStatus {
+		return runtimeStatus{Authenticated: true, Ready: false}
+	}
+	code, stdout, stderr := runCLI(t, "status", "--json")
+	if code != 0 || stderr != "" {
+		t.Fatalf("status code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	const want = `{"name":"palonexus","version":"dev","protocolVersion":"1.0","authenticated":true,"ready":false,"loginRequired":false}` + "\n"
+	if stdout != want {
+		t.Fatalf("status = %q, want %q", stdout, want)
+	}
+	if strings.Contains(stdout, "subject") || strings.Contains(stdout, "account") ||
+		strings.Contains(stdout, "tenant") || strings.Contains(stdout, "token") {
+		t.Fatal("status leaked identity or credentials")
+	}
+}
+
+func TestStatusRecognizesLiveSessionEnvelope(t *testing.T) {
+	root := t.TempDir()
+	document := fmt.Sprintf(
+		`{"version":1,"tenant":"hidden","account":"hidden","metadata":{"kind":"session","sessionId":"session_01J5ABCDEFGHJKMNPQRSTVWXYZ","expiresAt":%q}}`,
+		time.Now().Add(time.Hour).UTC().Format(time.RFC3339Nano),
+	)
+	if err := os.WriteFile(filepath.Join(root, "state-"+strings.Repeat("a", 64)+".json"),
+		[]byte(document), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if !hasLiveSession(root) {
+		t.Fatal("live persisted session was reported logged out")
 	}
 }
 
@@ -211,16 +255,13 @@ func TestPluginCommandDispatchesWithoutEchoingPaths(t *testing.T) {
 	if err := os.MkdirAll(filepath.Join(pluginRoot, ".claude-plugin"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(pluginRoot, ".claude-plugin", "plugin.json"), []byte(`{"name":"palonexus","version":"dev","description":"PaloNexus governed actions","license":"MIT","author":{"name":"PaloNexus"},"hooks":"./hooks/hooks.json","skills":"./skills/"}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(pluginRoot, ".claude-plugin", "plugin.json"), []byte(`{"name":"palonexus","version":"dev","description":"PaloNexus governed actions","license":"MIT","author":{"name":"PaloNexus"},"skills":"./skills/"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(pluginRoot, "hooks"), 0o700); err != nil {
 		t.Fatal(err)
 	}
-	if err := os.WriteFile(filepath.Join(pluginRoot, "hooks", "hooks.json"), []byte(`{"version":1,"guardConfig":"./guard.json"}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(pluginRoot, "hooks", "guard.json"), []byte(`{"guardPath":"__PALONEXUS_GUARD__","argv":["guard","check"]}`), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(pluginRoot, "hooks", "hooks.json"), []byte(`{"hooks":{"PreToolUse":[{"matcher":"*","hooks":[{"type":"command","command":"__PALONEXUS_GUARD__","args":["guard","check"],"timeout":30}]}]}}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	if err := os.MkdirAll(filepath.Join(pluginRoot, "skills"), 0o700); err != nil {

@@ -77,8 +77,11 @@ type ownershipMarker struct {
 }
 
 type transactionJournal struct {
-	Schema    int    `json:"schema"`
-	Operation string `json:"operation"`
+	Schema          int    `json:"schema"`
+	Operation       string `json:"operation"`
+	Phase           string `json:"phase"`
+	PreviousVersion string `json:"previousVersion,omitempty"`
+	NextVersion     string `json:"nextVersion,omitempty"`
 }
 
 type faultHooks struct {
@@ -122,9 +125,6 @@ func Install(ctx context.Context, target Target, options Options) (Result, error
 	if err := probeNative(ctx, target, options); err != nil {
 		return Result{}, err
 	}
-	if err := nativeValidate(ctx, target, options, options.SourceDir); err != nil {
-		return Result{}, err
-	}
 	sourceDigest, err := digestTree(sourceFD)
 	if err != nil {
 		return Result{}, fmt.Errorf("validate plugin artifact: %w", err)
@@ -147,18 +147,25 @@ func Install(ctx context.Context, target Target, options Options) (Result, error
 		existing, markerErr := readOwnedMarkerAt(parentFD, destination, target)
 		switch {
 		case markerErr == nil:
+			if err := verifyNativeInstalled(ctx, target, options, path, existing.Version, true); err != nil {
+				return false, errors.New("owned local install does not match native registration")
+			}
 			if sameInstallIntent(existing, marker) {
-				if err := verifyNativeInstalled(ctx, target, options, path, existing.Version, true); err != nil {
-					if err := nativeReplace(ctx, target, options, path, existing.Version); err != nil {
-						return false, err
-					}
-				}
 				return false, nil
 			}
 		case errors.Is(markerErr, os.ErrNotExist):
-			// Fresh installation.
+			if err := verifyNativeInstalled(ctx, target, options, "", "", false); err != nil {
+				return false, errors.New("foreign native plugin registration")
+			}
+			absent, absentErr := nativeMarketplaceAbsent(ctx, target, options)
+			if absentErr != nil || !absent {
+				return false, errors.New("foreign native marketplace registration")
+			}
 		default:
 			return false, markerErr
+		}
+		if err := nativeValidate(ctx, target, options, options.SourceDir); err != nil {
+			return false, err
 		}
 		if err := removeIfOwnedStale(parentFD, stageName, target); err != nil {
 			return false, err
@@ -172,7 +179,7 @@ func Install(ctx context.Context, target Target, options Options) (Result, error
 		}
 		copyErr := copyTree(sourceFD, stageFD)
 		if copyErr == nil {
-			copyErr = writeGuardConfigAt(stageFD, options.GuardPath)
+			copyErr = writeGuardConfigAt(stageFD, target, options.GuardPath)
 		}
 		if copyErr == nil {
 			var stagedDigest string
@@ -189,7 +196,15 @@ func Install(ctx context.Context, target Target, options Options) (Result, error
 		if copyErr != nil {
 			return false, rollbackStage(parentFD, copyErr)
 		}
-		if err := writeJournal(parentFD, "install"); err != nil {
+		previousVersion := ""
+		if markerErr == nil {
+			previousVersion = existing.Version
+		}
+		journal := transactionJournal{
+			Schema: 1, Operation: "install", Phase: "local-prepared",
+			PreviousVersion: previousVersion, NextVersion: options.Version,
+		}
+		if err := writeJournal(parentFD, journal); err != nil {
 			return false, rollbackStage(parentFD, err)
 		}
 		if installFaults.afterJournal != nil {
@@ -222,21 +237,38 @@ func Install(ctx context.Context, target Target, options Options) (Result, error
 				return false, rollbackInstall(parentFD, hadExisting, err)
 			}
 		}
-		if err := nativeReplace(ctx, target, options, path, options.Version); err != nil {
+		journal.Phase = "native-pending"
+		if err := writeJournal(parentFD, journal); err != nil {
+			return false, rollbackInstall(parentFD, hadExisting, err)
+		}
+		if err := nativeReplace(ctx, target, options, path, options.Version, previousVersion); err != nil {
 			rollbackErr := rollbackInstall(parentFD, hadExisting, err)
 			if hadExisting {
-				if restoreErr := nativeReplace(ctx, target, options, path, existing.Version); restoreErr != nil {
+				_ = nativeRemoveOwned(ctx, target, options, path, options.Version)
+				if restoreErr := nativeReplace(ctx, target, options, path, existing.Version, ""); restoreErr != nil {
 					return false, errors.Join(rollbackErr, errors.New("native plugin rollback failed"))
 				}
-			} else {
-				_ = nativeRemove(ctx, target, options, false)
+			}
+			return false, rollbackErr
+		}
+		journal.Phase = "native-complete"
+		if err := writeJournal(parentFD, journal); err != nil {
+			rollbackErr := rollbackInstall(parentFD, hadExisting, err)
+			_ = nativeRemoveOwned(ctx, target, options, path, options.Version)
+			if hadExisting {
+				_ = nativeRestore(ctx, target, options, path, existing.Version)
 			}
 			return false, rollbackErr
 		}
 		if hadExisting {
 			if installFaults.beforeDelete != nil {
 				if err := installFaults.beforeDelete(); err != nil {
-					return false, rollbackInstall(parentFD, true, err)
+					rollbackErr := rollbackInstall(parentFD, true, err)
+					_ = nativeRemoveOwned(ctx, target, options, path, options.Version)
+					if restoreErr := nativeReplace(ctx, target, options, path, existing.Version, ""); restoreErr != nil {
+						return false, errors.Join(rollbackErr, errors.New("native plugin rollback failed"))
+					}
+					return false, rollbackErr
 				}
 			}
 			if err := removeTreeAt(parentFD, backupName); err != nil {
@@ -285,14 +317,15 @@ func Uninstall(ctx context.Context, target Target, options Options) (Result, err
 		existing, err := readOwnedMarkerAt(parentFD, destination, target)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
-				if err := nativeRemove(ctx, target, options, true); err != nil {
-					return false, err
-				}
 				return false, nil
 			}
 			return false, err
 		}
-		if err := writeJournal(parentFD, "uninstall"); err != nil {
+		journal := transactionJournal{
+			Schema: 1, Operation: "uninstall", Phase: "native-pending",
+			PreviousVersion: existing.Version,
+		}
+		if err := writeJournal(parentFD, journal); err != nil {
 			return false, err
 		}
 		if installFaults.afterJournal != nil {
@@ -303,29 +336,52 @@ func Uninstall(ctx context.Context, target Target, options Options) (Result, err
 				return false, err
 			}
 		}
+		if err := nativeRemoveOwned(ctx, target, options, path, existing.Version); err != nil {
+			if restoreErr := nativeRestore(ctx, target, options, path, existing.Version); restoreErr != nil {
+				return false, errors.Join(err, errors.New("native plugin rollback failed"))
+			}
+			_ = removeJournal(parentFD)
+			return false, err
+		}
+		journal.Phase = "native-complete"
+		if err := writeJournal(parentFD, journal); err != nil {
+			if restoreErr := nativeRestore(ctx, target, options, path, existing.Version); restoreErr != nil {
+				return false, errors.Join(err, errors.New("native plugin rollback failed"))
+			}
+			return false, err
+		}
 		if err := unix.Renameat(parentFD, destination, parentFD, backupName); err != nil {
 			_ = removeJournal(parentFD)
+			if restoreErr := nativeRestore(ctx, target, options, path, existing.Version); restoreErr != nil {
+				return false, errors.Join(errors.New("stage plugin uninstall"),
+					errors.New("native plugin rollback failed"))
+			}
 			return false, errors.New("stage plugin uninstall")
 		}
 		if err := unix.Fsync(parentFD); err != nil {
-			return false, rollbackUninstall(parentFD, err)
+			rollbackErr := rollbackUninstall(parentFD, err)
+			if restoreErr := nativeRestore(ctx, target, options, path, existing.Version); restoreErr != nil {
+				return false, errors.Join(rollbackErr, errors.New("native plugin rollback failed"))
+			}
+			return false, rollbackErr
 		}
 		if installFaults.afterBackup != nil {
 			if err := installFaults.afterBackup(); err != nil {
-				return false, rollbackUninstall(parentFD, err)
+				rollbackErr := rollbackUninstall(parentFD, err)
+				if restoreErr := nativeRestore(ctx, target, options, path, existing.Version); restoreErr != nil {
+					return false, errors.Join(rollbackErr, errors.New("native plugin rollback failed"))
+				}
+				return false, rollbackErr
 			}
 		}
 		if installFaults.beforeDelete != nil {
 			if err := installFaults.beforeDelete(); err != nil {
-				return false, rollbackUninstall(parentFD, err)
+				rollbackErr := rollbackUninstall(parentFD, err)
+				if restoreErr := nativeRestore(ctx, target, options, path, existing.Version); restoreErr != nil {
+					return false, errors.Join(rollbackErr, errors.New("native plugin rollback failed"))
+				}
+				return false, rollbackErr
 			}
-		}
-		if err := nativeRemove(ctx, target, options, true); err != nil {
-			rollbackErr := rollbackUninstall(parentFD, err)
-			if restoreErr := nativeReplace(ctx, target, options, path, existing.Version); restoreErr != nil {
-				return false, errors.Join(rollbackErr, errors.New("native plugin rollback failed"))
-			}
-			return false, rollbackErr
 		}
 		if err := removeTreeAt(parentFD, backupName); err != nil {
 			return false, rollbackUninstall(parentFD, err)
@@ -607,12 +663,15 @@ func requireManifest(sourceFD int, target Target, version string) error {
 		pluginManifest.Name != installName || pluginManifest.Version != version ||
 		pluginManifest.Description == "" || len(pluginManifest.Description) > 512 ||
 		pluginManifest.License != "MIT" ||
-		pluginManifest.Author.Name != "PaloNexus" ||
-		pluginManifest.Hooks != "./hooks/hooks.json" || pluginManifest.Skills != "./skills/" {
+		pluginManifest.Author.Name != "PaloNexus" || pluginManifest.Skills != "./skills/" ||
+		(target == ClaudeCode && pluginManifest.Hooks != "") ||
+		(target == Codex && pluginManifest.Hooks != "./hooks/hooks.json") {
 		return errors.New("invalid plugin manifest")
 	}
-	if err := requireRelativeFile(palonexusRoot, pluginManifest.Hooks); err != nil {
-		return errors.New("invalid plugin hook path")
+	if pluginManifest.Hooks != "" {
+		if err := requireRelativeFile(palonexusRoot, pluginManifest.Hooks); err != nil {
+			return errors.New("invalid plugin hook path")
+		}
 	}
 	if err := requireRelativeDirectory(palonexusRoot, pluginManifest.Skills); err != nil {
 		return errors.New("invalid plugin skill path")
@@ -630,30 +689,8 @@ func requireManifest(sourceFD int, target Target, version string) error {
 	}
 	hooksData, hooksErr := readBoundedFD(hooksManifestFD, 64*1024)
 	unix.Close(hooksManifestFD)
-	var hooksManifest struct {
-		Version     int    `json:"version"`
-		GuardConfig string `json:"guardConfig"`
-	}
-	if hooksErr != nil || decodeStrictDocument(hooksData, &hooksManifest) != nil ||
-		hooksManifest.Version != 1 || hooksManifest.GuardConfig != "./guard.json" {
+	if hooksErr != nil || validateHookManifest(hooksData, target, "__PALONEXUS_GUARD__") != nil {
 		return errors.New("invalid plugin hooks manifest")
-	}
-	guardConfigFD, err := unix.Openat(
-		hooksFD, "guard.json", unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0,
-	)
-	if err != nil {
-		return errors.New("plugin guard configuration missing")
-	}
-	guardConfigData, guardConfigErr := readBoundedFD(guardConfigFD, 4096)
-	unix.Close(guardConfigFD)
-	var guardConfig struct {
-		GuardPath string   `json:"guardPath"`
-		Argv      []string `json:"argv"`
-	}
-	if guardConfigErr != nil || decodeStrictDocument(guardConfigData, &guardConfig) != nil ||
-		guardConfig.GuardPath != "__PALONEXUS_GUARD__" ||
-		len(guardConfig.Argv) != 2 || guardConfig.Argv[0] != "guard" || guardConfig.Argv[1] != "check" {
-		return errors.New("invalid plugin guard configuration")
 	}
 	protocolFD, err := unix.Openat(
 		palonexusRoot, "palonexus.json", unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0,
@@ -1136,7 +1173,54 @@ func writeFileAt(parentFD int, name string, data []byte, mode uint32) error {
 	return file.Close()
 }
 
-func writeGuardConfigAt(marketplaceFD int, guardPath string) error {
+type hookDocument struct {
+	Hooks map[string][]hookMatcher `json:"hooks"`
+}
+
+type hookMatcher struct {
+	Matcher string        `json:"matcher"`
+	Hooks   []hookCommand `json:"hooks"`
+}
+
+type hookCommand struct {
+	Type    string   `json:"type"`
+	Command string   `json:"command"`
+	Args    []string `json:"args,omitempty"`
+	Timeout int      `json:"timeout"`
+}
+
+func validateHookManifest(data []byte, target Target, guardPath string) error {
+	var document hookDocument
+	if decodeStrictDocument(data, &document) != nil || len(document.Hooks) != 1 {
+		return errors.New("invalid hook document")
+	}
+	matchers, ok := document.Hooks["PreToolUse"]
+	if !ok || len(matchers) != 1 || len(matchers[0].Hooks) != 1 {
+		return errors.New("invalid hook event")
+	}
+	matcher, command := matchers[0], matchers[0].Hooks[0]
+	if command.Type != "command" || command.Timeout != 30 {
+		return errors.New("invalid hook command")
+	}
+	if target == ClaudeCode {
+		if matcher.Matcher != "*" || command.Command != guardPath ||
+			len(command.Args) != 2 || command.Args[0] != "guard" || command.Args[1] != "check" {
+			return errors.New("invalid Claude hook")
+		}
+		return nil
+	}
+	if matcher.Matcher != ".*" || len(command.Args) != 0 ||
+		command.Command != shellCommand(guardPath) {
+		return errors.New("invalid Codex hook")
+	}
+	return nil
+}
+
+func shellCommand(guardPath string) string {
+	return "'" + strings.ReplaceAll(guardPath, "'", "'\\''") + "' guard check"
+}
+
+func writeGuardConfigAt(marketplaceFD int, target Target, guardPath string) error {
 	pluginsFD, err := openDirectoryAt(marketplaceFD, "plugins")
 	if err != nil {
 		return errors.New("open installed plugin directory")
@@ -1153,25 +1237,31 @@ func writeGuardConfigAt(marketplaceFD int, guardPath string) error {
 	}
 	defer unix.Close(hooksFD)
 	existingFD, err := unix.Openat(
-		hooksFD, "guard.json", unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0,
+		hooksFD, "hooks.json", unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0,
 	)
 	if err != nil {
-		return errors.New("guard configuration placeholder missing")
+		return errors.New("hook configuration placeholder missing")
 	}
 	if _, err := validateRegularFD(existingFD, false); err != nil {
 		unix.Close(existingFD)
-		return errors.New("unsafe guard configuration placeholder")
+		return errors.New("unsafe hook configuration placeholder")
 	}
 	unix.Close(existingFD)
-	if err := unix.Unlinkat(hooksFD, "guard.json", 0); err != nil {
-		return errors.New("replace guard configuration")
+	if err := unix.Unlinkat(hooksFD, "hooks.json", 0); err != nil {
+		return errors.New("replace hook configuration")
 	}
-	document := struct {
-		GuardPath string   `json:"guardPath"`
-		Argv      []string `json:"argv"`
-	}{GuardPath: guardPath, Argv: []string{"guard", "check"}}
-	if err := writeFileAt(hooksFD, "guard.json", mustJSON(document), 0o600); err != nil {
-		return errors.New("write guard configuration")
+	command := hookCommand{Type: "command", Command: guardPath, Args: []string{"guard", "check"}, Timeout: 30}
+	matcher := "*"
+	if target == Codex {
+		command.Command = shellCommand(guardPath)
+		command.Args = nil
+		matcher = ".*"
+	}
+	document := hookDocument{Hooks: map[string][]hookMatcher{
+		"PreToolUse": {{Matcher: matcher, Hooks: []hookCommand{command}}},
+	}}
+	if err := writeFileAt(hooksFD, "hooks.json", mustJSON(document), 0o600); err != nil {
+		return errors.New("write hook configuration")
 	}
 	return unix.Fsync(hooksFD)
 }
@@ -1292,10 +1382,10 @@ func rejectDuplicateJSONKeys(data []byte) error {
 	return walk()
 }
 
-func writeJournal(parentFD int, operation string) error {
+func writeJournal(parentFD int, journal transactionJournal) error {
 	_ = unix.Unlinkat(parentFD, journalTempName, 0)
 	if err := writeFileAt(parentFD, journalTempName,
-		mustJSON(transactionJournal{Schema: 1, Operation: operation}), 0o600); err != nil {
+		mustJSON(journal), 0o600); err != nil {
 		return errors.New("write plugin journal")
 	}
 	if err := unix.Renameat(parentFD, journalTempName, parentFD, journalName); err != nil {
@@ -1329,7 +1419,9 @@ func recoverTransaction(parentFD int, target Target) error {
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
 	if rejectDuplicateJSONKeys(data) != nil || decoder.Decode(&journal) != nil || journal.Schema != 1 ||
-		(journal.Operation != "install" && journal.Operation != "uninstall") {
+		(journal.Operation != "install" && journal.Operation != "uninstall") ||
+		(journal.Phase != "local-prepared" && journal.Phase != "native-pending" &&
+			journal.Phase != "native-complete") {
 		return errors.New("invalid plugin transaction journal")
 	}
 	var extra any
