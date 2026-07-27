@@ -4,7 +4,6 @@
 package daemon
 
 import (
-	"errors"
 	"os"
 	"syscall"
 )
@@ -23,17 +22,10 @@ func pinStartedProcess(process *os.Process) (*startedProcessGuard, error) {
 }
 
 func (g *startedProcessGuard) signal(signal syscall.Signal) error {
-	if g == nil {
-		return ErrUnprovenProcess
-	}
-	token, err := processStartToken(g.pid)
-	if err != nil || token != g.startToken {
-		return ErrUnprovenProcess
-	}
-	if err := syscall.Kill(g.pid, signal); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return ErrUnavailable
-	}
-	return nil
+	// A launch-time PID plus start token is still not a stable signaling
+	// handle. Wait may prove exit, but an unresponsive live child is never
+	// signaled numerically on Darwin.
+	return ErrUnavailable
 }
 
 func (*startedProcessGuard) close() {}

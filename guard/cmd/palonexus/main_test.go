@@ -17,6 +17,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -29,11 +30,19 @@ import (
 )
 
 func TestBuiltBinaryDaemonLifecycleAndOneShot(t *testing.T) {
+	if runtime.GOOS == "darwin" {
+		t.Skip("Darwin exact-descriptor daemon launch is unsupported and fails closed")
+	}
 	var calls atomic.Int32
+	var outage atomic.Bool
 	var selected atomic.Value
 	selected.Store(protocol.DecisionOutcomeAllow)
 	decisionServer := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
 		calls.Add(1)
+		if outage.Load() {
+			http.Error(w, "unavailable", http.StatusServiceUnavailable)
+			return
+		}
 		var action protocol.ActionRequest
 		if request.Method != http.MethodPost || request.Header.Get("Authorization") != "Bearer access-token" ||
 			json.NewDecoder(request.Body).Decode(&action) != nil {
@@ -224,8 +233,9 @@ func TestBuiltBinaryDaemonLifecycleAndOneShot(t *testing.T) {
 	if err := os.WriteFile(caPath, originalCA, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	decisionServer.Close()
+	outage.Store(true)
 	for _, arguments := range [][]string{{"guard", "check", "--one-shot"}, {"guard", "check"}} {
+		before := calls.Load()
 		code, stdout, stderr = run(compact.String()+"\n", arguments...)
 		if code != 0 || stderr != "" {
 			t.Fatalf("outage %v: %d %q %q", arguments, code, stdout, stderr)
@@ -234,10 +244,57 @@ func TestBuiltBinaryDaemonLifecycleAndOneShot(t *testing.T) {
 		if parseErr != nil || outage.Code != protocol.ProtocolErrorCodeAuthorizationUnavailable {
 			t.Fatalf("outage %v response: %s, %v", arguments, stdout, parseErr)
 		}
+		if delta := calls.Load() - before; delta != 1 {
+			t.Fatalf("outage %v accepted attempts = %d", arguments, delta)
+		}
 	}
 	if code, stdout, stderr := run("", "guard", "stop"); code != 0 ||
 		stdout != "guard stopped\n" || stderr != "" {
 		t.Fatalf("stop: %d %q %q", code, stdout, stderr)
+	}
+}
+
+func TestBuiltBinaryDarwinDaemonLaunchFailsClosed(t *testing.T) {
+	if runtime.GOOS != "darwin" {
+		t.Skip("Darwin-specific descriptor execution capability")
+	}
+	binary := buildBinary(t)
+	root, err := os.MkdirTemp("", "pn-darwin-main-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	root, _ = filepath.EvalSymlinks(root)
+	keyPath := filepath.Join(root, "credential.key")
+	if err := os.WriteFile(keyPath, bytes.Repeat([]byte{0x42}, 32), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	configPath := filepath.Join(root, "config.json")
+	config := fmt.Sprintf(`{
+	  "decision_endpoint":"http://127.0.0.1:65534",
+	  "oidc_issuer":"http://127.0.0.1:65533",
+	  "local_test_mode":true,
+	  "tenant_id":"tenant-a","account_id":"account-a","client_id":"codex",
+	  "state_dir":%q,"credential_service":"palonexus-test",
+	  "test_credential_root":%q,"test_credential_key_file":%q,
+	  "routes":[{"target":"api.example.com","decision_endpoint":"http://127.0.0.1:65534"}]
+	}`, filepath.Join(root, "state"), filepath.Join(root, "credentials"), keyPath)
+	if err := os.WriteFile(configPath, []byte(config), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(binary, "guard", "start")
+	command.Env = append(os.Environ(),
+		"PALONEXUS_CONFIG="+configPath,
+		"PALONEXUS_RUNTIME_DIR="+filepath.Join(root, "run"),
+		"PALONEXUS_ALLOW_LOCAL_TEST_MODE=1",
+	)
+	var stdout, stderr bytes.Buffer
+	command.Stdout, command.Stderr = &stdout, &stderr
+	err = command.Run()
+	var exit *exec.ExitError
+	if !errors.As(err, &exit) || exit.ExitCode() != 1 || stdout.Len() != 0 ||
+		stderr.String() != "palonexus: guard: unavailable\n" {
+		t.Fatalf("Darwin daemon launch: %v %q %q", err, stdout.String(), stderr.String())
 	}
 }
 

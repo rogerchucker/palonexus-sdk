@@ -26,6 +26,11 @@ func processIdentity(pid int) (uint64, uint64, error) {
 	return uint64(stat.Dev), uint64(stat.Ino), nil
 }
 
+func processExists(pid int) bool {
+	err := syscall.Kill(pid, 0)
+	return err == nil || errors.Is(err, syscall.EPERM)
+}
+
 func signalStableProcess(state lifecycleState, signal syscall.Signal) error {
 	pidfd, err := unix.PidfdOpen(state.PID, 0)
 	if err != nil {

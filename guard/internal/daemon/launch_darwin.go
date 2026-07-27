@@ -5,6 +5,7 @@ package daemon
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"os"
 	"os/exec"
@@ -44,14 +45,29 @@ func (m *Manager) launchCommand(
 		_ = source.Close()
 		return nil, nil, ErrUnsafeExecutable
 	}
+	if m.cfg.afterLaunchVerified != nil {
+		m.cfg.afterLaunchVerified(stagePath)
+	}
+	if _, err := unix.FcntlInt(stage.Fd(), unix.F_SETFD, 0); err != nil {
+		_ = stage.Close()
+		_ = source.Close()
+		return nil, nil, ErrUnsafeExecutable
+	}
+	if !darwinDescriptorExecutionSupported() {
+		removeExactDarwinStage(stage, stagePath)
+		_ = stage.Close()
+		_ = source.Close()
+		return nil, nil, ErrUnsafeExecutable
+	}
 	command := exec.CommandContext(
-		context.WithoutCancel(ctx), stagePath, m.cfg.Arguments...,
+		context.WithoutCancel(ctx), fmt.Sprintf("/dev/fd/%d", stage.Fd()), m.cfg.Arguments...,
 	)
 	command.Args[0] = m.cfg.Executable
 	command.Stdin = nil
 	command.Stdout = logFile
 	command.Stderr = logFile
 	command.Env = append([]string(nil), m.environment...)
+	command.ExtraFiles = []*os.File{stage}
 	command.SysProcAttr = &unix.SysProcAttr{Setsid: true}
 	return command, func() {
 		_ = stage.Close()
@@ -59,13 +75,31 @@ func (m *Manager) launchCommand(
 	}, nil
 }
 
+func darwinDescriptorExecutionSupported() bool {
+	// Darwin's posix_spawn resolves the executable before applying inherited
+	// descriptor file actions, and the system fdesc mount rejects execve of
+	// /dev/fd entries. There is no fexecve-equivalent in the supported Go API.
+	return false
+}
+
 func openOrCreateDarwinStage(
 	path string,
 	source *os.File,
 	digest string,
 ) (*os.File, error) {
-	stage, err := os.OpenFile(path, os.O_RDWR|os.O_CREATE|os.O_EXCL, 0o700)
+	directory, err := openRuntime(filepath.Dir(path), false)
+	if err != nil {
+		return nil, ErrUnsafeExecutable
+	}
+	defer directory.Close()
+	name := filepath.Base(path)
+	fd, err := unix.Openat(
+		int(directory.Fd()), name,
+		unix.O_RDWR|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o700,
+	)
+	var stage *os.File
 	if err == nil {
+		stage = os.NewFile(uintptr(fd), filepath.Base(path))
 		if _, err = source.Seek(0, io.SeekStart); err == nil {
 			_, err = io.Copy(stage, source)
 		}
@@ -79,23 +113,29 @@ func openOrCreateDarwinStage(
 			err = stage.Sync()
 		}
 		if err == nil {
-			err = unix.Chflags(path, unix.UF_IMMUTABLE)
+			err = unix.Fchflags(int(stage.Fd()), unix.UF_IMMUTABLE)
 		}
 		if err == nil {
-			if directory, openErr := os.Open(filepath.Dir(path)); openErr == nil {
-				err = directory.Sync()
-				_ = directory.Close()
-			} else {
-				err = openErr
-			}
+			err = directory.Sync()
 		}
 		if err != nil {
 			_ = stage.Close()
-			_ = os.Remove(path)
 			return nil, ErrUnsafeExecutable
 		}
-	} else if os.IsExist(err) {
-		stage, err = os.Open(path)
+		_ = stage.Close()
+		fd, err = unix.Openat(
+			int(directory.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0,
+		)
+		if err == nil {
+			stage = os.NewFile(uintptr(fd), filepath.Base(path))
+		}
+	} else if err == unix.EEXIST {
+		fd, err = unix.Openat(
+			int(directory.Fd()), name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0,
+		)
+		if err == nil {
+			stage = os.NewFile(uintptr(fd), filepath.Base(path))
+		}
 	}
 	if err != nil {
 		return nil, ErrUnsafeExecutable
@@ -130,6 +170,10 @@ func cleanupRunningExecutable(runtimeDir string) {
 		return
 	}
 	defer file.Close()
+	removeExactDarwinStage(file, path)
+}
+
+func removeExactDarwinStage(file *os.File, path string) {
 	info, statErr := file.Stat()
 	if statErr != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o500 {
 		return
@@ -138,14 +182,16 @@ func cleanupRunningExecutable(runtimeDir string) {
 	if !ok || unix.Fchflags(int(file.Fd()), 0) != nil {
 		return
 	}
-	current, err := os.Lstat(path)
-	currentStat, currentOK := current.Sys().(*syscall.Stat_t)
-	if err == nil && currentOK &&
-		currentStat.Dev == opened.Dev && currentStat.Ino == opened.Ino {
-		_ = os.Remove(path)
-		if directory, openErr := os.Open(runtimeDir); openErr == nil {
-			_ = directory.Sync()
-			_ = directory.Close()
-		}
+	directory, err := openRuntime(filepath.Dir(path), false)
+	if err != nil {
+		return
+	}
+	defer directory.Close()
+	var current unix.Stat_t
+	if unix.Fstatat(
+		int(directory.Fd()), filepath.Base(path), &current, unix.AT_SYMLINK_NOFOLLOW,
+	) == nil && current.Dev == int32(opened.Dev) && current.Ino == opened.Ino {
+		_ = unix.Unlinkat(int(directory.Fd()), filepath.Base(path), 0)
+		_ = directory.Sync()
 	}
 }

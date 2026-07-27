@@ -85,3 +85,5 @@ func inspectSealedExecutable(file *os.File) (executableIdentity, error) {
 	}
 	return executableIdentity{Digest: hex.EncodeToString(hasher.Sum(nil))}, nil
 }
+
+func darwinDescriptorExecutionSupported() bool { return true }

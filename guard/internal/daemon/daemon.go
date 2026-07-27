@@ -63,6 +63,7 @@ type Config struct {
 	StopTimeout          time.Duration
 	KillTimeout          time.Duration
 	afterSocketPublished func()
+	afterLaunchVerified  func(string)
 }
 
 type Status struct {
@@ -525,11 +526,6 @@ func waitStopped(ctx context.Context, path string, pid int, maximum time.Duratio
 		case <-ticker.C:
 		}
 	}
-}
-
-func processExists(pid int) bool {
-	err := syscall.Kill(pid, 0)
-	return err == nil || errors.Is(err, syscall.EPERM)
 }
 
 func probeBudget(ctx context.Context) time.Duration {

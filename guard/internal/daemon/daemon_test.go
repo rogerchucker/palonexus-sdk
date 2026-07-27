@@ -15,6 +15,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"sync/atomic"
@@ -91,6 +92,13 @@ func testConfig(t *testing.T) Config {
 	}
 }
 
+func requireAutoStart(t *testing.T) {
+	t.Helper()
+	if runtime.GOOS == "darwin" && !darwinDescriptorExecutionSupported() {
+		t.Skip("Darwin has no exact-descriptor executable launch primitive; fail-closed is required")
+	}
+}
+
 func testConfigForRuntime(t *testing.T, runtimeDir string) Config {
 	t.Helper()
 	cfg := testConfig(t)
@@ -160,12 +168,15 @@ func TestDaemonProcessHelper(t *testing.T) {
 }
 
 func TestStartStatusStopAndDoubleStop(t *testing.T) {
-	manager, err := New(testConfig(t))
+	requireAutoStart(t)
+	cfg := testConfig(t)
+	manager, err := New(cfg)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if err := manager.Start(context.Background()); err != nil {
-		t.Fatalf("Start: %v", err)
+		log, _ := os.ReadFile(filepath.Join(cfg.RuntimeDir, logName))
+		t.Fatalf("Start: %v log=%q", err, log)
 	}
 	t.Cleanup(func() { _ = manager.Stop(context.Background()) })
 	status, err := manager.Status(context.Background())
@@ -185,6 +196,7 @@ func TestStartStatusStopAndDoubleStop(t *testing.T) {
 }
 
 func TestConcurrentAutoStartAcrossProcessesStartsOneDaemon(t *testing.T) {
+	requireAutoStart(t)
 	cfg := testConfig(t)
 	const callers = 8
 	commands := make([]*exec.Cmd, 0, callers)
@@ -303,6 +315,9 @@ func TestDaemonAndOneShotRejectMalformedActionBeforePipeline(t *testing.T) {
 	}
 	for _, oneShot := range []bool{true, false} {
 		t.Run(strconv.FormatBool(oneShot), func(t *testing.T) {
+			if !oneShot {
+				requireAutoStart(t)
+			}
 			var calls atomic.Int32
 			cfg := testConfig(t)
 			cfg.Handler = func(context.Context, []byte) ([]byte, error) {
@@ -652,6 +667,7 @@ func TestExecutableContentMutationAfterValidationIsRejected(t *testing.T) {
 }
 
 func TestArgumentMetacharactersArePassedLiterally(t *testing.T) {
+	requireAutoStart(t)
 	cfg := testConfig(t)
 	marker := filepath.Join(t.TempDir(), "PWNED")
 	cfg.Arguments = append(cfg.Arguments, ";touch", marker)
@@ -690,6 +706,7 @@ func TestContextCancellationBoundsStartupAndOneShot(t *testing.T) {
 }
 
 func TestBoundedStartupFailureTerminatesSpawnedChild(t *testing.T) {
+	requireAutoStart(t)
 	cfg := testConfig(t)
 	cfg.StartupTimeout = 50 * time.Millisecond
 	cfg.KillTimeout = 50 * time.Millisecond
@@ -717,6 +734,7 @@ func TestBoundedStartupFailureTerminatesSpawnedChild(t *testing.T) {
 }
 
 func TestCrashCleanupAndRestart(t *testing.T) {
+	requireAutoStart(t)
 	cfg := testConfig(t)
 	manager, _ := New(cfg)
 	if err := manager.Start(context.Background()); err != nil {
@@ -739,6 +757,7 @@ func TestCrashCleanupAndRestart(t *testing.T) {
 }
 
 func TestSIGKILLAfterSocketPublicationBeforeStateRecovers(t *testing.T) {
+	requireAutoStart(t)
 	cfg := testConfig(t)
 	cfg.ChildEnv = append(cfg.ChildEnv, "PALONEXUS_DAEMON_HELPER_MODE=crash-after-socket")
 	crashing, err := New(cfg)
@@ -763,6 +782,7 @@ func TestSIGKILLAfterSocketPublicationBeforeStateRecovers(t *testing.T) {
 }
 
 func TestAmbiguousSocketRecoveryErrorIsPreserved(t *testing.T) {
+	requireAutoStart(t)
 	cfg := testConfig(t)
 	if _, err := New(cfg); err != nil {
 		t.Fatal(err)
@@ -800,6 +820,7 @@ func TestAmbiguousSocketRecoveryErrorIsPreserved(t *testing.T) {
 }
 
 func TestTerminationSignalCleansUpAndAllowsRestart(t *testing.T) {
+	requireAutoStart(t)
 	cfg := testConfig(t)
 	manager, _ := New(cfg)
 	if err := manager.Start(context.Background()); err != nil {
@@ -825,6 +846,7 @@ func TestTerminationSignalCleansUpAndAllowsRestart(t *testing.T) {
 }
 
 func TestStatusDoesNotReportStoppedWhenMatchingProcessIsUnresponsive(t *testing.T) {
+	requireAutoStart(t)
 	cfg := testConfig(t)
 	manager, _ := New(cfg)
 	if err := manager.Start(context.Background()); err != nil {
@@ -891,6 +913,7 @@ func TestStopDoesNotKillUnrelatedOrReusedPID(t *testing.T) {
 }
 
 func TestStopRequiresCompleteProcessIdentityInLifecycleState(t *testing.T) {
+	requireAutoStart(t)
 	cfg := testConfig(t)
 	manager, _ := New(cfg)
 	if err := manager.Start(context.Background()); err != nil {
@@ -932,6 +955,7 @@ func TestStopRequiresCompleteProcessIdentityInLifecycleState(t *testing.T) {
 }
 
 func TestStatusBindsCanonicalArgumentsAndEnvironment(t *testing.T) {
+	requireAutoStart(t)
 	cfg := testConfig(t)
 	manager, _ := New(cfg)
 	if err := manager.Start(context.Background()); err != nil {
@@ -988,6 +1012,7 @@ func TestStatusRejectsCorruptOversizedAndTrailingState(t *testing.T) {
 }
 
 func TestCheckUsesDaemonTransportAfterAutoStart(t *testing.T) {
+	requireAutoStart(t)
 	cfg := testConfig(t)
 	manager, _ := New(cfg)
 	t.Cleanup(func() { _ = manager.Stop(context.Background()) })

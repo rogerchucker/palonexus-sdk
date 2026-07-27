@@ -51,14 +51,14 @@ func processStartToken(pid int) (string, error) {
 	return strconv.FormatInt(start.Sec, 10) + ":" + strconv.FormatInt(int64(start.Usec), 10), nil
 }
 
+func processExists(pid int) bool {
+	_, err := processStartToken(pid)
+	return err == nil
+}
+
 func signalStableProcess(state lifecycleState, signal syscall.Signal) error {
-	// Darwin lacks pidfd. Re-read both executable identity and kernel start
-	// time immediately before signaling; any uncertainty fails closed.
-	if !stateMatchesProcess(state) {
-		return ErrUnprovenProcess
-	}
-	if err := syscall.Kill(state.PID, signal); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return ErrUnavailable
-	}
-	return nil
+	// Darwin exposes no stable process handle equivalent to Linux pidfd.
+	// Numeric signaling can target a reused PID after any validation, so
+	// escalation is deliberately unavailable.
+	return ErrUnavailable
 }
