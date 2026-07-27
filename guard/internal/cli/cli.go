@@ -66,6 +66,9 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		_, _ = fmt.Fprintf(stdout, "Usage: palonexus %s\n", command)
 		return 0
 	}
+	if command == "plugin" && len(args) > 1 {
+		return runPluginCommand(args[1:], stdout, stderr)
+	}
 	if len(args) != 1 {
 		return invalidArguments(stderr, command)
 	}

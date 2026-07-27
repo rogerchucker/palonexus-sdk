@@ -4,6 +4,8 @@ package cli
 
 import (
 	"bytes"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 )
@@ -129,5 +131,45 @@ func TestGlobalFlagsRejectExtraArguments(t *testing.T) {
 				t.Fatalf("code=%d stdout=%q stderr=%q", code, stdout, stderr)
 			}
 		})
+	}
+}
+
+func TestPluginCommandDispatchesWithoutEchoingPaths(t *testing.T) {
+	home := t.TempDir()
+	if err := os.Chmod(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	source := filepath.Join(home, "source")
+	if err := os.MkdirAll(filepath.Join(source, ".claude-plugin"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(source, ".claude-plugin", "plugin.json"), []byte(`{"name":"palonexus"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	guard := filepath.Join(home, "palonexus")
+	if err := os.WriteFile(guard, []byte("#!/bin/sh\n"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	restoreHome, restoreExecutable := pluginUserHome, pluginExecutable
+	t.Cleanup(func() {
+		pluginUserHome, pluginExecutable = restoreHome, restoreExecutable
+	})
+	pluginUserHome = func() (string, error) { return home, nil }
+	pluginExecutable = func() (string, error) { return guard, nil }
+
+	code, stdout, stderr := runCLI(t, "plugin", "install", "claude-code", "--source", source)
+	if code != 0 || stdout != "palonexus: plugin claude-code installed\n" || stderr != "" {
+		t.Fatalf("install code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+	code, stdout, stderr = runCLI(t, "plugin", "uninstall", "claude-code")
+	if code != 0 || stdout != "palonexus: plugin claude-code uninstalled\n" || stderr != "" {
+		t.Fatalf("uninstall code=%d stdout=%q stderr=%q", code, stdout, stderr)
+	}
+
+	secret := filepath.Join(home, "secret-token")
+	code, stdout, stderr = runCLI(t, "plugin", "install", "invalid", "--source", secret)
+	if code != 2 || stdout != "" || stderr != "palonexus: plugin: invalid arguments\n" ||
+		strings.Contains(stdout+stderr, secret) {
+		t.Fatalf("invalid code=%d stdout=%q stderr=%q", code, stdout, stderr)
 	}
 }
