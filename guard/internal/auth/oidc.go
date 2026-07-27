@@ -6,6 +6,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
+	"crypto/tls"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -194,8 +195,22 @@ func secureTransport(base *http.Transport) (*http.Transport, error) {
 	secured.DialContext = safeDial
 	secured.DialTLS = nil
 	secured.DialTLSContext = nil
-	if secured.TLSClientConfig != nil {
+	if secured.TLSClientConfig == nil {
+		secured.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	} else {
 		secured.TLSClientConfig = secured.TLSClientConfig.Clone()
+		if secured.TLSClientConfig.MaxVersion != 0 &&
+			secured.TLSClientConfig.MaxVersion < tls.VersionTLS12 {
+			return nil, ErrInvalidConfig
+		}
+		if secured.TLSClientConfig.MinVersion == 0 ||
+			secured.TLSClientConfig.MinVersion < tls.VersionTLS12 {
+			secured.TLSClientConfig.MinVersion = tls.VersionTLS12
+		}
+		if secured.TLSClientConfig.MaxVersion != 0 &&
+			secured.TLSClientConfig.MinVersion > secured.TLSClientConfig.MaxVersion {
+			return nil, ErrInvalidConfig
+		}
 	}
 	return secured, nil
 }

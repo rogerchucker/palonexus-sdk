@@ -661,6 +661,32 @@ func TestSecureTransportPreservesTrustMaterialAndReplacesNetworkHooks(t *testing
 	}
 }
 
+func TestSecureTransportEnforcesTLS12FloorAndPreservesTLS13(t *testing.T) {
+	for _, minimum := range []uint16{0, tls.VersionTLS10, tls.VersionTLS11} {
+		secured, err := secureTransport(&http.Transport{
+			TLSClientConfig: &tls.Config{MinVersion: minimum},
+		})
+		if err != nil {
+			t.Fatalf("safe transport minimum %x was not hardened: %v", minimum, err)
+		}
+		if secured.TLSClientConfig.MinVersion != tls.VersionTLS12 {
+			t.Fatalf("TLS minimum %x remained below TLS 1.2: %x", minimum, secured.TLSClientConfig.MinVersion)
+		}
+	}
+	if _, err := secureTransport(&http.Transport{
+		TLSClientConfig: &tls.Config{MaxVersion: tls.VersionTLS11},
+	}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("TLS maximum below 1.2 was accepted: %v", err)
+	}
+	secured, err := secureTransport(&http.Transport{
+		TLSClientConfig: &tls.Config{MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS13},
+	})
+	if err != nil || secured.TLSClientConfig.MinVersion != tls.VersionTLS13 ||
+		secured.TLSClientConfig.MaxVersion != tls.VersionTLS13 {
+		t.Fatalf("strict TLS 1.3 configuration was not preserved: %#v, %v", secured, err)
+	}
+}
+
 func TestDiscoveryURLForRootAndPathIssuers(t *testing.T) {
 	cases := map[string]string{
 		"https://issuer.example":         "https://issuer.example/.well-known/openid-configuration",
@@ -1106,6 +1132,13 @@ func TestSupersedingLoginSurvivesInFlightRefreshCleanup(t *testing.T) {
 		t.Fatal(err)
 	}
 	entered, release := make(chan struct{}), make(chan struct{})
+	defer func() {
+		select {
+		case <-release:
+		default:
+			close(release)
+		}
+	}()
 	p.refreshBlock = func() {
 		select {
 		case <-entered:
@@ -1125,6 +1158,14 @@ func TestSupersedingLoginSurvivesInFlightRefreshCleanup(t *testing.T) {
 		t.Fatal("refresh did not reach provider")
 	}
 	second := loginForTest(t, m, p)
+	if _, err := m.options.Credentials.Get(context.Background(),
+		credentialKey("tenant", "account", first.ID)); !errors.Is(err, keystore.ErrNotFound) {
+		t.Fatalf("superseding login left reserved predecessor credential while refresh was hung: %v", err)
+	}
+	if _, err := m.options.Credentials.Get(context.Background(),
+		credentialKey("tenant", "account", second.ID)); err != nil {
+		t.Fatalf("superseding login credential was not committed: %v", err)
+	}
 	p.mutateClaims = func(claims map[string]any) { claims["nonce"] = firstRequest.nonce }
 	close(release)
 	if err := <-done; !errors.Is(err, ErrCommitIndeterminate) {

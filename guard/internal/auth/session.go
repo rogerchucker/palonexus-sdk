@@ -139,7 +139,7 @@ func (m *Manager) Complete(ctx context.Context, callback Callback) (Session, err
 	var generation uint64
 	binding := state.Binding{Tenant: m.options.Tenant, Account: m.options.Account}
 	err = m.options.Metadata.WithSessionTransaction(ctx, binding, func(current state.Metadata, found bool) (*state.Metadata, error) {
-		previous, hadPrevious = current, found && !current.Tombstoned
+		previous, hadPrevious = current, found
 		generation = 1
 		if found {
 			generation = current.Generation + 1
