@@ -17,9 +17,9 @@ from typing import Protocol, Self, SupportsIndex, cast
 from .._canonicalize import canonical_json
 from ..keystore import KeyStore
 from .did import (
-    _FAILED,
     IdentityVerificationFailed,
     _capture,
+    _checked_capture,
     _raise_identity_failure,
     resolve_did_key,
     sign_ed25519,
@@ -81,9 +81,7 @@ class StaticRevocationLookup:
         )
         result = _capture(operation)
         del operation, revoked_ids
-        if result is _FAILED:
-            _raise_identity_failure()
-        values = cast(tuple[str, ...], result)
+        values = cast(tuple[str, ...], _checked_capture(result))
         object.__setattr__(self, "revoked_ids", values)
 
     def is_revoked(self, credential_id: str) -> bool:
@@ -132,12 +130,19 @@ class MemoryReplayStore:
                 and type(now) is datetime
                 and now.tzinfo is not None
             )
+            if not valid_id or not valid_times:
+                return False
+            normalized_expiry = expires_at.astimezone(UTC)
+            normalized_now = now.astimezone(UTC)
+            if (
+                type(normalized_expiry) is not datetime
+                or normalized_expiry.tzinfo is None
+                or type(normalized_now) is not datetime
+                or normalized_now.tzinfo is None
+            ):
+                return False
         except Exception:
             return False
-        if not valid_id or not valid_times:
-            return False
-        normalized_expiry = expires_at.astimezone(UTC)
-        normalized_now = now.astimezone(UTC)
         if normalized_expiry <= normalized_now:
             return False
         with self._lock:
@@ -1126,9 +1131,7 @@ def create_verifiable_credential(
         expires_at,
         claims,
     )
-    if result is _FAILED:
-        _raise_identity_failure()
-    return cast(str, result)
+    return _checked_capture(result)
 
 
 def verify_verifiable_credential(
@@ -1149,9 +1152,7 @@ def verify_verifiable_credential(
     )
     result = _capture(operation)
     del operation, token, expected_audience, now, revocation_lookup
-    if result is _FAILED:
-        _raise_identity_failure()
-    return cast(VerifiedCredential, result)
+    return _checked_capture(result)
 
 
 def create_verifiable_presentation(
@@ -1196,9 +1197,7 @@ def create_verifiable_presentation(
         issued_at,
         expires_at,
     )
-    if result is _FAILED:
-        _raise_identity_failure()
-    return cast(str, result)
+    return _checked_capture(result)
 
 
 def verify_verifiable_presentation(
@@ -1231,9 +1230,7 @@ def verify_verifiable_presentation(
         revocation_lookup,
         replay_store,
     )
-    if result is _FAILED:
-        _raise_identity_failure()
-    return cast(VerifiedPresentation, result)
+    return _checked_capture(result)
 
 
 def create_delegation(
@@ -1290,9 +1287,7 @@ def create_delegation(
         issued_at,
         expires_at,
     )
-    if result is _FAILED:
-        _raise_identity_failure()
-    return cast(str, result)
+    return _checked_capture(result)
 
 
 def verify_delegation_chain(
@@ -1337,6 +1332,4 @@ def verify_delegation_chain(
         now,
         revocation_lookup,
     )
-    if result is _FAILED:
-        _raise_identity_failure()
-    return cast(VerifiedDelegation, result)
+    return _checked_capture(result)

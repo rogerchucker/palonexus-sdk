@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import math
 from collections.abc import Callable
 from dataclasses import dataclass
@@ -26,6 +27,18 @@ _SIGNATURE_BYTES = 64
 _MAX_MESSAGE_BYTES = 1_048_576
 _MAX_DID_BYTES = 256
 _FAILED = object()
+
+
+class _ControlFlow:
+    """One sanitized control-flow exception awaiting a safe re-raise."""
+
+    __slots__ = ("error",)
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+    def __repr__(self) -> str:
+        return "_ControlFlow([REDACTED])"
 
 
 class IdentityVerificationFailed(Exception):
@@ -71,9 +84,17 @@ def _capture[T](operation: Callable[[], T]) -> T | object:
 
     try:
         return operation()
-    except (KeyboardInterrupt, SystemExit):
-        raise
-    except BaseException:
+    except (
+        asyncio.CancelledError,
+        GeneratorExit,
+        KeyboardInterrupt,
+        SystemExit,
+    ) as error:
+        error.__traceback__ = None
+        error.__cause__ = None
+        error.__context__ = None
+        return _ControlFlow(error)
+    except Exception:
         return _FAILED
 
 
@@ -81,6 +102,25 @@ def _raise_identity_failure() -> NoReturn:
     """Create the public error in a frame that has never held caller input."""
 
     raise IdentityVerificationFailed() from None
+
+
+def _raise_control_flow(error: BaseException) -> NoReturn:
+    """Re-raise the same sanitized control-flow object from a clean frame."""
+
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    raise error from None
+
+
+def _checked_capture[T](result: T | object) -> T:
+    """Return a safe result or raise from a never-secret helper frame."""
+
+    if result is _FAILED:
+        _raise_identity_failure()
+    if type(result) is _ControlFlow:
+        _raise_control_flow(result.error)
+    return cast(T, result)
 
 
 def _base58btc_encode(value: bytes) -> str:
@@ -139,12 +179,8 @@ class DidKey:
         operation = partial(_validated_did_key_parts, did, key_id, public_key)
         result = _capture(operation)
         del operation, did, key_id, public_key
-        if result is _FAILED:
-            _raise_identity_failure()
-        resolved_did, resolved_key_id, resolved_public_key = cast(
-            tuple[str, str, bytes],
-            result,
-        )
+        checked = cast(tuple[str, str, bytes], _checked_capture(result))
+        resolved_did, resolved_key_id, resolved_public_key = checked
         object.__setattr__(self, "did", resolved_did)
         object.__setattr__(self, "key_id", resolved_key_id)
         object.__setattr__(self, "public_key", resolved_public_key)
@@ -169,9 +205,7 @@ class DidKey:
         )
         result = _capture(operation)
         del operation, message, key_store, tenant_id, key_id
-        if result is _FAILED:
-            _raise_identity_failure()
-        return cast(bytes, result)
+        return _checked_capture(result)
 
     def __copy__(self) -> Self:
         return self
@@ -238,9 +272,7 @@ def resolve_did_key(did: object) -> DidKey:
     operation = partial(_resolve_did_key, did)
     result = _capture(operation)
     del operation, did
-    if result is _FAILED:
-        _raise_identity_failure()
-    return cast(DidKey, result)
+    return _checked_capture(result)
 
 
 def _generate_ed25519_key(
@@ -303,9 +335,7 @@ def generate_ed25519_key(
     )
     result = _capture(operation)
     del operation, key_store, tenant_id, key_id
-    if result is _FAILED:
-        _raise_identity_failure()
-    return cast(DidKey, result)
+    return _checked_capture(result)
 
 
 def _sign_ed25519(
@@ -362,9 +392,7 @@ def sign_ed25519(
     )
     result = _capture(operation)
     del operation, message, key_store, tenant_id, key_id, expected_did
-    if result is _FAILED:
-        _raise_identity_failure()
-    return cast(bytes, result)
+    return _checked_capture(result)
 
 
 def verify_ed25519(did: str, message: bytes, signature: bytes) -> bool:

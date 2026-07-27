@@ -3,12 +3,15 @@
 
 from __future__ import annotations
 
+import asyncio
 import copy
 import dataclasses
 import pickle
 import traceback
-from collections.abc import Mapping
-from datetime import UTC, datetime, timedelta
+from collections.abc import Callable, Mapping
+from datetime import UTC, datetime, timedelta, tzinfo
+from functools import partial
+from types import TracebackType
 from typing import Any, cast
 
 import pytest
@@ -22,10 +25,12 @@ from palonexus.identity import (
     VerifiedCredential,
     VerifiedDelegation,
     VerifiedPresentation,
+    create_delegation,
     create_verifiable_credential,
     create_verifiable_presentation,
     generate_ed25519_key,
     sign_ed25519,
+    verify_delegation_chain,
     verify_verifiable_credential,
     verify_verifiable_presentation,
 )
@@ -422,4 +427,347 @@ def test_memory_replay_store_is_explicit_bounded_and_purges_atomically() -> None
             invalid,
             expires_at=NOW + timedelta(minutes=1),
             now=NOW,
+        )
+
+
+class _HostileTimezone(tzinfo):
+    def utcoffset(self, value: datetime | None) -> timedelta:
+        del value
+        raise RuntimeError("LEAK-hostile-utcoffset")
+
+    def dst(self, value: datetime | None) -> timedelta:
+        del value
+        raise RuntimeError("LEAK-hostile-dst")
+
+    def tzname(self, value: datetime | None) -> str:
+        del value
+        raise RuntimeError("LEAK-hostile-tzname")
+
+    def fromutc(self, value: datetime) -> datetime:
+        del value
+        raise RuntimeError("LEAK-hostile-fromutc")
+
+
+def test_memory_replay_store_guards_hostile_datetime_normalization() -> None:
+    replay = MemoryReplayStore(testing_only=True, max_entries=1)
+    hostile = datetime(2026, 7, 27, 12, 0, tzinfo=_HostileTimezone())
+    assert not replay.check_and_record(
+        "urn:uuid:hostile-expiry",
+        expires_at=hostile,
+        now=NOW,
+    )
+    assert not replay.check_and_record(
+        "urn:uuid:hostile-now",
+        expires_at=NOW + timedelta(minutes=1),
+        now=hostile,
+    )
+    assert replay.check_and_record(
+        "urn:uuid:valid-after-hostile",
+        expires_at=NOW + timedelta(minutes=1),
+        now=NOW,
+    )
+
+
+class _CancellationStore:
+    capabilities: Mapping[str, bool | str] = {"testing_only": True}
+
+    def __init__(
+        self,
+        cancellation: asyncio.CancelledError,
+        *,
+        cancel_on: str,
+    ) -> None:
+        self.cancellation = cancellation
+        self.cancel_on = cancel_on
+        self.inner = EphemeralKeyStore(testing_only=True)
+
+    def store(
+        self,
+        *,
+        tenant_id: str,
+        key_id: str,
+        value: bytearray,
+    ) -> None:
+        if self.cancel_on == "store":
+            for index in range(len(value)):
+                value[index] = 0
+            raise self.cancellation
+        self.inner.store(tenant_id=tenant_id, key_id=key_id, value=value)
+
+    def load(self, *, tenant_id: str, key_id: str) -> Any:
+        if self.cancel_on == "load":
+            raise self.cancellation
+        lease = self.inner.load(tenant_id=tenant_id, key_id=key_id)
+        if self.cancel_on != "lease":
+            return lease
+
+        cancellation = self.cancellation
+
+        class CancellingLease:
+            def __enter__(self) -> Any:
+                entered = lease.__enter__()
+                del entered
+                raise cancellation
+
+            def __exit__(
+                self,
+                exc_type: type[BaseException] | None,
+                exc_value: BaseException | None,
+                traceback_value: TracebackType | None,
+            ) -> None:
+                lease.__exit__(exc_type, exc_value, traceback_value)
+
+        return CancellingLease()
+
+    def delete(self, *, tenant_id: str, key_id: str) -> None:
+        self.inner.delete(tenant_id=tenant_id, key_id=key_id)
+
+
+def _assert_same_clean_cancellation(
+    expected: asyncio.CancelledError,
+    operation: Any,
+) -> None:
+    with pytest.raises(asyncio.CancelledError) as captured:
+        operation()
+    assert captured.value is expected
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+    _assert_secret_unreachable(captured.value, "LEAK-callback-frame")
+
+
+@pytest.mark.parametrize("cancel_on", ["store", "load", "lease"])
+def test_key_store_cancellation_propagates_identity_without_secret_graph(
+    cancel_on: str,
+) -> None:
+    cancellation = asyncio.CancelledError()
+    store = _CancellationStore(cancellation, cancel_on=cancel_on)
+    operation: Callable[[], object]
+    if cancel_on == "store":
+        operation = partial(
+            generate_ed25519_key,
+            key_store=store,
+            tenant_id="LEAK-callback-frame",
+            key_id="cancelled",
+        )
+    else:
+        if cancel_on == "lease":
+            key = generate_ed25519_key(
+                key_store=store.inner,
+                tenant_id=TENANT,
+                key_id="cancelled",
+            )
+        else:
+            key = generate_ed25519_key(
+                key_store=store.inner,
+                tenant_id=TENANT,
+                key_id="cancelled",
+            )
+        operation = partial(
+            sign_ed25519,
+            b"LEAK-callback-frame",
+            key_store=store,
+            tenant_id=TENANT,
+            key_id="cancelled",
+            expected_did=key.did,
+        )
+    _assert_same_clean_cancellation(cancellation, operation)
+
+
+def test_revocation_and_replay_cancellation_propagate_same_clean_object() -> None:
+    revocation_cancelled = asyncio.CancelledError()
+
+    class CancellingRevocation:
+        def is_revoked(self, credential_id: str) -> bool:
+            del credential_id
+            raise revocation_cancelled
+
+    with EphemeralKeyStore(testing_only=True) as store:
+        credential, _ = _issued_token(store)
+    _assert_same_clean_cancellation(
+        revocation_cancelled,
+        lambda: verify_verifiable_credential(
+            credential,
+            expected_audience="control-plane",
+            now=NOW,
+            revocation_lookup=CancellingRevocation(),
+        ),
+    )
+
+    replay_cancelled = asyncio.CancelledError()
+
+    class CancellingReplay:
+        def check_and_record(
+            self,
+            replay_id: str,
+            *,
+            expires_at: datetime,
+            now: datetime,
+        ) -> bool:
+            del replay_id, expires_at, now
+            raise replay_cancelled
+
+    with EphemeralKeyStore(testing_only=True) as store:
+        holder = generate_ed25519_key(
+            key_store=store,
+            tenant_id=TENANT,
+            key_id="cancel-holder",
+        )
+        credential, _ = _issued_token(
+            store,
+            key_id="cancel-issuer",
+            expires_at=NOW + timedelta(minutes=2),
+        )
+        presentation = create_verifiable_presentation(
+            key_store=store,
+            tenant_id=TENANT,
+            key_id="cancel-holder",
+            holder=holder.did,
+            credentials=(credential,),
+            audience="control-plane",
+            challenge="cancel-challenge",
+            presentation_id="urn:uuid:cancel-presentation",
+            issued_at=NOW,
+            expires_at=NOW + timedelta(minutes=1),
+        )
+    _assert_same_clean_cancellation(
+        replay_cancelled,
+        lambda: verify_verifiable_presentation(
+            presentation,
+            expected_audience="control-plane",
+            expected_challenge="cancel-challenge",
+            now=NOW,
+            revocation_lookup=StaticRevocationLookup(),
+            replay_store=CancellingReplay(),
+        ),
+    )
+
+
+@pytest.mark.parametrize("boundary", ["vc", "vp", "delegation"])
+def test_signed_identity_creation_propagates_cancellation(boundary: str) -> None:
+    cancellation = asyncio.CancelledError()
+    store = _CancellationStore(cancellation, cancel_on="load")
+    issuer = generate_ed25519_key(
+        key_store=store.inner,
+        tenant_id=TENANT,
+        key_id="cancel-signing",
+    )
+    if boundary == "vc":
+        operation = partial(
+            create_verifiable_credential,
+            key_store=store,
+            tenant_id=TENANT,
+            key_id="cancel-signing",
+            issuer=issuer.did,
+            subject="did:example:agent",
+            audience="control-plane",
+            credential_id="urn:uuid:cancel-vc",
+            issued_at=NOW,
+            expires_at=NOW + timedelta(minutes=1),
+            claims={"private": "LEAK-callback-frame"},
+        )
+    elif boundary == "vp":
+        credential, _ = _issued_token(
+            store.inner,
+            key_id="cancel-vp-issuer",
+        )
+        operation = partial(
+            create_verifiable_presentation,
+            key_store=store,
+            tenant_id=TENANT,
+            key_id="cancel-signing",
+            holder=issuer.did,
+            credentials=(credential,),
+            audience="control-plane",
+            challenge="LEAK-callback-frame",
+            presentation_id="urn:uuid:cancel-vp",
+            issued_at=NOW,
+            expires_at=NOW + timedelta(minutes=1),
+        )
+    else:
+        operation = partial(
+            create_delegation,
+            key_store=store,
+            tenant_id=TENANT,
+            key_id="cancel-signing",
+            issuer=issuer.did,
+            subject="did:example:delegate",
+            audience="control-plane",
+            credential_id="urn:uuid:cancel-delegation",
+            actor="did:example:actor",
+            agent="did:example:agent",
+            capabilities=("tools:read",),
+            resources=("runbooks/*",),
+            remaining_depth=1,
+            issued_at=NOW,
+            expires_at=NOW + timedelta(minutes=1),
+        )
+    _assert_same_clean_cancellation(cancellation, operation)
+
+
+def test_delegation_revocation_cancellation_propagates() -> None:
+    cancellation = asyncio.CancelledError()
+
+    class CancellingRevocation:
+        def is_revoked(self, credential_id: str) -> bool:
+            del credential_id
+            raise cancellation
+
+    with EphemeralKeyStore(testing_only=True) as store:
+        issuer = generate_ed25519_key(
+            key_store=store,
+            tenant_id=TENANT,
+            key_id="delegation-cancel",
+        )
+        token = create_delegation(
+            key_store=store,
+            tenant_id=TENANT,
+            key_id="delegation-cancel",
+            issuer=issuer.did,
+            subject="did:example:delegate",
+            audience="control-plane",
+            credential_id="urn:uuid:delegation-cancel",
+            actor="did:example:actor",
+            agent="did:example:agent",
+            capabilities=("tools:read",),
+            resources=("runbooks/*",),
+            remaining_depth=1,
+            issued_at=NOW,
+            expires_at=NOW + timedelta(minutes=1),
+        )
+    _assert_same_clean_cancellation(
+        cancellation,
+        lambda: verify_delegation_chain(
+            (token,),
+            root_issuer=issuer.did,
+            expected_subject="did:example:delegate",
+            expected_actor="did:example:actor",
+            expected_agent="did:example:agent",
+            expected_audience="control-plane",
+            required_capability="tools:read",
+            required_resource="runbooks/*",
+            now=NOW,
+            revocation_lookup=CancellingRevocation(),
+        ),
+    )
+
+
+def test_generator_exit_is_not_converted_to_identity_failure() -> None:
+    class GeneratorExitStore(_FailingStore):
+        def store(
+            self,
+            *,
+            tenant_id: str,
+            key_id: str,
+            value: bytearray,
+        ) -> None:
+            del tenant_id, key_id
+            for index in range(len(value)):
+                value[index] = 0
+            raise GeneratorExit
+
+    with pytest.raises(GeneratorExit):
+        generate_ed25519_key(
+            key_store=GeneratorExitStore(),
+            tenant_id=TENANT,
+            key_id="generator-exit",
         )
