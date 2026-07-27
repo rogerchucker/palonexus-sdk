@@ -2,6 +2,7 @@
 package decision
 
 import (
+	"bytes"
 	"context"
 	"crypto/ecdsa"
 	"crypto/elliptic"
@@ -248,12 +249,12 @@ func TestHTTP1ReusedConnectionFailureDoesNotReplayAuthorization(t *testing.T) {
 	}
 }
 
-func TestHTTP2StreamResetDoesNotReplayAuthorization(t *testing.T) {
+func TestDecisionTransportNeverNegotiatesHTTP2(t *testing.T) {
 	request := action()
 	var calls atomic.Int32
 	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		call := calls.Add(1)
-		if r.ProtoMajor != 2 {
+		if r.ProtoMajor != 1 {
 			t.Errorf("protocol = %s", r.Proto)
 		}
 		switch call {
@@ -275,11 +276,15 @@ func TestHTTP2StreamResetDoesNotReplayAuthorization(t *testing.T) {
 		Now:          func() time.Time { return time.Date(2026, 7, 25, 20, 0, 2, 0, time.UTC) },
 		MaxClockSkew: time.Minute,
 	}, "")
+	transport := client.http.Transport.(*http.Transport)
+	if transport.ForceAttemptHTTP2 || transport.TLSNextProto == nil || len(transport.TLSNextProto) != 0 {
+		t.Fatal("decision transport permits HTTP/2 negotiation or retries")
+	}
 	if _, err := client.Decide(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := client.Decide(context.Background(), request); !errors.Is(err, ErrUnavailable) {
-		t.Fatalf("stream-reset result = %v", err)
+		t.Fatalf("connection-reset result = %v", err)
 	}
 	if calls.Load() != 2 {
 		t.Fatalf("authorization reached server %d times; implicit replay occurred", calls.Load())
@@ -421,6 +426,34 @@ func TestLoopbackHTTPRequiresConfigurationAndRuntimeOptIn(t *testing.T) {
 	}
 	if _, err := client.Decide(context.Background(), request); err != nil {
 		t.Fatal(err)
+	}
+
+	ca, _ := testCA(t)
+	caPath := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(
+		caPath,
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: ca.Raw}),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	contradictoryBody := strings.Replace(
+		body(true, endpoint),
+		`"trusted_ca_file": ""`,
+		fmt.Sprintf(`"trusted_ca_file": %q`, caPath),
+		1,
+	)
+	contradictory, err := guardconfig.Load(
+		write(contradictoryBody),
+		guardconfig.Options{AllowLocalTestMode: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewFromConfig(contradictory, Options{
+		AccessToken: func(context.Context) ([]byte, error) { return []byte("token"), nil },
+	}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("plaintext endpoint silently ignored trusted CA: %v", err)
 	}
 }
 
@@ -1063,6 +1096,118 @@ func TestTLSOptionsRejectUnsafeOrAmbiguousConfiguration(t *testing.T) {
 			t.Errorf("case %d error = %v", index, err)
 		}
 	}
+}
+
+func TestClientCertificateConfigurationDetachesMutableCallerState(t *testing.T) {
+	ca, caKey := testCA(t)
+	source := issueCertificate(t, ca, caKey, nil, true)
+	leaf, err := x509.ParseCertificate(source.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	source.Leaf = leaf
+	source.SupportedSignatureAlgorithms = []tls.SignatureScheme{tls.ECDSAWithP256AndSHA256}
+	originalDER := append([]byte(nil), source.Certificate[0]...)
+	originalCommonName := source.Leaf.Subject.CommonName
+	originalScheme := source.SupportedSignatureAlgorithms[0]
+
+	configuration, err := buildTLSConfig(TLSOptions{
+		ClientCertificates: []tls.Certificate{source},
+	}, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	configured := &configuration.Certificates[0]
+	if configured.PrivateKey == source.PrivateKey || configured.Leaf == source.Leaf {
+		t.Fatal("client retained caller private-key or leaf pointer")
+	}
+
+	source.Certificate[0][0] ^= 0xff
+	source.SupportedSignatureAlgorithms[0] = tls.PSSWithSHA512
+	source.Leaf.Subject.CommonName = "mutated"
+	sourceKey := source.PrivateKey.(*ecdsa.PrivateKey)
+	sourceKey.D.SetInt64(1)
+
+	if !bytes.Equal(configured.Certificate[0], originalDER) {
+		t.Fatal("caller certificate mutation affected client")
+	}
+	if configured.Leaf.Subject.CommonName != originalCommonName {
+		t.Fatal("caller leaf mutation affected client")
+	}
+	if len(configured.SupportedSignatureAlgorithms) != 1 ||
+		configured.SupportedSignatureAlgorithms[0] != originalScheme {
+		t.Fatal("caller signature-algorithm mutation affected client")
+	}
+	configuredKey := configured.PrivateKey.(*ecdsa.PrivateKey)
+	if configuredKey.D.Cmp(sourceKey.D) == 0 {
+		t.Fatal("caller private-key mutation affected client")
+	}
+}
+
+func TestCallerCertificateMutationCannotRaceConcurrentMTLS(t *testing.T) {
+	request := action()
+	ca, caKey := testCA(t)
+	rootPool := x509.NewCertPool()
+	rootPool.AddCert(ca)
+	serverCertificate := issueCertificate(t, ca, caKey, []string{"example.com"}, false)
+	source := issueCertificate(t, ca, caKey, nil, true)
+	leaf, err := x509.ParseCertificate(source.Certificate[0])
+	if err != nil {
+		t.Fatal(err)
+	}
+	source.Leaf = leaf
+	source.SupportedSignatureAlgorithms = []tls.SignatureScheme{tls.ECDSAWithP256AndSHA256}
+
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(validDecision(t, request, protocol.DecisionOutcomeAllow))
+	}))
+	server.TLS = &tls.Config{
+		Certificates: []tls.Certificate{serverCertificate},
+		ClientAuth:   tls.RequireAndVerifyClientCert,
+		ClientCAs:    rootPool,
+		MinVersion:   tls.VersionTLS12,
+	}
+	server.StartTLS()
+	defer server.Close()
+	client := clientForTLSServer(t, server, Options{
+		TLS: TLSOptions{
+			RootCAs: rootPool, ClientCertificates: []tls.Certificate{source},
+		},
+		AccessToken: func(context.Context) ([]byte, error) { return []byte("token"), nil },
+		Now:         func() time.Time { return time.Date(2026, 7, 25, 20, 0, 2, 0, time.UTC) },
+	}, "")
+
+	stop := make(chan struct{})
+	mutated := make(chan struct{})
+	go func() {
+		defer close(mutated)
+		key := source.PrivateKey.(*ecdsa.PrivateKey)
+		for counter := int64(2); ; counter++ {
+			select {
+			case <-stop:
+				return
+			default:
+				source.Certificate[0][0] ^= byte(counter)
+				source.SupportedSignatureAlgorithms[0] = tls.PSSWithSHA256
+				source.Leaf.Subject.CommonName = fmt.Sprintf("mutated-%d", counter)
+				key.D.SetInt64(counter)
+			}
+		}
+	}()
+	var wait sync.WaitGroup
+	for range 20 {
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			if _, err := client.Decide(context.Background(), request); err != nil {
+				t.Errorf("Decide: %v", err)
+			}
+		}()
+	}
+	wait.Wait()
+	close(stop)
+	<-mutated
 }
 
 func TestOwnedCredentialBufferIsWipedAndHeaderReleasedImmediately(t *testing.T) {

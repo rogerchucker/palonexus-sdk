@@ -5,6 +5,7 @@ package decision
 import (
 	"bytes"
 	"context"
+	"crypto"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
@@ -90,6 +91,9 @@ func NewFromConfig(configuration *config.Config, options Options) (*Client, erro
 	if parseErr != nil {
 		return nil, ErrInvalidConfig
 	}
+	if len(pem) != 0 && parsedEndpoint.Scheme != "https" {
+		return nil, ErrInvalidConfig
+	}
 	if len(pem) != 0 && parsedEndpoint.Scheme == "https" {
 		if options.TLS.RootCAs != nil {
 			return nil, ErrInvalidConfig
@@ -143,6 +147,11 @@ func newClient(options Options, allowLocalHTTP bool, controls transportControls)
 	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	transport.DisableCompression = true
+	// Protocol v1 authorization is deliberately HTTP/1.1-only. Go's bundled
+	// HTTP/2 transport may replay a stream refused before its body is consumed,
+	// which conflicts with this client's strict zero-network-retry policy.
+	transport.ForceAttemptHTTP2 = false
+	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 	resolver := controls.resolver
 	if resolver == nil {
 		resolver = net.DefaultResolver
@@ -200,8 +209,8 @@ func buildTLSConfig(options TLSOptions, plaintext bool) (*tls.Config, error) {
 	}
 	certificates := make([]tls.Certificate, len(options.ClientCertificates))
 	for index := range options.ClientCertificates {
-		certificate := cloneCertificate(options.ClientCertificates[index])
-		if len(certificate.Certificate) == 0 || certificate.PrivateKey == nil {
+		certificate, err := cloneCertificate(options.ClientCertificates[index])
+		if err != nil {
 			return nil, ErrInvalidConfig
 		}
 		certificates[index] = certificate
@@ -217,19 +226,64 @@ func buildTLSConfig(options TLSOptions, plaintext bool) (*tls.Config, error) {
 	return result, nil
 }
 
-func cloneCertificate(source tls.Certificate) tls.Certificate {
+const (
+	maxCertificateChain    = 8
+	maxCertificateDERBytes = 1 << 20
+)
+
+func cloneCertificate(source tls.Certificate) (tls.Certificate, error) {
+	if len(source.Certificate) == 0 || len(source.Certificate) > maxCertificateChain ||
+		source.PrivateKey == nil {
+		return tls.Certificate{}, ErrInvalidConfig
+	}
 	result := source
 	result.Certificate = make([][]byte, len(source.Certificate))
+	total := 0
 	for index := range source.Certificate {
+		if len(source.Certificate[index]) == 0 ||
+			total > maxCertificateDERBytes-len(source.Certificate[index]) {
+			return tls.Certificate{}, ErrInvalidConfig
+		}
+		total += len(source.Certificate[index])
 		result.Certificate[index] = append([]byte(nil), source.Certificate[index]...)
 	}
+	result.SupportedSignatureAlgorithms =
+		append([]tls.SignatureScheme(nil), source.SupportedSignatureAlgorithms...)
 	result.OCSPStaple = append([]byte(nil), source.OCSPStaple...)
 	result.SignedCertificateTimestamps = make([][]byte, len(source.SignedCertificateTimestamps))
 	for index := range source.SignedCertificateTimestamps {
 		result.SignedCertificateTimestamps[index] =
 			append([]byte(nil), source.SignedCertificateTimestamps[index]...)
 	}
-	return result
+	leaf, err := x509.ParseCertificate(result.Certificate[0])
+	if err != nil {
+		return tls.Certificate{}, ErrInvalidConfig
+	}
+	result.Leaf = leaf
+
+	// Snapshot standard TLS private keys rather than retaining caller-owned
+	// mutable pointers. Custom signer implementations are intentionally
+	// rejected because their concurrency and mutation semantics are unknown.
+	keyDER, err := x509.MarshalPKCS8PrivateKey(source.PrivateKey)
+	if err != nil {
+		return tls.Certificate{}, ErrInvalidConfig
+	}
+	privateKey, err := x509.ParsePKCS8PrivateKey(keyDER)
+	wipe(keyDER)
+	if err != nil {
+		return tls.Certificate{}, ErrInvalidConfig
+	}
+	signer, ok := privateKey.(crypto.Signer)
+	if !ok {
+		return tls.Certificate{}, ErrInvalidConfig
+	}
+	leafPublic, err1 := x509.MarshalPKIXPublicKey(leaf.PublicKey)
+	keyPublic, err2 := x509.MarshalPKIXPublicKey(signer.Public())
+	if err1 != nil || err2 != nil || !bytes.Equal(leafPublic, keyPublic) {
+		return tls.Certificate{}, ErrInvalidConfig
+	}
+	result.PrivateKey = privateKey
+	return result, nil
 }
 
 func rejectRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
