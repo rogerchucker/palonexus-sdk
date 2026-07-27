@@ -174,3 +174,7 @@ scripts/verify_python_artifacts.py,rogerchucker/palonexus-sdk,WORKTREE,scripts/v
 guard/cmd/palonexus/main.go,rogerchucker/palonexus-sdk,WORKTREE,guard/cmd/palonexus/main.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/cli/cli.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/cli/cli.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/cli/cli_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/cli/cli_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/config/config.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/config/config.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/config/config_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/config/config_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/routing/routing.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/routing/routing.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/routing/routing_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/routing/routing_test.go,PaloNexus,yes,new,MIT,rogerchucker
