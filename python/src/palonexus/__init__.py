@@ -26,6 +26,17 @@ from .errors import (
     PolicyDenied,
     UnsupportedProtocol,
 )
+from .keystore import (
+    EphemeralKeyStore,
+    InvalidKeyIdentifier,
+    InvalidKeyMaterial,
+    KeyNotFound,
+    KeyStore,
+    KeyStoreClosed,
+    KeyStoreCorrupt,
+    KeyStoreError,
+    KeyStoreUnavailable,
+)
 from .models import ActionRequest, ActionTarget, DecisionOutcome, TaskContext
 from .protocol import ActionRequestBuilder
 from .redaction import Redactor
@@ -54,10 +65,19 @@ __all__ = [
     "CredentialUnavailable",
     "CredentialRevoked",
     "DecisionOutcome",
+    "EphemeralKeyStore",
     "IdempotencyConflict",
     "InvalidDecision",
     "InvalidCredentialDeadline",
+    "InvalidKeyIdentifier",
+    "InvalidKeyMaterial",
     "InvalidRequest",
+    "KeyNotFound",
+    "KeyStore",
+    "KeyStoreClosed",
+    "KeyStoreCorrupt",
+    "KeyStoreError",
+    "KeyStoreUnavailable",
     "MissingIdentity",
     "ModelValidationError",
     "PaloNexusError",
