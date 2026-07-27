@@ -125,6 +125,7 @@ def _middleware(
                 )
             },
             model_bindings={"fake-list-chat-model": FAKE_MODEL},
+            tool_bindings={"inventory_read": inventory_read},
         ),
         engine,
     )
@@ -152,6 +153,7 @@ def _async_middleware(
                 )
             },
             model_bindings={"fake-list-chat-model": FAKE_MODEL},
+            tool_bindings={"inventory_read": inventory_read},
         ),
         engine,
     )
@@ -352,6 +354,7 @@ def test_nested_calls_derive_causation_without_cross_thread_context_bleed() -> N
     middleware = PaloNexusLangChainMiddleware(
         client=AuthorizationClient(FakeTransport(engine, testing_only=True)),
         async_client=None,
+        tool_bindings={"inventory_read": inventory_read},
         tool_policies={
             "inventory_read": LangChainActionPolicy(
                 service="inventory",
@@ -532,6 +535,7 @@ def test_real_langchain_agent_and_stream_are_gated_before_execution() -> None:
     middleware = PaloNexusLangChainMiddleware(
         client=AuthorizationClient(FakeTransport(engine, testing_only=True)),
         async_client=None,
+        tool_bindings={"counted_inventory": counted_inventory},
         tool_policies={
             "counted_inventory": LangChainActionPolicy(
                 service="inventory",
@@ -676,6 +680,7 @@ def test_untrusted_client_results_fail_closed_without_handler_or_warning() -> No
         middleware = PaloNexusLangChainMiddleware(
             client=WrongSyncClient(result),  # type: ignore[arg-type]
             async_client=None,
+            tool_bindings={"inventory_read": inventory_read},
             tool_policies={
                 "inventory_read": LangChainActionPolicy(
                     service="inventory",
@@ -691,6 +696,162 @@ def test_untrusted_client_results_fail_closed_without_handler_or_warning() -> No
             )
 
 
+def test_sync_client_exception_graph_is_discarded_and_sanitized() -> None:
+    secret = "CLIENT-SECRET-SYNC"
+    captured: list[BaseException] = []
+
+    class HostileClientError(BaseException):
+        pass
+
+    class BrokenClient:
+        authorization_client_kind = "sync"
+
+        def authorize(self, *args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            cause = ValueError(secret)
+            error = HostileClientError(secret)
+            error.__cause__ = cause
+            error.__context__ = cause
+            captured.append(error)
+            raise error
+
+    middleware = PaloNexusLangChainMiddleware(
+        client=BrokenClient(),  # type: ignore[arg-type]
+        async_client=None,
+        tool_bindings={"inventory_read": inventory_read},
+        tool_policies={
+            "inventory_read": LangChainActionPolicy(
+                service="inventory",
+                side_effect="read_only",
+            )
+        },
+        model_policies={},
+    )
+    with pytest.raises(AuthorizationUnavailable) as raised:
+        middleware.wrap_tool_call(
+            _tool_request(context=_context()),
+            lambda request: pytest.fail("handler executed"),
+        )
+
+    assert secret not in f"{raised.value!s} {raised.value!r}"
+    assert raised.value.__cause__ is None
+    assert captured[0].__traceback__ is None
+    assert captured[0].__cause__ is None
+    assert captured[0].__context__ is None
+
+
+def test_client_control_flow_exception_identity_is_preserved() -> None:
+    marker = concurrent.futures.CancelledError("cancelled")
+
+    class CancelledClient:
+        authorization_client_kind = "sync"
+
+        def authorize(self, *args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            raise marker
+
+    middleware = PaloNexusLangChainMiddleware(
+        client=CancelledClient(),  # type: ignore[arg-type]
+        async_client=None,
+        tool_bindings={"inventory_read": inventory_read},
+        tool_policies={
+            "inventory_read": LangChainActionPolicy(
+                service="inventory",
+                side_effect="read_only",
+            )
+        },
+        model_policies={},
+    )
+    with pytest.raises(concurrent.futures.CancelledError) as raised:
+        middleware.wrap_tool_call(
+            _tool_request(context=_context()),
+            lambda request: pytest.fail("handler executed"),
+        )
+    assert raised.value is marker
+
+
+def test_sync_malformed_awaitable_cleanup_is_guarded() -> None:
+    class HostileAwaitable:
+        def __await__(self) -> Any:
+            yield
+
+        def cancel(self) -> None:
+            raise RuntimeError("CANCEL-SECRET")
+
+        def close(self) -> None:
+            raise RuntimeError("CLOSE-SECRET")
+
+    class WrongClient:
+        authorization_client_kind = "sync"
+
+        def authorize(self, *args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            return HostileAwaitable()
+
+    middleware = PaloNexusLangChainMiddleware(
+        client=WrongClient(),  # type: ignore[arg-type]
+        async_client=None,
+        tool_bindings={"inventory_read": inventory_read},
+        tool_policies={
+            "inventory_read": LangChainActionPolicy(
+                service="inventory",
+                side_effect="read_only",
+            )
+        },
+        model_policies={},
+    )
+    with pytest.raises(InvalidRequest) as raised:
+        middleware.wrap_tool_call(
+            _tool_request(context=_context()),
+            lambda request: pytest.fail("handler executed"),
+        )
+    assert "SECRET" not in f"{raised.value!s} {raised.value!r}"
+
+
+def test_async_client_exception_graph_is_discarded_and_sanitized() -> None:
+    secret = "CLIENT-SECRET-ASYNC"
+    captured: list[BaseException] = []
+
+    class BrokenAsyncClient:
+        authorization_client_kind = "async"
+
+        async def authorize(self, *args: Any, **kwargs: Any) -> Any:
+            del args, kwargs
+            cause = ValueError(secret)
+            error = RuntimeError(secret)
+            error.__cause__ = cause
+            error.__context__ = cause
+            captured.append(error)
+            raise error
+
+    middleware = PaloNexusLangChainMiddleware(
+        client=None,
+        async_client=BrokenAsyncClient(),  # type: ignore[arg-type]
+        tool_bindings={"inventory_read": inventory_read},
+        tool_policies={
+            "inventory_read": LangChainActionPolicy(
+                service="inventory",
+                side_effect="read_only",
+            )
+        },
+        model_policies={},
+    )
+
+    async def scenario() -> None:
+        with pytest.raises(AuthorizationUnavailable) as raised:
+            await middleware.awrap_tool_call(
+                _tool_request(context=_context()),
+                lambda request: pytest.fail("handler executed"),
+            )
+        assert secret not in f"{raised.value!s} {raised.value!r}"
+        assert raised.value.__cause__ is None
+
+    asyncio.run(scenario())
+    assert captured[0].__traceback__ is None
+    assert captured[0].__cause__ is None
+    assert captured[0].__context__ is None
+
+
 def test_exact_non_allow_decision_from_duck_client_fails_closed() -> None:
     engine = ScriptedEngine(ScriptedEngine.deny(), testing_only=True)
     underlying = AuthorizationClient(FakeTransport(engine, testing_only=True))
@@ -704,6 +865,7 @@ def test_exact_non_allow_decision_from_duck_client_fails_closed() -> None:
     middleware = PaloNexusLangChainMiddleware(
         client=DenyClient(),  # type: ignore[arg-type]
         async_client=None,
+        tool_bindings={"inventory_read": inventory_read},
         tool_policies={
             "inventory_read": LangChainActionPolicy(
                 service="inventory",
@@ -738,6 +900,7 @@ def test_genuine_allow_from_different_attempt_is_rejected() -> None:
     middleware = PaloNexusLangChainMiddleware(
         client=ReplayClient(),  # type: ignore[arg-type]
         async_client=None,
+        tool_bindings={"inventory_read": inventory_read},
         tool_policies={
             "inventory_read": LangChainActionPolicy(
                 service="inventory",
@@ -778,6 +941,7 @@ def test_async_genuine_allow_from_different_attempt_is_rejected() -> None:
         middleware = PaloNexusLangChainMiddleware(
             client=None,
             async_client=ReplayAsyncClient(),  # type: ignore[arg-type]
+            tool_bindings={"inventory_read": inventory_read},
             tool_policies={
                 "inventory_read": LangChainActionPolicy(
                     service="inventory",
@@ -858,6 +1022,7 @@ def test_callable_kind_and_async_return_shape_fail_closed() -> None:
     middleware = PaloNexusLangChainMiddleware(
         client=None,
         async_client=NonAwaitableAsyncClient(),  # type: ignore[arg-type]
+        tool_bindings={"inventory_read": inventory_read},
         tool_policies={
             "inventory_read": LangChainActionPolicy(
                 service="inventory",
@@ -949,6 +1114,7 @@ def test_implicit_nested_context_inherits_deadline_and_cancellation() -> None:
     middleware = PaloNexusLangChainMiddleware(
         client=CaptureClient(),  # type: ignore[arg-type]
         async_client=None,
+        tool_bindings={"inventory_read": inventory_read},
         tool_policies={
             "inventory_read": LangChainActionPolicy(
                 service="inventory",
@@ -1007,6 +1173,7 @@ def test_explicit_nested_controls_clamp_and_compose_without_weakening() -> None:
     middleware = PaloNexusLangChainMiddleware(
         client=CaptureClient(),  # type: ignore[arg-type]
         async_client=None,
+        tool_bindings={"inventory_read": inventory_read},
         tool_policies={
             "inventory_read": LangChainActionPolicy(
                 service="inventory",
@@ -1079,6 +1246,7 @@ def test_async_explicit_nested_controls_clamp_and_preserve_parent() -> None:
         middleware = PaloNexusLangChainMiddleware(
             client=None,
             async_client=CaptureAsyncClient(),  # type: ignore[arg-type]
+            tool_bindings={"inventory_read": inventory_read},
             tool_policies={
                 "inventory_read": LangChainActionPolicy(
                     service="inventory",
@@ -1228,6 +1396,25 @@ def test_outer_model_substitution_is_seen_and_rejected_by_inner_guard() -> None:
         agent.invoke(
             {"messages": [{"role": "user", "content": "blocked"}]},
             context=_context(model_policy_key="primary"),
+        )
+    assert engine.recorded_calls == ()
+
+
+def test_same_name_distinct_tool_is_rejected_before_authorization() -> None:
+    replacement = tool(
+        "inventory_read",
+        description="Replacement tool.",
+    )(
+        lambda item_id: f"replacement:{item_id}",
+    )
+    middleware, engine = _middleware(ScriptedEngine.allow())
+    request = _tool_request(context=_context())
+    request = request.override(tool=replacement)
+
+    with pytest.raises(InvalidRequest):
+        middleware.wrap_tool_call(
+            request,
+            lambda value: pytest.fail("handler executed"),
         )
     assert engine.recorded_calls == ()
 

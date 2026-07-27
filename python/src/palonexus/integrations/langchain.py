@@ -43,6 +43,7 @@ try:
     from langchain.tools.tool_node import ToolCallRequest
     from langchain_core.language_models.chat_models import BaseChatModel
     from langchain_core.messages import AIMessage, ToolMessage
+    from langchain_core.tools import BaseTool
     from langgraph.types import Command
 except ImportError:
     raise MissingIntegrationDependency() from None
@@ -51,6 +52,56 @@ type SideEffect = Literal["read_only", "write", "destructive", "external"]
 _ResultT = TypeVar("_ResultT")
 _MAX_DEADLINE_HORIZON_SECONDS = 3600.0
 _SIDE_EFFECTS = frozenset({"read_only", "write", "destructive", "external"})
+_CONTROL_FLOW_ERRORS = (
+    KeyboardInterrupt,
+    SystemExit,
+    GeneratorExit,
+    concurrent.futures.CancelledError,
+    asyncio.CancelledError,
+)
+
+
+def _discard_exception_graph(error: BaseException) -> None:
+    """Sever an untrusted exception graph before raising a safe replacement."""
+
+    pending = [error]
+    seen: set[int] = set()
+    while pending:
+        current = pending.pop()
+        identity = id(current)
+        if identity in seen:
+            continue
+        seen.add(identity)
+        cause = current.__cause__
+        context = current.__context__
+        if cause is not None:
+            pending.append(cause)
+        if context is not None:
+            pending.append(context)
+        if isinstance(current, BaseExceptionGroup):
+            pending.extend(current.exceptions)
+        try:
+            current.__traceback__ = None
+            current.__cause__ = None
+            current.__context__ = None
+        except Exception:
+            pass
+
+
+def _dispose_malformed_awaitable(value: object) -> None:
+    """Best-effort cleanup without trusting close/cancel implementations."""
+
+    methods = ("close",) if inspect.iscoroutine(value) else ("cancel", "close")
+    for name in methods:
+        method = getattr(value, name, None)
+        if not callable(method):
+            continue
+        try:
+            method()
+        except BaseException as error:
+            if isinstance(error, _CONTROL_FLOW_ERRORS):
+                raise
+            _discard_exception_graph(error)
 
 
 class _LangChainCompatible:
@@ -332,6 +383,7 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
         "_client",
         "_model_bindings",
         "_model_policies",
+        "_tool_bindings",
         "_tool_policies",
     )
 
@@ -343,6 +395,7 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
         tool_policies: Mapping[str, LangChainActionPolicy],
         model_policies: Mapping[str, LangChainActionPolicy],
         model_bindings: Mapping[str, BaseChatModel] | None = None,
+        tool_bindings: Mapping[str, BaseTool] | None = None,
     ) -> None:
         if client is not None and (
             not isinstance(client, SyncAuthorizationClientProtocol)
@@ -369,16 +422,27 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
         ):
             raise InvalidRequest() from None
         self._model_bindings = MappingProxyType(bindings)
+        bound_tools = {} if tool_bindings is None else dict(tool_bindings)
+        if any(
+            type(key) is not str
+            or not key
+            or not isinstance(bound_tool, BaseTool)
+            or bound_tool.name != key
+            for key, bound_tool in bound_tools.items()
+        ):
+            raise InvalidRequest() from None
+        self._tool_bindings = MappingProxyType(bound_tools)
         self._builder = ActionRequestBuilder(
             adapter_id="palonexus-langchain",
             adapter_version="0.2.0",
             host_version=str(langchain.__version__),
         )
 
-    def _with_model_binding(
+    def _with_agent_bindings(
         self,
         policy_key: str,
         model: BaseChatModel,
+        tools: Sequence[BaseTool],
     ) -> PaloNexusLangChainMiddleware:
         if policy_key not in self._model_policies:
             raise InvalidRequest() from None
@@ -387,12 +451,20 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
         if existing is not None and existing is not model:
             raise InvalidRequest() from None
         bindings[policy_key] = model
+        tool_bindings: dict[str, BaseTool] = {}
+        for bound_tool in tools:
+            if not isinstance(bound_tool, BaseTool) or bound_tool.name in tool_bindings:
+                raise InvalidRequest() from None
+            tool_bindings[bound_tool.name] = bound_tool
+        if set(tool_bindings) != set(self._tool_policies):
+            raise InvalidRequest() from None
         return PaloNexusLangChainMiddleware(
             client=self._client,
             async_client=self._async_client,
             tool_policies=self._tool_policies,
             model_policies=self._model_policies,
             model_bindings=bindings,
+            tool_bindings=tool_bindings,
         )
 
     def _prepare(
@@ -472,14 +544,6 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
         return attempt, context, frame
 
     @staticmethod
-    def _approval(error: ApprovalRequired) -> LangChainApprovalRequired:
-        return LangChainApprovalRequired(
-            request_id=error.request_id,
-            decision_id=error.decision_id,
-            correlation_id=error.correlation_id,
-        )
-
-    @staticmethod
     def _compatible(error: PaloNexusError) -> PaloNexusError:
         identifiers = {
             "request_id": error.request_id,
@@ -498,6 +562,17 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
             return LangChainInvalidRequest(**identifiers)
         return LangChainInvalidRequest(**identifiers)
 
+    def _raise_client_error(self, error: BaseException) -> None:
+        if isinstance(error, _CONTROL_FLOW_ERRORS):
+            raise error
+        replacement: PaloNexusError
+        if isinstance(error, PaloNexusError):
+            replacement = self._compatible(error)
+        else:
+            replacement = LangChainAuthorizationUnavailable()
+        _discard_exception_graph(error)
+        raise replacement from None
+
     def _authorize(
         self,
         attempt: Any,
@@ -505,19 +580,16 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
     ) -> None:
         if self._client is None:
             raise InvalidRequest() from None
-        if _cancelled(context.cancelled):
-            raise concurrent.futures.CancelledError from None
         try:
+            if _cancelled(context.cancelled):
+                raise concurrent.futures.CancelledError
             result = self._client.authorize(
                 attempt,
                 deadline=_checked_deadline(context.deadline),
                 cancelled=context.cancelled,
             )
             if inspect.isawaitable(result):
-                if inspect.iscoroutine(result):
-                    result.close()
-                elif hasattr(result, "cancel"):
-                    result.cancel()
+                _dispose_malformed_awaitable(result)
                 raise InvalidRequest() from None
             if (
                 type(result) is not AuthorizationDecision
@@ -527,8 +599,8 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
                 or result.client_scope_hash != attempt.client_scope_hash
             ):
                 raise InvalidRequest() from None
-        except ApprovalRequired as error:
-            raise self._approval(error) from None
+        except BaseException as error:
+            self._raise_client_error(error)
         finally:
             attempt.close()
 
@@ -539,9 +611,9 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
     ) -> None:
         if self._async_client is None:
             raise InvalidRequest() from None
-        if _cancelled(context.cancelled):
-            raise asyncio.CancelledError from None
         try:
+            if _cancelled(context.cancelled):
+                raise asyncio.CancelledError
             pending = self._async_client.authorize(
                 attempt,
                 deadline=_checked_deadline(context.deadline),
@@ -558,8 +630,8 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
                 or result.client_scope_hash != attempt.client_scope_hash
             ):
                 raise InvalidRequest() from None
-        except ApprovalRequired as error:
-            raise self._approval(error) from None
+        except BaseException as error:
+            self._raise_client_error(error)
         finally:
             attempt.close()
 
@@ -594,6 +666,8 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
     ) -> ToolMessage | Command[Any]:
         try:
             name = _tool_name(request)
+            if self._tool_bindings.get(name) is not request.tool:
+                raise InvalidRequest() from None
             attempt, context, frame = self._prepare(
                 request=request,
                 name=name,
@@ -618,6 +692,8 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
     ) -> ToolMessage | Command[Any]:
         try:
             name = _tool_name(request)
+            if self._tool_bindings.get(name) is not request.tool:
+                raise InvalidRequest() from None
             attempt, context, frame = self._prepare(
                 request=request,
                 name=name,
@@ -718,17 +794,24 @@ def create_authorized_agent(
     *,
     model: BaseChatModel,
     model_policy_key: str,
-    tools: Sequence[Any],
+    tools: Sequence[BaseTool],
     authorization: PaloNexusLangChainMiddleware,
     middleware: Sequence[AgentMiddleware[Any, Any]] = (),
     **kwargs: Any,
 ) -> Any:
     """Create an agent whose final effective model/tool target is authorized."""
 
-    bound = authorization._with_model_binding(model_policy_key, model)
+    if any(not isinstance(bound_tool, BaseTool) for bound_tool in tools):
+        raise InvalidRequest() from None
+    normalized_tools = tuple(tools)
+    bound = authorization._with_agent_bindings(
+        model_policy_key,
+        model,
+        normalized_tools,
+    )
     return create_agent(
         model=model,
-        tools=tools,
+        tools=normalized_tools,
         middleware=authorized_middleware_stack(middleware, bound),
         **kwargs,
     )

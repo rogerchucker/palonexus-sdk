@@ -16,6 +16,9 @@ also receive the same object at
 an application-owned `model_policy_key`. Each model policy also binds that key
 to the exact application-supplied `BaseChatModel` object; a distinct backend
 object fails closed even if it advertises the same public name.
+`create_authorized_agent` likewise binds every configured tool policy to the
+exact supplied `BaseTool` object. A replacement tool with the same name fails
+closed before authorization or execution.
 
 Use `create_authorized_agent`, not a raw `create_agent` middleware list.
 LangChain executes middleware in onion order: the first entry is outermost and
