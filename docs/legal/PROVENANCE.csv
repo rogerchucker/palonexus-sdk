@@ -99,3 +99,12 @@ protocol/tests/test_generated_clean.py,rogerchucker/palonexus-sdk,WORKTREE,proto
 guard/pkg/protocol/generated_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/pkg/protocol/generated_test.go,PaloNexus,yes,new,MIT,rogerchucker
 go.mod,rogerchucker/palonexus-sdk,WORKTREE,go.mod,PaloNexus,yes,new,MIT,rogerchucker
 protocol/generated-runtime-v1.md,rogerchucker/palonexus-sdk,WORKTREE,protocol/generated-runtime-v1.md,PaloNexus,yes,new,MIT,rogerchucker
+.github/workflows/ci.yml,rogerchucker/palonexus-sdk,WORKTREE,.github/workflows/ci.yml,PaloNexus,yes,new,MIT,rogerchucker
+.github/workflows/codeql.yml,rogerchucker/palonexus-sdk,WORKTREE,.github/workflows/codeql.yml,PaloNexus,yes,new,MIT,rogerchucker
+.github/workflows/dependency-review.yml,rogerchucker/palonexus-sdk,WORKTREE,.github/workflows/dependency-review.yml,PaloNexus,yes,new,MIT,rogerchucker
+.github/dependabot.yml,rogerchucker/palonexus-sdk,WORKTREE,.github/dependabot.yml,PaloNexus,yes,new,MIT,rogerchucker
+.gitleaks.toml,rogerchucker/palonexus-sdk,WORKTREE,.gitleaks.toml,PaloNexus,yes,new,MIT,rogerchucker
+.gitleaksignore,rogerchucker/palonexus-sdk,WORKTREE,.gitleaksignore,PaloNexus,yes,new,MIT,rogerchucker
+scripts/verify,rogerchucker/palonexus-sdk,WORKTREE,scripts/verify,PaloNexus,yes,new,MIT,rogerchucker
+foundation_tests/test_workflows.py,rogerchucker/palonexus-sdk,WORKTREE,foundation_tests/test_workflows.py,PaloNexus,yes,new,MIT,rogerchucker
+CONTRIBUTING.md,rogerchucker/palonexus-sdk,WORKTREE,CONTRIBUTING.md,PaloNexus,yes,new,MIT,rogerchucker

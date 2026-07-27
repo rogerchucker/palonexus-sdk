@@ -23,9 +23,7 @@ def test_repository_has_public_governance_and_uv_workspace() -> None:
 
 
 def test_python_distribution_has_public_metadata() -> None:
-    project = tomllib.loads((ROOT / "python" / "pyproject.toml").read_text())[
-        "project"
-    ]
+    project = tomllib.loads((ROOT / "python" / "pyproject.toml").read_text())["project"]
 
     assert project["name"] == "palonexus"
     assert project["dynamic"] == ["version"]

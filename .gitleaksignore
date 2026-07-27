@@ -1,0 +1,6 @@
+c751645bfb82eaece6ede36276b67df7ad319f2a:protocol/test-vectors/approval/valid/approved.json:generic-api-key:18
+c751645bfb82eaece6ede36276b67df7ad319f2a:protocol/test-vectors/approval/valid/denied.json:generic-api-key:18
+c751645bfb82eaece6ede36276b67df7ad319f2a:protocol/test-vectors/approval/valid/cancelled.json:generic-api-key:17
+c751645bfb82eaece6ede36276b67df7ad319f2a:protocol/test-vectors/approval/valid/approved-arbitrary-precision.json:generic-api-key:18
+c751645bfb82eaece6ede36276b67df7ad319f2a:protocol/test-vectors/approval/valid/expired.json:generic-api-key:17
+182c288dbc5a98033b914b97f58125f6d0c1974d:docs/superpowers/plans/2026-07-26-palonexus-sdk-guard.md:generic-api-key:5

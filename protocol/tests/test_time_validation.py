@@ -56,10 +56,7 @@ def test_public_validator_has_task5_document_api() -> None:
 
 def test_invalid_time_order_is_rejected_by_public_validator() -> None:
     decision = _json(
-        VECTORS
-        / "decision"
-        / "semantic-invalid"
-        / "invalid-time-order.json"
+        VECTORS / "decision" / "semantic-invalid" / "invalid-time-order.json"
     )
 
     with pytest.raises(validate.ProtocolValidationError, match="decision_expiry_order"):
@@ -116,9 +113,7 @@ def test_every_task5_timestamp_is_strictly_parsed() -> None:
     with pytest.raises(validate.ProtocolValidationError, match="timestamp_invalid"):
         validate.validate_decision_document(decision)
 
-    decision = _json(
-        VECTORS / "decision" / "valid" / "approval-required.json"
-    )
+    decision = _json(VECTORS / "decision" / "valid" / "approval-required.json")
     decision["approval"]["expiresAt"] = "2026-02-30T20:17:01Z"
     with pytest.raises(validate.ProtocolValidationError, match="timestamp_invalid"):
         validate.validate_decision_document(decision)
@@ -191,11 +186,11 @@ def test_structural_invalid_vectors_fail_closed() -> None:
         ("action", "target.service", "../admin"),
         ("action", "target.resource", "workspace:/deploy/../secret"),
         ("action", "adapter.version", "1.0.0-01"),
-        ("action", "context.safeDisplay", "safe\u202Ehidden"),
+        ("action", "context.safeDisplay", "safe\u202ehidden"),
         ("action", "context.safeDisplay", "safe\u2028hidden"),
         ("decision", "displayReason", "safe\u0085hidden"),
         ("decision", "displayReason", "safe\u2029hidden"),
-        ("decision", "reasonCode", "policy_allowed\u001B"),
+        ("decision", "reasonCode", "policy_allowed\u001b"),
     ),
 )
 def test_controls_traversal_and_ambiguous_strings_are_rejected(
@@ -235,9 +230,7 @@ def test_recursive_extension_property_names_are_bounded_and_safe(
 @pytest.mark.parametrize("value", (float("inf"), float("-inf"), float("nan")))
 def test_in_memory_non_finite_extension_numbers_fail_closed(value: float) -> None:
     action = _action()
-    action["extensions"]["dev.palonexus.example.v1"] = {
-        "nested": {"value": value}
-    }
+    action["extensions"]["dev.palonexus.example.v1"] = {"nested": {"value": value}}
 
     with pytest.raises(validate.ProtocolValidationError):
         validate.validate_action_document(action)
@@ -310,10 +303,7 @@ def test_validation_document_is_explicitly_task5_only() -> None:
 
 def test_cli_rejects_invalid_time_order_without_echoing_payload() -> None:
     decision_path = (
-        VECTORS
-        / "decision"
-        / "semantic-invalid"
-        / "invalid-time-order.json"
+        VECTORS / "decision" / "semantic-invalid" / "invalid-time-order.json"
     )
     decision = _json(decision_path)
     result = subprocess.run(

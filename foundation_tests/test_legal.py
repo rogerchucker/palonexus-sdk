@@ -76,9 +76,7 @@ def _legal_fixture(tmp_path: Path, *, pyproject: str = "") -> Path:
     (tmp_path / "LICENSE").write_text("MIT License\n", encoding="utf-8")
     if pyproject:
         (tmp_path / "python").mkdir()
-        (tmp_path / "python" / "pyproject.toml").write_text(
-            pyproject, encoding="utf-8"
-        )
+        (tmp_path / "python" / "pyproject.toml").write_text(pyproject, encoding="utf-8")
     return tmp_path
 
 
@@ -345,8 +343,7 @@ def test_verifier_requires_python_dependencies_in_lock(tmp_path: Path) -> None:
         ),
         (
             "guard/Cargo.toml",
-            '[package]\nname="guard"\nversion="1.0.0"\n'
-            '[dependencies]\nserde="1"\n',
+            '[package]\nname="guard"\nversion="1.0.0"\n[dependencies]\nserde="1"\n',
             "unsupported dependency reconciliation: cargo",
         ),
     ],
@@ -409,8 +406,7 @@ def test_verifier_rejects_locked_version_drift(tmp_path: Path) -> None:
 
     assert result.returncode == 1
     assert (
-        "dependency version drift: demo (inventory 2.0, expected 1.0)"
-        in result.stdout
+        "dependency version drift: demo (inventory 2.0, expected 1.0)" in result.stdout
     )
 
 
@@ -418,8 +414,7 @@ def test_verifier_rejects_lock_constraint_mismatch(tmp_path: Path) -> None:
     repository = _legal_fixture(
         tmp_path,
         pyproject=(
-            '[project]\nname="palonexus"\nlicense="MIT"\n'
-            'dependencies=["demo>=2.0"]\n'
+            '[project]\nname="palonexus"\nlicense="MIT"\ndependencies=["demo>=2.0"]\n'
         ),
     )
     (repository / "uv.lock").write_text(
@@ -689,9 +684,7 @@ def test_verifier_rejects_symlinked_release_artifact(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize("limit_kind", ["entries", "bytes"])
-def test_verifier_bounds_archive_inspection(
-    tmp_path: Path, limit_kind: str
-) -> None:
+def test_verifier_bounds_archive_inspection(tmp_path: Path, limit_kind: str) -> None:
     repository = _legal_fixture(tmp_path)
     artifact = repository / "dist" / "oversized.whl"
     artifact.parent.mkdir()
@@ -706,9 +699,7 @@ def test_verifier_bounds_archive_inspection(
 
     assert result.returncode == 1
     expected = (
-        "too many archive entries"
-        if limit_kind == "entries"
-        else "archive too large"
+        "too many archive entries" if limit_kind == "entries" else "archive too large"
     )
     assert expected in result.stdout
 
@@ -719,9 +710,7 @@ def test_verifier_rejects_suspicious_archive_compression_ratio(
     repository = _legal_fixture(tmp_path)
     artifact = repository / "dist" / "compressed.zip"
     artifact.parent.mkdir()
-    with zipfile.ZipFile(
-        artifact, "w", compression=zipfile.ZIP_DEFLATED
-    ) as archive:
+    with zipfile.ZipFile(artifact, "w", compression=zipfile.ZIP_DEFLATED) as archive:
         archive.writestr("LICENSE", "MIT License\n")
         archive.writestr("payload", b"\0" * (10 * 1024 * 1024))
 

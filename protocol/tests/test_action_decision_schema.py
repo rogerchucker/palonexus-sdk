@@ -134,12 +134,14 @@ def test_adapter_label_is_diagnostic_and_cannot_select_trusted_identity(
     action_validator: Draft202012Validator,
 ) -> None:
     action = _read_json(VECTORS / "action" / "valid" / "file-write.json")
-    assert "diagnostic" in action_validator.schema["properties"]["adapter"][
-        "description"
-    ].lower()
-    assert "non-authoritative" in action_validator.schema["properties"]["adapter"][
-        "description"
-    ].lower()
+    assert (
+        "diagnostic"
+        in action_validator.schema["properties"]["adapter"]["description"].lower()
+    )
+    assert (
+        "non-authoritative"
+        in action_validator.schema["properties"]["adapter"]["description"].lower()
+    )
 
     action["adapter"]["clientId"] = "privileged-client"
     assert _errors(action_validator, action)
@@ -186,9 +188,7 @@ def test_decision_requires_both_scope_hash_fields(
 def test_missing_authenticated_identity_is_a_fail_closed_deny(
     decision_validator: Draft202012Validator,
 ) -> None:
-    decision = _read_json(
-        VECTORS / "decision" / "valid" / "deny-missing-identity.json"
-    )
+    decision = _read_json(VECTORS / "decision" / "valid" / "deny-missing-identity.json")
     assert decision["outcome"] == "deny"
     assert decision["reasonCode"] == "missing_identity"
     assert _errors(decision_validator, decision) == []

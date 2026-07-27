@@ -1,0 +1,4 @@
+title = "PaloNexus SDK secret scanning policy"
+
+[extend]
+useDefault = true

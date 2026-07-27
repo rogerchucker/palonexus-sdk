@@ -22,10 +22,14 @@ commands. Do not use `pip`, checked-in virtual environments, or ad hoc
 requirements files.
 
 ```console
-uv sync
-uv run pytest
-uv run ruff check .
+uv sync --frozen
+scripts/verify
 ```
+
+The explicit sync is the only verification phase allowed to fetch locked
+artifacts. `scripts/verify` then runs frozen, offline, and without syncing. It
+also selects the security-patched Go 1.25.12 toolchain declared in `go.mod`;
+the module language baseline remains Go 1.25.0.
 
 Keep changes focused, add tests before implementation, update documentation,
 and record user-visible changes in `CHANGELOG.md`. Pull requests must explain

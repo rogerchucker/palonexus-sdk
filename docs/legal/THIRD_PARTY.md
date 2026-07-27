@@ -19,8 +19,10 @@ not substitutes for this review.
 
 Protocol type generation uses the Python standard library, the reviewed and
 locked JSON Schema validator for Draft 2020-12 meta-schema checks, the reviewed
-and locked Ruff formatter, and `gofmt` from the Go 1.25 baseline declared in
-`go.mod`. The generated Python and Go DTOs add no runtime package dependency.
+and locked Ruff formatter, and `gofmt` from the security-patched Go 1.25.12
+toolchain declared in `go.mod`. The module retains the Go 1.25.0 language
+baseline while verification rejects any selected build toolchain other than
+Go 1.25.12. The generated Python and Go DTOs add no runtime package dependency.
 Their stable headers bind each output to the generator version and the SHA-256
 digest of all source schemas.
 
@@ -45,8 +47,10 @@ build environments so their resolver cannot float a transitive build tool.
 The verifier derives that closure from `uv.lock` and requires every member to
 be present as an exact build requirement.
 
-Verification runs `uv lock --check --offline`, checks every manifest constraint
-against the locked version, requires the canonical PyPI registry and
+After one explicit `uv sync --frozen`, verification runs
+`uv lock --check --offline`; every `uv run` uses
+`--frozen --offline --no-sync`. It checks every manifest constraint against the
+locked version, requires the canonical PyPI registry and
 `files.pythonhosted.org` artifact host, and requires SHA-256 hashes for every
 locked distribution without contacting the network.
 
@@ -66,6 +70,7 @@ locked distribution without contacting the network.
 | pluggy | 1.6.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | pygments | 2.20.0 | BSD-2-Clause | reviewed | Retain notices | None identified | PyPI |
 | pytest | 9.1.1 | MIT | reviewed | Retain notices | None identified | PyPI |
+| pyyaml | 6.0.3 | MIT | reviewed | Retain notices | None identified | PyPI |
 | referencing | 0.37.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | rpds-py | 2026.6.3 | MIT | reviewed | Retain notices | None identified | PyPI |
 | ruff | 0.16.0 | MIT | reviewed | Retain notices | None identified | PyPI |
@@ -76,3 +81,19 @@ locked distribution without contacting the network.
 | unicodedata2 | 15.1.0 | Apache-2.0 | reviewed | Retain license and notices | None supplied | PyPI |
 | vcs-versioning | 2.2.2 | MIT | reviewed | Retain notices | None identified | PyPI |
 <!-- dependency-inventory:end -->
+
+## CI-only tools and actions
+
+CI does not distribute its tools with PaloNexus artifacts. GitHub-hosted actions
+are restricted to the `actions`, `astral-sh`, and `github` organizations,
+pinned to full immutable commit IDs, and annotated with their reviewed release
+versions in each workflow. Dependency caches are disabled for untrusted pull
+request execution.
+
+Secret scanning runs the MIT-licensed Gitleaks module at the exact
+`github.com/zricethezav/gitleaks/v8@v8.30.1` version through Go's authenticated
+module mechanism. The repository does not use the separately licensed
+`gitleaks-action` bundle. Historical false positives are suppressed only by
+exact commit/path/rule/line fingerprints in `.gitleaksignore`; no path or regex
+allowlist is used. The CodeQL analysis action is a GitHub-provided service
+integration and its results are not distributed in release artifacts.

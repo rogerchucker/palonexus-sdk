@@ -97,6 +97,7 @@ def test_generation_tool_metadata_pins_contract_inputs_and_outputs() -> None:
     go_mod = (ROOT / "go.mod").read_text(encoding="utf-8")
     assert "module github.com/rogerchucker/palonexus-sdk" in go_mod
     assert re.search(r"^go 1\.25(?:\.0)?$", go_mod, re.MULTILINE)
+    assert re.search(r"^toolchain go1\.25\.12$", go_mod, re.MULTILINE)
 
 
 def test_check_mode_reports_stale_output_without_rewriting_it(tmp_path: Path) -> None:

@@ -1,0 +1,188 @@
+#!/bin/sh
+
+set -eu
+
+EX_DATAERR=65
+EX_USAGE=64
+EX_CONFIG=78
+ROOT=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+
+usage() {
+    cat <<'EOF'
+Usage: scripts/verify [MODE]
+
+Without a mode, run the complete foundation and protocol verification suite.
+Run "uv sync --frozen" once first. Verification then keeps every Python
+invocation frozen, offline, and no-sync.
+
+Modes:
+  --python-only              Run locked Python, protocol, generation, and legal checks.
+  --go-only                  Run Go 1.25.12 formatting, vet, and tests.
+  --host-gate-only           Require and run the trusted Gate 0 fixture verifier.
+  --require-host-gate        Run the complete suite and then require Gate 0.
+  --dco-commit COMMIT        Verify one commit's DCO author sign-off.
+  --dco-range BASE HEAD      Verify each commit in BASE..HEAD.
+  --help                     Show this help.
+EOF
+}
+
+fail_usage() {
+    printf '%s\n' "$1" >&2
+    usage >&2
+    exit "$EX_USAGE"
+}
+
+select_go_toolchain() {
+    selected_go=$(GOTOOLCHAIN=go1.25.12+auto go version)
+    case "$selected_go" in
+        "go version go1.25.12 "*) ;;
+        *)
+            printf 'expected Go 1.25.12, selected: %s\n' "$selected_go" >&2
+            exit "$EX_CONFIG"
+            ;;
+    esac
+    go_root=$(GOTOOLCHAIN=go1.25.12+auto go env GOROOT)
+    PATH="$go_root/bin:$PATH"
+    export PATH
+}
+
+run_python() {
+    select_go_toolchain
+    uv lock --check --offline
+    uv run --frozen --offline --no-sync ruff format --check \
+        python protocol scripts foundation_tests
+    uv run --frozen --offline --no-sync ruff check \
+        python protocol scripts foundation_tests
+    uv run --frozen --offline --no-sync python scripts/generate_protocol.py --check
+    uv run --frozen --offline --no-sync pytest foundation_tests protocol/tests -q
+    uv run --frozen --offline --no-sync python scripts/verify_legal.py
+}
+
+run_go() {
+    select_go_toolchain
+    unformatted=$("$go_root/bin/gofmt" -l guard)
+    if [ -n "$unformatted" ]; then
+        printf 'Go files require gofmt 1.25.12:\n%s\n' "$unformatted" >&2
+        exit 1
+    fi
+    GOTOOLCHAIN=go1.25.12+auto go vet ./...
+    GOTOOLCHAIN=go1.25.12+auto go test ./...
+}
+
+run_host_gate() {
+    verifier="$ROOT/scripts/verify_host_fixtures.py"
+    if [ ! -f "$verifier" ]; then
+        printf '%s\n' \
+            "Gate 0 is not ready: trusted host fixture verifier is absent." >&2
+        exit "$EX_CONFIG"
+    fi
+    python3 "$verifier"
+}
+
+require_commit() {
+    oid=$1
+    case "$oid" in
+        "" | *[!0-9a-f]*)
+            fail_usage "commit identifiers must be full lowercase hexadecimal OIDs"
+            ;;
+    esac
+    if [ "${#oid}" -ne 40 ]; then
+        fail_usage "commit identifiers must be full 40-character OIDs"
+    fi
+    if ! git -C "$ROOT" cat-file -e "$oid^{commit}" 2>/dev/null; then
+        fail_usage "commit does not exist: $oid"
+    fi
+}
+
+check_dco_commit() {
+    oid=$1
+    author=$(git -C "$ROOT" show -s --format='%an <%ae>' "$oid")
+    trailers=$(
+        git -C "$ROOT" show -s --format=%B "$oid" |
+            git -C "$ROOT" interpret-trailers --parse
+    )
+    expected="Signed-off-by: $author"
+    if ! printf '%s\n' "$trailers" | grep -F -x -q "$expected"; then
+        printf '%s: missing author DCO trailer %s\n' "$oid" "$expected" >&2
+        exit "$EX_DATAERR"
+    fi
+}
+
+check_dco_range() {
+    base=$1
+    head=$2
+    require_commit "$base"
+    require_commit "$head"
+    commits=$(git -C "$ROOT" rev-list --reverse "$base..$head")
+    if [ -z "$commits" ]; then
+        printf 'DCO range contains no commits: %s..%s\n' "$base" "$head" >&2
+        exit "$EX_DATAERR"
+    fi
+    for oid in $commits; do
+        check_dco_commit "$oid"
+    done
+}
+
+mode=${1-}
+case "$mode" in
+    "")
+        if [ "$#" -ne 0 ]; then
+            fail_usage "unexpected arguments"
+        fi
+        cd "$ROOT"
+        run_python
+        run_go
+        ;;
+    --help)
+        if [ "$#" -ne 1 ]; then
+            fail_usage "--help accepts no arguments"
+        fi
+        usage
+        ;;
+    --python-only)
+        if [ "$#" -ne 1 ]; then
+            fail_usage "--python-only accepts no arguments"
+        fi
+        cd "$ROOT"
+        run_python
+        ;;
+    --go-only)
+        if [ "$#" -ne 1 ]; then
+            fail_usage "--go-only accepts no arguments"
+        fi
+        cd "$ROOT"
+        run_go
+        ;;
+    --host-gate-only)
+        if [ "$#" -ne 1 ]; then
+            fail_usage "--host-gate-only accepts no arguments"
+        fi
+        cd "$ROOT"
+        run_host_gate
+        ;;
+    --require-host-gate)
+        if [ "$#" -ne 1 ]; then
+            fail_usage "--require-host-gate accepts no arguments"
+        fi
+        cd "$ROOT"
+        run_python
+        run_go
+        run_host_gate
+        ;;
+    --dco-commit)
+        if [ "$#" -ne 2 ]; then
+            fail_usage "--dco-commit requires one full commit OID"
+        fi
+        require_commit "$2"
+        check_dco_commit "$2"
+        ;;
+    --dco-range)
+        if [ "$#" -ne 3 ]; then
+            fail_usage "--dco-range requires full BASE and HEAD commit OIDs"
+        fi
+        check_dco_range "$2" "$3"
+        ;;
+    *)
+        fail_usage "unknown mode: $mode"
+        ;;
+esac

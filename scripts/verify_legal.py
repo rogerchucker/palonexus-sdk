@@ -124,9 +124,9 @@ def _source_tree_paths(errors: list[str]) -> dict[str, str]:
         errors.append("missing source-tree manifest: docs/legal/SOURCE_TREE.txt")
         return {}
     try:
-        header_text, inventory_text = SOURCE_TREE.read_text(
-            encoding="utf-8"
-        ).split("\n\n", 1)
+        header_text, inventory_text = SOURCE_TREE.read_text(encoding="utf-8").split(
+            "\n\n", 1
+        )
         header = dict(
             line.split(": ", 1) for line in header_text.splitlines() if ": " in line
         )
@@ -180,8 +180,7 @@ def _read_provenance(
             reader = csv.DictReader(stream, strict=True)
             if reader.fieldnames != EXPECTED_COLUMNS:
                 errors.append(
-                    "invalid provenance columns: expected "
-                    + ",".join(EXPECTED_COLUMNS)
+                    "invalid provenance columns: expected " + ",".join(EXPECTED_COLUMNS)
                 )
                 return {}
             rows = list(reader)
@@ -572,10 +571,7 @@ def _tar_evidence(path: Path, errors: list[str]) -> list[tuple[str, bytes]]:
                         return []
                     evidence.append((member.name, contents))
     compressed_size = path.stat().st_size
-    if (
-        compressed_size
-        and total_size / compressed_size > MAX_COMPRESSION_RATIO
-    ):
+    if compressed_size and total_size / compressed_size > MAX_COMPRESSION_RATIO:
         errors.append(f"suspicious archive compression ratio: {path.relative_to(ROOT)}")
         return []
     return evidence
@@ -640,8 +636,7 @@ def _check_archives(errors: list[str]) -> None:
         if not evidence:
             if not any(str(relative) in error for error in errors):
                 errors.append(
-                    f"archive lacks authoritative license evidence: "
-                    f"{relative}"
+                    f"archive lacks authoritative license evidence: {relative}"
                 )
             continue
         metadata_members = [
@@ -650,23 +645,18 @@ def _check_archives(errors: list[str]) -> None:
             if name.endswith(".dist-info/METADATA")
         ]
         metadata_results = [
-            _metadata_is_palonexus_mit(contents)
-            for _, contents in metadata_members
+            _metadata_is_palonexus_mit(contents) for _, contents in metadata_members
         ]
         project_mit = any(mit for mit, _ in metadata_results)
         project_conflict = any(conflict for _, conflict in metadata_results)
-        root_licenses = [
-            contents for name, contents in evidence if _root_license(name)
-        ]
+        root_licenses = [contents for name, contents in evidence if _root_license(name)]
         canonical_license = (ROOT / "LICENSE").read_bytes().replace(b"\r\n", b"\n")
         root_license_matches = (
             len(root_licenses) == 1
             and root_licenses[0].replace(b"\r\n", b"\n") == canonical_license
         )
         if project_conflict:
-            errors.append(
-                f"conflicting or proprietary archive metadata: {relative}"
-            )
+            errors.append(f"conflicting or proprietary archive metadata: {relative}")
         elif path.name.endswith(".whl") and (
             len(metadata_members) != 1 or not project_mit
         ):
@@ -812,9 +802,11 @@ def _manifest_dependencies(errors: list[str]) -> dict[str, str]:
                         if name is not None:
                             match = REQUIREMENT_NAME.match(requirement.strip())
                             assert match is not None
-                            constraint = requirement.strip()[match.end() :].split(
-                                ";", 1
-                            )[0].strip()
+                            constraint = (
+                                requirement.strip()[match.end() :]
+                                .split(";", 1)[0]
+                                .strip()
+                            )
                             build_requirements_by_name[name] = constraint or "*"
         groups = data.get("dependency-groups", {})
         if isinstance(groups, dict):
@@ -871,9 +863,8 @@ def _manifest_dependencies(errors: list[str]) -> dict[str, str]:
     for go_mod in ROOT.rglob("go.mod"):
         relative = go_mod.relative_to(ROOT)
         contents = go_mod.read_text(encoding="utf-8")
-        if (
-            not IGNORED_PARTS.intersection(relative.parts)
-            and re.search(r"(?m)^\s*require(?:\s|\()", contents)
+        if not IGNORED_PARTS.intersection(relative.parts) and re.search(
+            r"(?m)^\s*require(?:\s|\()", contents
         ):
             errors.append(f"unsupported dependency reconciliation: go ({relative})")
     for go_sum in ROOT.rglob("go.sum"):
@@ -977,8 +968,7 @@ def _manifest_dependencies(errors: list[str]) -> dict[str, str]:
     for name, constraints in constraints_by_name.items():
         version = dependencies.get(name)
         if version is not None and any(
-            not _satisfies_constraint(version, constraint)
-            for constraint in constraints
+            not _satisfies_constraint(version, constraint) for constraint in constraints
         ):
             errors.append(f"locked version violates manifest constraint: {name}")
     build_closure: set[str] = set()
@@ -992,10 +982,7 @@ def _manifest_dependencies(errors: list[str]) -> dict[str, str]:
     for name in sorted(build_closure):
         version = dependencies.get(name)
         constraint = build_requirements_by_name.get(name)
-        if (
-            version is None
-            or constraint != f"=={version}"
-        ):
+        if version is None or constraint != f"=={version}":
             errors.append(f"build dependency closure is not exactly pinned: {name}")
     return dependencies
 
