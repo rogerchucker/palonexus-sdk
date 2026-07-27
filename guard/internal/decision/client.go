@@ -20,27 +20,39 @@ import (
 	"net/netip"
 	"net/url"
 	"regexp"
+	"runtime"
 	"strconv"
 	"strings"
 	"time"
 
+	"github.com/rogerchucker/palonexus-sdk/guard/internal/config"
 	"github.com/rogerchucker/palonexus-sdk/guard/internal/normalize"
 	"github.com/rogerchucker/palonexus-sdk/guard/pkg/protocol"
 )
 
 const MaxResponseBytes = 256 << 10
 
-type TokenSource func(context.Context) (string, error)
+// TokenSource transfers ownership of a fresh bearer-token buffer to the
+// client. Decide overwrites the complete buffer before it returns. A source
+// must return a distinct buffer for every concurrent call and honor ctx.
+type TokenSource func(context.Context) ([]byte, error)
+
+// TLSOptions is the complete caller-configurable TLS surface. It deliberately
+// exposes no dial, verification, proxy, redirect, or RoundTripper hooks.
+type TLSOptions struct {
+	RootCAs            *x509.CertPool
+	ClientCertificates []tls.Certificate
+	MinVersion         uint16
+	MaxVersion         uint16
+}
 
 type Options struct {
 	Endpoint     string
-	RootCAs      *x509.CertPool
-	HTTPClient   *http.Client
+	TLS          TLSOptions
 	AccessToken  TokenSource
 	Timeout      time.Duration
 	MaxClockSkew time.Duration
 	Now          func() time.Time
-	testing      bool
 }
 
 type Client struct {
@@ -49,18 +61,57 @@ type Client struct {
 	token    TokenSource
 	now      func() time.Time
 	skew     time.Duration
+	timeout  time.Duration
 }
 
 func (*Client) String() string     { return "decision.Client{configuration:[REDACTED]}" }
 func (c *Client) GoString() string { return c.String() }
 
-func newForTesting(options Options) (*Client, error) {
-	options.testing = true
-	return New(options)
+type transportControls struct {
+	resolver ipResolver
+	dial     contextDialer
 }
 
+// New constructs the production HTTPS-only client.
 func New(options Options) (*Client, error) {
-	endpoint, err := validateEndpoint(options.Endpoint)
+	return newClient(options, false, transportControls{})
+}
+
+// NewFromConfig constructs a client from a configuration that has already
+// enforced the file-plus-runtime local-test opt-in. Callers cannot enable
+// plaintext transport through Options.
+func NewFromConfig(configuration *config.Config, options Options) (*Client, error) {
+	if configuration == nil || options.Endpoint != "" {
+		return nil, ErrInvalidConfig
+	}
+	options.Endpoint = configuration.DecisionEndpoint()
+	pem := configuration.TrustedCAPEM()
+	parsedEndpoint, parseErr := url.Parse(options.Endpoint)
+	if parseErr != nil {
+		return nil, ErrInvalidConfig
+	}
+	if len(pem) != 0 && parsedEndpoint.Scheme == "https" {
+		if options.TLS.RootCAs != nil {
+			return nil, ErrInvalidConfig
+		}
+		pool := x509.NewCertPool()
+		if !pool.AppendCertsFromPEM(pem) {
+			return nil, ErrInvalidConfig
+		}
+		options.TLS.RootCAs = pool
+	}
+	return newClient(options, configuration.LocalTestMode(), transportControls{})
+}
+
+func newWithNetworkForTesting(options Options, controls transportControls) (*Client, error) {
+	if controls.resolver == nil || controls.dial == nil {
+		return nil, ErrInvalidConfig
+	}
+	return newClient(options, false, controls)
+}
+
+func newClient(options Options, allowLocalHTTP bool, controls transportControls) (*Client, error) {
+	endpoint, scheme, localHTTP, err := validateEndpoint(options.Endpoint, allowLocalHTTP)
 	if err != nil || options.AccessToken == nil {
 		return nil, ErrInvalidConfig
 	}
@@ -85,73 +136,140 @@ func New(options Options) (*Client, error) {
 	if options.Timeout > 15*time.Second {
 		return nil, ErrInvalidConfig
 	}
-	var transport *http.Transport
-	if options.testing && options.HTTPClient != nil {
-		if base, ok := options.HTTPClient.Transport.(*http.Transport); ok {
-			transport = base.Clone()
-			if base.TLSClientConfig != nil {
-				transport.TLSClientConfig = base.TLSClientConfig.Clone()
-			}
-		} else {
-			// Test-only custom transports are retained for deterministic mock TLS.
-			client := *options.HTTPClient
-			client.CheckRedirect = rejectRedirect
-			if client.Timeout == 0 || client.Timeout > options.Timeout {
-				client.Timeout = options.Timeout
-			}
-			return &Client{endpoint: endpoint, http: &client, token: options.AccessToken, now: options.Now, skew: options.MaxClockSkew}, nil
-		}
-	} else {
-		transport = http.DefaultTransport.(*http.Transport).Clone()
+	tlsConfig, err := buildTLSConfig(options.TLS, localHTTP)
+	if err != nil {
+		return nil, err
 	}
+	transport := http.DefaultTransport.(*http.Transport).Clone()
 	transport.Proxy = nil
 	transport.DisableCompression = true
-	if !options.testing {
-		transport.DialContext = safeDial
+	resolver := controls.resolver
+	if resolver == nil {
+		resolver = net.DefaultResolver
 	}
-	tlsConfig := transport.TLSClientConfig
-	if tlsConfig == nil {
-		tlsConfig = &tls.Config{}
+	dial := controls.dial
+	if dial == nil {
+		dialer := &net.Dialer{}
+		dial = dialer.DialContext
+	}
+	if localHTTP {
+		host := mustEndpointHost(endpoint)
+		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			return dialLoopback(ctx, network, address, host, dial)
+		}
 	} else {
-		tlsConfig = tlsConfig.Clone()
+		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
+			return dialResolved(ctx, network, address, resolver, dial)
+		}
 	}
-	if tlsConfig.MinVersion < tls.VersionTLS12 {
-		tlsConfig.MinVersion = tls.VersionTLS12
+	if scheme == "https" {
+		transport.TLSClientConfig = tlsConfig
+	} else {
+		transport.TLSClientConfig = nil
 	}
-	if options.RootCAs != nil {
-		tlsConfig.RootCAs = options.RootCAs.Clone()
-	}
-	transport.TLSClientConfig = tlsConfig
 	return &Client{
 		endpoint: endpoint,
 		http:     &http.Client{Transport: transport, Timeout: options.Timeout, CheckRedirect: rejectRedirect},
 		token:    options.AccessToken, now: options.Now, skew: options.MaxClockSkew,
+		timeout: options.Timeout,
 	}, nil
+}
+
+func buildTLSConfig(options TLSOptions, plaintext bool) (*tls.Config, error) {
+	if plaintext {
+		if options.RootCAs != nil || len(options.ClientCertificates) != 0 ||
+			options.MinVersion != 0 || options.MaxVersion != 0 {
+			return nil, ErrInvalidConfig
+		}
+		return nil, nil
+	}
+	minimum := options.MinVersion
+	if minimum == 0 {
+		minimum = tls.VersionTLS12
+	}
+	if minimum != tls.VersionTLS12 && minimum != tls.VersionTLS13 {
+		return nil, ErrInvalidConfig
+	}
+	if options.MaxVersion != 0 &&
+		(options.MaxVersion != tls.VersionTLS12 && options.MaxVersion != tls.VersionTLS13 ||
+			options.MaxVersion < minimum) {
+		return nil, ErrInvalidConfig
+	}
+	if len(options.ClientCertificates) > 8 {
+		return nil, ErrInvalidConfig
+	}
+	certificates := make([]tls.Certificate, len(options.ClientCertificates))
+	for index := range options.ClientCertificates {
+		certificate := cloneCertificate(options.ClientCertificates[index])
+		if len(certificate.Certificate) == 0 || certificate.PrivateKey == nil {
+			return nil, ErrInvalidConfig
+		}
+		certificates[index] = certificate
+	}
+	result := &tls.Config{
+		MinVersion:   minimum,
+		MaxVersion:   options.MaxVersion,
+		Certificates: certificates,
+	}
+	if options.RootCAs != nil {
+		result.RootCAs = options.RootCAs.Clone()
+	}
+	return result, nil
+}
+
+func cloneCertificate(source tls.Certificate) tls.Certificate {
+	result := source
+	result.Certificate = make([][]byte, len(source.Certificate))
+	for index := range source.Certificate {
+		result.Certificate[index] = append([]byte(nil), source.Certificate[index]...)
+	}
+	result.OCSPStaple = append([]byte(nil), source.OCSPStaple...)
+	result.SignedCertificateTimestamps = make([][]byte, len(source.SignedCertificateTimestamps))
+	for index := range source.SignedCertificateTimestamps {
+		result.SignedCertificateTimestamps[index] =
+			append([]byte(nil), source.SignedCertificateTimestamps[index]...)
+	}
+	return result
 }
 
 func rejectRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 
-func validateEndpoint(raw string) (string, error) {
+func validateEndpoint(raw string, allowLocalHTTP bool) (string, string, bool, error) {
 	for _, r := range raw {
 		if r <= 0x1f || r == 0x7f {
-			return "", ErrInvalidConfig
+			return "", "", false, ErrInvalidConfig
 		}
 	}
 	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Scheme != "https" || parsed.Host == "" ||
+	if err != nil || parsed.Host == "" ||
 		parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" ||
 		parsed.ForceQuery || parsed.Fragment != "" || parsed.Opaque != "" ||
 		strings.HasSuffix(parsed.Host, ":") || !validEndpointHost(parsed.Hostname()) ||
 		!validEndpointPath(parsed) {
-		return "", ErrInvalidConfig
+		return "", "", false, ErrInvalidConfig
 	}
 	if port := parsed.Port(); port != "" {
 		number, portErr := strconv.Atoi(port)
 		if portErr != nil || number < 1 || number > 65535 {
-			return "", ErrInvalidConfig
+			return "", "", false, ErrInvalidConfig
 		}
 	}
-	return parsed.String(), nil
+	if parsed.Scheme == "https" {
+		return parsed.String(), parsed.Scheme, false, nil
+	}
+	ip := net.ParseIP(parsed.Hostname())
+	if parsed.Scheme != "http" || !allowLocalHTTP || ip == nil || !ip.IsLoopback() {
+		return "", "", false, ErrInvalidConfig
+	}
+	return parsed.String(), parsed.Scheme, true, nil
+}
+
+func mustEndpointHost(raw string) string {
+	parsed, err := url.Parse(raw)
+	if err != nil {
+		panic("validated endpoint became invalid")
+	}
+	return parsed.Hostname()
 }
 
 var endpointDNSLabel = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
@@ -191,13 +309,30 @@ func validEndpointPath(endpoint *url.URL) bool {
 	return true
 }
 
-func safeDial(ctx context.Context, network, address string) (net.Conn, error) {
-	dialer := &net.Dialer{}
-	return dialResolved(ctx, network, address, net.DefaultResolver, dialer.DialContext)
-}
-
 type ipResolver interface {
 	LookupIPAddr(context.Context, string) ([]net.IPAddr, error)
+}
+
+func dialLoopback(
+	ctx context.Context,
+	network string,
+	address string,
+	expectedHost string,
+	dial contextDialer,
+) (net.Conn, error) {
+	if network != "tcp" && network != "tcp4" && network != "tcp6" {
+		return nil, errors.New("unsafe decision destination")
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil || host != expectedHost {
+		return nil, errors.New("unsafe decision destination")
+	}
+	ip := net.ParseIP(host)
+	portNumber, portErr := strconv.Atoi(port)
+	if ip == nil || !ip.IsLoopback() || portErr != nil || portNumber < 1 || portNumber > 65535 {
+		return nil, errors.New("unsafe decision destination")
+	}
+	return dial(ctx, network, net.JoinHostPort(ip.String(), port))
 }
 
 type contextDialer func(context.Context, string, string) (net.Conn, error)
@@ -329,6 +464,8 @@ func (c *Client) Decide(ctx context.Context, request protocol.ActionRequest) (pr
 	if err := ctx.Err(); err != nil {
 		return protocol.AuthorizationDecision{}, unavailable()
 	}
+	ctx, cancel := context.WithTimeout(ctx, c.timeout)
+	defer cancel()
 	scope, err := ClientScopeHash(request)
 	if err != nil {
 		return protocol.AuthorizationDecision{}, err
@@ -337,21 +474,39 @@ func (c *Client) Decide(ctx context.Context, request protocol.ActionRequest) (pr
 	if err != nil {
 		return protocol.AuthorizationDecision{}, ErrInvalidRequest
 	}
-	token, err := c.token(ctx)
-	if err != nil || !validBearerToken(token) {
-		return protocol.AuthorizationDecision{}, unavailable()
-	}
-	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, nil)
 	if err != nil {
 		return protocol.AuthorizationDecision{}, unavailable()
 	}
-	httpRequest.Header.Set("Authorization", "Bearer "+token)
+	httpRequest.Body = io.NopCloser(bytes.NewReader(body))
+	httpRequest.ContentLength = int64(len(body))
+	// GetBody intentionally stays nil. net/http treats Idempotency-Key plus a
+	// rewindable body as permission to replay a request on a failed reused
+	// connection. Authorization attempts have explicit idempotency semantics,
+	// but this client has a strict zero-retry policy.
+	httpRequest.GetBody = nil
+	token, err := c.token(ctx)
+	if err != nil || !validBearerToken(token) {
+		wipe(token)
+		return protocol.AuthorizationDecision{}, unavailable()
+	}
+	httpRequest.Header.Set("Authorization", "Bearer "+string(token))
 	httpRequest.Header.Set("Content-Type", "application/json")
 	httpRequest.Header.Set("Accept", "application/json")
 	httpRequest.Header.Set("Accept-Encoding", "identity")
 	httpRequest.Header.Set("Idempotency-Key", string(request.IdempotencyKey))
 	httpRequest.Header.Set("X-Palonexus-Protocol-Version", "1")
-	response, err := c.http.Do(httpRequest)
+	response, err := func() (*http.Response, error) {
+		// The standard library and TLS stack necessarily make transient string
+		// and record copies. Remove our retained header immediately after Do
+		// and overwrite the owned source buffer even if a test transport panics;
+		// neither is kept in Client state or returned errors.
+		defer func() {
+			httpRequest.Header.Del("Authorization")
+			wipe(token)
+		}()
+		return c.http.Do(httpRequest)
+	}()
 	if err != nil {
 		return protocol.AuthorizationDecision{}, unavailable()
 	}
@@ -393,8 +548,15 @@ func (c *Client) Decide(ctx context.Context, request protocol.ActionRequest) (pr
 
 var bearerToken = regexp.MustCompile(`^[A-Za-z0-9\-._~+/]+=*$`)
 
-func validBearerToken(token string) bool {
-	return token != "" && len(token) <= 16<<10 && bearerToken.MatchString(token)
+func validBearerToken(token []byte) bool {
+	return len(token) != 0 && len(token) <= 16<<10 && bearerToken.Match(token)
+}
+
+func wipe(value []byte) {
+	for index := range value {
+		value[index] = 0
+	}
+	runtime.KeepAlive(value)
 }
 
 func validResponseHeaders(response *http.Response) bool {

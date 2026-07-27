@@ -3,23 +3,33 @@ package decision
 
 import (
 	"context"
+	"crypto/ecdsa"
+	"crypto/elliptic"
+	"crypto/rand"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
+	"crypto/x509/pkix"
 	"encoding/hex"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"net"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
 
+	guardconfig "github.com/rogerchucker/palonexus-sdk/guard/internal/config"
 	"github.com/rogerchucker/palonexus-sdk/guard/pkg/protocol"
 )
 
@@ -65,17 +75,45 @@ func validDecision(t *testing.T, request protocol.ActionRequest, outcome protoco
 func testClient(t *testing.T, handler http.Handler) (*Client, *httptest.Server) {
 	t.Helper()
 	server := httptest.NewTLSServer(handler)
-	client, err := newForTesting(Options{
-		Endpoint: server.URL + "/v1/decisions", HTTPClient: server.Client(),
-		AccessToken:  func(context.Context) (string, error) { return "secret-token", nil },
+	client := clientForTLSServer(t, server, Options{
+		AccessToken:  func(context.Context) ([]byte, error) { return []byte("secret-token"), nil },
 		Now:          func() time.Time { return time.Date(2026, 7, 25, 20, 0, 2, 0, time.UTC) },
 		MaxClockSkew: time.Minute,
-	})
+	}, "/v1/decisions")
+	return client, server
+}
+
+func clientForTLSServer(t *testing.T, server *httptest.Server, options Options, path string) *Client {
+	t.Helper()
+	parsed, err := url.Parse(server.URL)
 	if err != nil {
-		server.Close()
 		t.Fatal(err)
 	}
-	return client, server
+	_, port, err := net.SplitHostPort(parsed.Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	options.Endpoint = "https://example.com:" + port + path
+	if options.TLS.RootCAs == nil {
+		pool := x509.NewCertPool()
+		pool.AddCert(server.Certificate())
+		options.TLS.RootCAs = pool
+	}
+	target := server.Listener.Addr().String()
+	controls := transportControls{
+		resolver: resolverFunc(func(context.Context, string) ([]net.IPAddr, error) {
+			return []net.IPAddr{{IP: net.ParseIP("8.8.8.8")}}, nil
+		}),
+		dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+			var dialer net.Dialer
+			return dialer.DialContext(ctx, network, target)
+		},
+	}
+	client, err := newWithNetworkForTesting(options, controls)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
 }
 
 func TestClientSendsOneAuthenticatedBoundRequestAndReturnsAllow(t *testing.T) {
@@ -138,6 +176,116 @@ func TestClientNeverCachesAllow(t *testing.T) {
 	}
 }
 
+func TestAuthorizationRequestIsSingleUseDespiteIdempotencyHeader(t *testing.T) {
+	var calls atomic.Int32
+	client := clientWithRoundTripper(
+		Options{
+			Endpoint:    "https://example.com/v1/authorization/decisions",
+			AccessToken: func(context.Context) ([]byte, error) { return []byte("token"), nil },
+		},
+		roundTripFunc(func(request *http.Request) (*http.Response, error) {
+			calls.Add(1)
+			if request.GetBody != nil {
+				t.Fatal("rewindable body permits implicit net/http replay")
+			}
+			if request.ContentLength <= 0 || request.Header.Get("Idempotency-Key") == "" {
+				t.Fatal("lost body length or protocol idempotency key")
+			}
+			return nil, errors.New("ambiguous completion")
+		}),
+	)
+	if _, err := client.Decide(context.Background(), action()); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("error = %v", err)
+	}
+	if calls.Load() != 1 {
+		t.Fatalf("round trips = %d", calls.Load())
+	}
+}
+
+func TestHTTP1ReusedConnectionFailureDoesNotReplayAuthorization(t *testing.T) {
+	request := action()
+	var calls atomic.Int32
+	var firstPeer string
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		if r.ProtoMajor != 1 {
+			t.Errorf("protocol = %s", r.Proto)
+		}
+		switch call {
+		case 1:
+			firstPeer = r.RemoteAddr
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(validDecision(t, request, protocol.DecisionOutcomeAllow))
+		case 2:
+			if r.RemoteAddr != firstPeer {
+				t.Errorf("connection was not reused: %s then %s", firstPeer, r.RemoteAddr)
+			}
+			connection, _, err := w.(http.Hijacker).Hijack()
+			if err != nil {
+				t.Error(err)
+				return
+			}
+			_ = connection.Close()
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(validDecision(t, request, protocol.DecisionOutcomeAllow))
+		}
+	}))
+	defer server.Close()
+	client := clientForTLSServer(t, server, Options{
+		AccessToken:  func(context.Context) ([]byte, error) { return []byte("token"), nil },
+		Now:          func() time.Time { return time.Date(2026, 7, 25, 20, 0, 2, 0, time.UTC) },
+		MaxClockSkew: time.Minute,
+	}, "")
+	if _, err := client.Decide(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Decide(context.Background(), request); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("ambiguous reused-connection result = %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("authorization reached server %d times; implicit replay occurred", calls.Load())
+	}
+}
+
+func TestHTTP2StreamResetDoesNotReplayAuthorization(t *testing.T) {
+	request := action()
+	var calls atomic.Int32
+	server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		call := calls.Add(1)
+		if r.ProtoMajor != 2 {
+			t.Errorf("protocol = %s", r.Proto)
+		}
+		switch call {
+		case 1:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(validDecision(t, request, protocol.DecisionOutcomeAllow))
+		case 2:
+			panic(http.ErrAbortHandler)
+		default:
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(validDecision(t, request, protocol.DecisionOutcomeAllow))
+		}
+	}))
+	server.EnableHTTP2 = true
+	server.StartTLS()
+	defer server.Close()
+	client := clientForTLSServer(t, server, Options{
+		AccessToken:  func(context.Context) ([]byte, error) { return []byte("token"), nil },
+		Now:          func() time.Time { return time.Date(2026, 7, 25, 20, 0, 2, 0, time.UTC) },
+		MaxClockSkew: time.Minute,
+	}, "")
+	if _, err := client.Decide(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Decide(context.Background(), request); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("stream-reset result = %v", err)
+	}
+	if calls.Load() != 2 {
+		t.Fatalf("authorization reached server %d times; implicit replay occurred", calls.Load())
+	}
+}
+
 func TestClientScopeHashMatchesProtocolVector(t *testing.T) {
 	got, err := ClientScopeHash(action())
 	if err != nil {
@@ -179,13 +327,13 @@ func TestNewRequiresHTTPSAndVerifiedTLS(t *testing.T) {
 		"https://0x7f000001/private",
 		"https://example.com/\nprivate",
 	} {
-		if _, err := New(Options{Endpoint: endpoint, AccessToken: func(context.Context) (string, error) { return "x", nil }}); !errors.Is(err, ErrInvalidConfig) {
+		if _, err := New(Options{Endpoint: endpoint, AccessToken: func(context.Context) ([]byte, error) { return []byte("x"), nil }}); !errors.Is(err, ErrInvalidConfig) {
 			t.Errorf("New(%q) error = %v", endpoint, err)
 		}
 	}
 	for _, options := range []Options{
-		{Endpoint: "https://example.com", AccessToken: func(context.Context) (string, error) { return "x", nil }, Timeout: -time.Second},
-		{Endpoint: "https://example.com", AccessToken: func(context.Context) (string, error) { return "x", nil }, MaxClockSkew: -time.Second},
+		{Endpoint: "https://example.com", AccessToken: func(context.Context) ([]byte, error) { return []byte("x"), nil }, Timeout: -time.Second},
+		{Endpoint: "https://example.com", AccessToken: func(context.Context) ([]byte, error) { return []byte("x"), nil }, MaxClockSkew: -time.Second},
 	} {
 		if _, err := New(options); !errors.Is(err, ErrInvalidConfig) {
 			t.Errorf("invalid bounds error = %v", err)
@@ -193,13 +341,86 @@ func TestNewRequiresHTTPSAndVerifiedTLS(t *testing.T) {
 	}
 	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {}))
 	defer server.Close()
-	client, err := New(Options{Endpoint: server.URL, AccessToken: func(context.Context) (string, error) { return "x", nil }})
+	client, err := New(Options{Endpoint: server.URL, AccessToken: func(context.Context) ([]byte, error) { return []byte("x"), nil }})
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, err = client.Decide(context.Background(), action())
 	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("TLS error = %v", err)
+	}
+}
+
+func TestLoopbackHTTPRequiresConfigurationAndRuntimeOptIn(t *testing.T) {
+	request := action()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write(validDecision(t, request, protocol.DecisionOutcomeAllow))
+	}))
+	defer server.Close()
+	endpoint := server.URL + "/v1/authorization/decisions"
+	body := func(local bool, decisionEndpoint string) string {
+		return fmt.Sprintf(`{
+			"decision_endpoint": %q,
+			"oidc_issuer": "https://identity.example.com",
+			"trusted_ca_file": "",
+			"local_test_mode": %t,
+			"routes": [{"target":"api.example.com","decision_endpoint":"https://decision.example.com"}]
+		}`, decisionEndpoint, local)
+	}
+	write := func(content string) string {
+		path := filepath.Join(t.TempDir(), "config.json")
+		if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return path
+	}
+	if _, err := New(Options{
+		Endpoint:    endpoint,
+		AccessToken: func(context.Context) ([]byte, error) { return []byte("token"), nil },
+	}); !errors.Is(err, ErrInvalidConfig) {
+		t.Fatalf("runtime-only local mode accepted: %v", err)
+	}
+	if _, err := guardconfig.Load(
+		write(body(true, endpoint)),
+		guardconfig.Options{},
+	); err == nil {
+		t.Fatal("config-only local mode accepted")
+	}
+	if _, err := guardconfig.Load(
+		write(body(false, endpoint)),
+		guardconfig.Options{AllowLocalTestMode: true},
+	); err == nil {
+		t.Fatal("runtime-only local mode accepted by config")
+	}
+	for _, unsafeEndpoint := range []string{
+		strings.Replace(endpoint, "127.0.0.1", "localhost", 1),
+		"http://192.0.2.1:8181/v1/authorization/decisions",
+	} {
+		if _, err := guardconfig.Load(
+			write(body(true, unsafeEndpoint)),
+			guardconfig.Options{AllowLocalTestMode: true},
+		); err == nil {
+			t.Fatalf("unsafe local endpoint accepted: %s", unsafeEndpoint)
+		}
+	}
+	configuration, err := guardconfig.Load(
+		write(body(true, endpoint)),
+		guardconfig.Options{AllowLocalTestMode: true},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	client, err := NewFromConfig(configuration, Options{
+		AccessToken:  func(context.Context) ([]byte, error) { return []byte("token"), nil },
+		Now:          func() time.Time { return time.Date(2026, 7, 25, 20, 0, 2, 0, time.UTC) },
+		MaxClockSkew: time.Minute,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := client.Decide(context.Background(), request); err != nil {
+		t.Fatal(err)
 	}
 }
 
@@ -212,13 +433,224 @@ func TestCustomCAIsUsed(t *testing.T) {
 	defer server.Close()
 	pool := x509.NewCertPool()
 	pool.AddCert(server.Certificate())
-	client, err := newForTesting(Options{Endpoint: server.URL, RootCAs: pool, HTTPClient: &http.Client{Transport: &http.Transport{}}, AccessToken: func(context.Context) (string, error) { return "x", nil }, Now: func() time.Time { return time.Date(2026, 7, 25, 20, 0, 2, 0, time.UTC) }})
-	if err != nil {
-		t.Fatal(err)
-	}
+	client := clientForTLSServer(t, server, Options{
+		TLS:         TLSOptions{RootCAs: pool},
+		AccessToken: func(context.Context) ([]byte, error) { return []byte("x"), nil },
+		Now:         func() time.Time { return time.Date(2026, 7, 25, 20, 0, 2, 0, time.UTC) },
+	}, "")
 	if _, err := client.Decide(context.Background(), request); err != nil {
 		t.Fatal(err)
 	}
+}
+
+func TestProductionTLSPathEnforcesTrustHostnameVersionsAndMTLS(t *testing.T) {
+	request := action()
+	now := func() time.Time { return time.Date(2026, 7, 25, 20, 0, 2, 0, time.UTC) }
+	ca, caKey := testCA(t)
+	rootPool := x509.NewCertPool()
+	rootPool.AddCert(ca)
+	serverCertificate := issueCertificate(t, ca, caKey, []string{"example.com"}, false)
+	clientCertificate := issueCertificate(t, ca, caKey, nil, true)
+
+	start := func(tlsConfig *tls.Config) *httptest.Server {
+		server := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(validDecision(t, request, protocol.DecisionOutcomeAllow))
+		}))
+		server.TLS = tlsConfig
+		server.StartTLS()
+		return server
+	}
+	t.Run("trusted CA succeeds", func(t *testing.T) {
+		server := start(&tls.Config{
+			Certificates: []tls.Certificate{serverCertificate},
+			MinVersion:   tls.VersionTLS12,
+		})
+		defer server.Close()
+		client := clientForTLSServer(t, server, Options{
+			TLS:         TLSOptions{RootCAs: rootPool},
+			AccessToken: func(context.Context) ([]byte, error) { return []byte("token"), nil },
+			Now:         now,
+		}, "")
+		if _, err := client.Decide(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("wrong CA fails", func(t *testing.T) {
+		server := start(&tls.Config{Certificates: []tls.Certificate{serverCertificate}})
+		defer server.Close()
+		client := clientForTLSServer(t, server, Options{
+			TLS:         TLSOptions{RootCAs: x509.NewCertPool()},
+			AccessToken: func(context.Context) ([]byte, error) { return []byte("token"), nil },
+			Now:         now,
+		}, "")
+		if _, err := client.Decide(context.Background(), request); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("hostname mismatch fails", func(t *testing.T) {
+		wrongCertificate := issueCertificate(t, ca, caKey, []string{"wrong.example"}, false)
+		server := start(&tls.Config{Certificates: []tls.Certificate{wrongCertificate}})
+		defer server.Close()
+		client := clientForTLSServer(t, server, Options{
+			TLS:         TLSOptions{RootCAs: rootPool},
+			AccessToken: func(context.Context) ([]byte, error) { return []byte("token"), nil },
+			Now:         now,
+		}, "")
+		if _, err := client.Decide(context.Background(), request); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("TLS below 1.2 fails", func(t *testing.T) {
+		server := start(&tls.Config{
+			Certificates: []tls.Certificate{serverCertificate},
+			MaxVersion:   tls.VersionTLS11,
+		})
+		defer server.Close()
+		client := clientForTLSServer(t, server, Options{
+			TLS:         TLSOptions{RootCAs: rootPool},
+			AccessToken: func(context.Context) ([]byte, error) { return []byte("token"), nil },
+			Now:         now,
+		}, "")
+		if _, err := client.Decide(context.Background(), request); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("configured TLS 1.3 minimum is honored", func(t *testing.T) {
+		server := start(&tls.Config{
+			Certificates: []tls.Certificate{serverCertificate},
+			MinVersion:   tls.VersionTLS12,
+			MaxVersion:   tls.VersionTLS12,
+		})
+		defer server.Close()
+		client := clientForTLSServer(t, server, Options{
+			TLS: TLSOptions{
+				RootCAs: rootPool, MinVersion: tls.VersionTLS13,
+			},
+			AccessToken: func(context.Context) ([]byte, error) { return []byte("token"), nil },
+			Now:         now,
+		}, "")
+		if _, err := client.Decide(context.Background(), request); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("configured TLS maximum is honored", func(t *testing.T) {
+		server := start(&tls.Config{
+			Certificates: []tls.Certificate{serverCertificate},
+			MinVersion:   tls.VersionTLS13,
+		})
+		defer server.Close()
+		client := clientForTLSServer(t, server, Options{
+			TLS: TLSOptions{
+				RootCAs: rootPool, MaxVersion: tls.VersionTLS12,
+			},
+			AccessToken: func(context.Context) ([]byte, error) { return []byte("token"), nil },
+			Now:         now,
+		}, "")
+		if _, err := client.Decide(context.Background(), request); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("error = %v", err)
+		}
+	})
+	t.Run("mTLS certificate is required and accepted", func(t *testing.T) {
+		server := start(&tls.Config{
+			Certificates: []tls.Certificate{serverCertificate},
+			ClientAuth:   tls.RequireAndVerifyClientCert,
+			ClientCAs:    rootPool,
+			MinVersion:   tls.VersionTLS12,
+		})
+		defer server.Close()
+		without := clientForTLSServer(t, server, Options{
+			TLS:         TLSOptions{RootCAs: rootPool},
+			AccessToken: func(context.Context) ([]byte, error) { return []byte("token"), nil },
+			Now:         now,
+		}, "")
+		if _, err := without.Decide(context.Background(), request); !errors.Is(err, ErrUnavailable) {
+			t.Fatalf("missing certificate error = %v", err)
+		}
+		with := clientForTLSServer(t, server, Options{
+			TLS: TLSOptions{
+				RootCAs: rootPool, ClientCertificates: []tls.Certificate{clientCertificate},
+			},
+			AccessToken: func(context.Context) ([]byte, error) { return []byte("token"), nil },
+			Now:         now,
+		}, "")
+		if _, err := with.Decide(context.Background(), request); err != nil {
+			t.Fatal(err)
+		}
+	})
+}
+
+func testCA(t *testing.T) (*x509.Certificate, *ecdsa.PrivateKey) {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "PaloNexus test CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign | x509.KeyUsageDigitalSignature,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := x509.ParseCertificate(der)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return certificate, key
+}
+
+func issueCertificate(
+	t *testing.T,
+	ca *x509.Certificate,
+	caKey *ecdsa.PrivateKey,
+	dnsNames []string,
+	client bool,
+) tls.Certificate {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(elliptic.P256(), rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 120))
+	if err != nil {
+		t.Fatal(err)
+	}
+	usage := []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}
+	if client {
+		usage = []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}
+	}
+	template := &x509.Certificate{
+		SerialNumber: serial,
+		Subject:      pkix.Name{CommonName: "PaloNexus test peer"},
+		DNSNames:     dnsNames,
+		NotBefore:    time.Now().Add(-time.Hour),
+		NotAfter:     time.Now().Add(time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  usage,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, ca, &key.PublicKey, caKey)
+	if err != nil {
+		t.Fatal(err)
+	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	certificate, err := tls.X509KeyPair(
+		pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der}),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: keyDER}),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return certificate
 }
 
 func TestOutcomesHaveTypedErrors(t *testing.T) {
@@ -378,7 +810,7 @@ func TestBoundedResponseTimeoutCancellationOutageAndNoRetry(t *testing.T) {
 			}
 		})
 	}
-	client, err := newForTesting(Options{Endpoint: "https://127.0.0.1:1", HTTPClient: &http.Client{Timeout: 20 * time.Millisecond}, AccessToken: func(context.Context) (string, error) { return "x", nil }})
+	client, err := New(Options{Endpoint: "https://127.0.0.1:1", Timeout: 20 * time.Millisecond, AccessToken: func(context.Context) ([]byte, error) { return []byte("x"), nil }})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -396,11 +828,8 @@ func TestRedirectProxyAndTokenPrivacy(t *testing.T) {
 		http.Redirect(w, r, target.URL, http.StatusTemporaryRedirect)
 	}))
 	defer source.Close()
-	client, err := newForTesting(Options{Endpoint: source.URL, HTTPClient: source.Client(), AccessToken: func(context.Context) (string, error) { return "top-secret", nil }})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = client.Decide(context.Background(), request)
+	client := clientForTLSServer(t, source, Options{AccessToken: func(context.Context) ([]byte, error) { return []byte("top-secret"), nil }}, "")
+	_, err := client.Decide(context.Background(), request)
 	if !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("error = %v", err)
 	}
@@ -441,22 +870,17 @@ func TestConcurrentCallsAreIndependentAndTokenErrorsAreSanitized(t *testing.T) {
 		}()
 	}
 	wg.Wait()
-	bad, err := newForTesting(Options{Endpoint: server.URL, HTTPClient: server.Client(), AccessToken: func(context.Context) (string, error) { return "", errors.New("secret credential value") }})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = bad.Decide(context.Background(), request)
+	bad := clientForTLSServer(t, server, Options{AccessToken: func(context.Context) ([]byte, error) {
+		return nil, errors.New("secret credential value")
+	}}, "")
+	_, err := bad.Decide(context.Background(), request)
 	if !errors.Is(err, ErrUnavailable) || strings.Contains(err.Error(), "secret") {
 		t.Fatalf("error = %v", err)
 	}
 	for _, token := range []string{" leading", "trailing ", "contains\tcontrol", "not bearer!"} {
-		rejected, err := newForTesting(Options{
-			Endpoint: server.URL, HTTPClient: server.Client(),
-			AccessToken: func(context.Context) (string, error) { return token, nil },
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
+		rejected := clientForTLSServer(t, server, Options{
+			AccessToken: func(context.Context) ([]byte, error) { return []byte(token), nil },
+		}, "")
 		if _, err = rejected.Decide(context.Background(), request); !errors.Is(err, ErrUnavailable) {
 			t.Fatalf("token %q error = %v", token, err)
 		}
@@ -464,17 +888,16 @@ func TestConcurrentCallsAreIndependentAndTokenErrorsAreSanitized(t *testing.T) {
 }
 
 func TestUnavailableHasAnExportedTypedErrorAndNilContextFailsClosed(t *testing.T) {
-	client, err := newForTesting(Options{
-		Endpoint: "https://127.0.0.1:1",
-		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+	client := clientWithRoundTripper(
+		Options{
+			Endpoint:    "https://example.com",
+			AccessToken: func(context.Context) ([]byte, error) { return []byte("token"), nil },
+		},
+		roundTripFunc(func(*http.Request) (*http.Response, error) {
 			return nil, errors.New("private network detail")
-		})},
-		AccessToken: func(context.Context) (string, error) { return "token", nil },
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	_, err = client.Decide(context.Background(), action())
+		}),
+	)
+	_, err := client.Decide(context.Background(), action())
 	var unavailable *UnavailableError
 	if !errors.As(err, &unavailable) || !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("error = %#v", err)
@@ -490,23 +913,22 @@ func TestUnavailableHasAnExportedTypedErrorAndNilContextFailsClosed(t *testing.T
 func TestCancellationBeforeCredentialLookupMakesNoAuthorityCall(t *testing.T) {
 	var tokens atomic.Int32
 	var calls atomic.Int32
-	client, err := newForTesting(Options{
-		Endpoint: "https://example.com/v1/authorization/decisions",
-		HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+	client := clientWithRoundTripper(
+		Options{
+			Endpoint: "https://example.com/v1/authorization/decisions",
+			AccessToken: func(context.Context) ([]byte, error) {
+				tokens.Add(1)
+				return []byte("token"), nil
+			},
+		},
+		roundTripFunc(func(*http.Request) (*http.Response, error) {
 			calls.Add(1)
 			return nil, errors.New("must not call")
-		})},
-		AccessToken: func(context.Context) (string, error) {
-			tokens.Add(1)
-			return "token", nil
-		},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
+		}),
+	)
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	if _, err = client.Decide(ctx, action()); !errors.Is(err, ErrUnavailable) {
+	if _, err := client.Decide(ctx, action()); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("error = %v", err)
 	}
 	if tokens.Load() != 0 || calls.Load() != 0 {
@@ -556,18 +978,17 @@ func TestAdversarialResponseHeadersAndNilBodyFailClosedWithoutRetry(t *testing.T
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			var calls atomic.Int32
-			client, err := newForTesting(Options{
-				Endpoint: "https://example.com/v1/authorization/decisions",
-				HTTPClient: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			client := clientWithRoundTripper(
+				Options{
+					Endpoint:    "https://example.com/v1/authorization/decisions",
+					AccessToken: func(context.Context) ([]byte, error) { return []byte("token"), nil },
+				},
+				roundTripFunc(func(*http.Request) (*http.Response, error) {
 					calls.Add(1)
 					return tc.response, nil
-				})},
-				AccessToken: func(context.Context) (string, error) { return "token", nil },
-			})
-			if err != nil {
-				t.Fatal(err)
-			}
-			if _, err = client.Decide(context.Background(), request); !errors.Is(err, ErrInvalidDecision) {
+				}),
+			)
+			if _, err := client.Decide(context.Background(), request); !errors.Is(err, ErrInvalidDecision) {
 				t.Fatalf("error = %v", err)
 			}
 			if calls.Load() != 1 {
@@ -598,21 +1019,138 @@ func TestOutcomeErrorFormattingDoesNotExposeDecisionExtensions(t *testing.T) {
 }
 
 func TestClientDoesNotMutateCallerTLSConfig(t *testing.T) {
-	cfg := &tls.Config{MinVersion: tls.VersionTLS13}
-	httpClient := &http.Client{Transport: &http.Transport{TLSClientConfig: cfg}}
-	client, err := newForTesting(Options{Endpoint: "https://example.com", HTTPClient: httpClient, AccessToken: func(context.Context) (string, error) { return "x", nil }})
+	pool := x509.NewCertPool()
+	client, err := newWithNetworkForTesting(Options{
+		Endpoint:    "https://example.com",
+		TLS:         TLSOptions{RootCAs: pool, MinVersion: tls.VersionTLS13},
+		AccessToken: func(context.Context) ([]byte, error) { return []byte("x"), nil },
+	}, transportControls{
+		resolver: resolverFunc(func(context.Context, string) ([]net.IPAddr, error) {
+			return []net.IPAddr{{IP: net.ParseIP("8.8.8.8")}}, nil
+		}),
+		dial: func(context.Context, string, string) (net.Conn, error) {
+			return nil, errors.New("unused")
+		},
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.MinVersion != tls.VersionTLS13 {
-		t.Fatal("mutated TLS config")
-	}
 	transport := client.http.Transport.(*http.Transport)
+	if transport.TLSClientConfig.RootCAs == pool {
+		t.Fatal("retained mutable caller CA pool")
+	}
 	if transport.TLSClientConfig.MinVersion != tls.VersionTLS13 {
 		t.Fatalf("weakened TLS minimum to %x", transport.TLSClientConfig.MinVersion)
 	}
 	if transport.Proxy != nil || !transport.DisableCompression {
 		t.Fatal("ambient proxy or decompression remained enabled")
+	}
+}
+
+func TestTLSOptionsRejectUnsafeOrAmbiguousConfiguration(t *testing.T) {
+	token := func(context.Context) ([]byte, error) { return []byte("token"), nil }
+	invalid := []TLSOptions{
+		{MinVersion: tls.VersionTLS11},
+		{MaxVersion: tls.VersionTLS11},
+		{MinVersion: tls.VersionTLS13, MaxVersion: tls.VersionTLS12},
+		{ClientCertificates: []tls.Certificate{{}}},
+		{ClientCertificates: make([]tls.Certificate, 9)},
+	}
+	for index, tlsOptions := range invalid {
+		if _, err := New(Options{
+			Endpoint: "https://example.com", TLS: tlsOptions, AccessToken: token,
+		}); !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("case %d error = %v", index, err)
+		}
+	}
+}
+
+func TestOwnedCredentialBufferIsWipedAndHeaderReleasedImmediately(t *testing.T) {
+	request := action()
+	owned := []byte("private-token")
+	var observed *http.Request
+	client := clientWithRoundTripper(
+		Options{
+			Endpoint: "https://example.com/v1/authorization/decisions",
+			AccessToken: func(context.Context) ([]byte, error) {
+				return owned, nil
+			},
+			Now: func() time.Time {
+				return time.Date(2026, 7, 25, 20, 0, 2, 0, time.UTC)
+			},
+		},
+		roundTripFunc(func(incoming *http.Request) (*http.Response, error) {
+			observed = incoming
+			if incoming.Header.Get("Authorization") != "Bearer private-token" {
+				t.Fatal("missing authorization at transport boundary")
+			}
+			document := validDecision(t, request, protocol.DecisionOutcomeAllow)
+			return &http.Response{
+				StatusCode:    http.StatusOK,
+				Header:        http.Header{"Content-Type": {"application/json"}},
+				Body:          io.NopCloser(strings.NewReader(string(document))),
+				ContentLength: int64(len(document)),
+			}, nil
+		}),
+	)
+	if _, err := client.Decide(context.Background(), request); err != nil {
+		t.Fatal(err)
+	}
+	for index, value := range owned {
+		if value != 0 {
+			t.Fatalf("credential byte %d retained: %x", index, value)
+		}
+	}
+	if observed == nil || observed.Header.Get("Authorization") != "" {
+		t.Fatal("request retained authorization after RoundTrip")
+	}
+
+	invalid := []byte("bad token")
+	rejected := clientWithRoundTripper(
+		Options{
+			Endpoint:    "https://example.com",
+			AccessToken: func(context.Context) ([]byte, error) { return invalid, nil },
+		},
+		roundTripFunc(func(*http.Request) (*http.Response, error) {
+			t.Fatal("invalid credential reached transport")
+			return nil, nil
+		}),
+	)
+	if _, err := rejected.Decide(context.Background(), request); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("invalid credential error = %v", err)
+	}
+	for index, value := range invalid {
+		if value != 0 {
+			t.Fatalf("invalid credential byte %d retained: %x", index, value)
+		}
+	}
+}
+
+func TestTimeoutBoundsCredentialAcquisitionBeforeNetwork(t *testing.T) {
+	var networkCalls atomic.Int32
+	client := clientWithRoundTripper(
+		Options{
+			Endpoint: "https://example.com",
+			Timeout:  15 * time.Millisecond,
+			AccessToken: func(ctx context.Context) ([]byte, error) {
+				<-ctx.Done()
+				return nil, ctx.Err()
+			},
+		},
+		roundTripFunc(func(*http.Request) (*http.Response, error) {
+			networkCalls.Add(1)
+			return nil, errors.New("unexpected")
+		}),
+	)
+	started := time.Now()
+	if _, err := client.Decide(context.Background(), action()); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("error = %v", err)
+	}
+	if elapsed := time.Since(started); elapsed > 500*time.Millisecond {
+		t.Fatalf("credential timeout took %s", elapsed)
+	}
+	if networkCalls.Load() != 0 {
+		t.Fatal("network called after credential timeout")
 	}
 }
 
@@ -671,6 +1209,30 @@ type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
 	return f(request)
+}
+
+func clientWithRoundTripper(options Options, transport http.RoundTripper) *Client {
+	now := options.Now
+	if now == nil {
+		now = func() time.Time { return time.Date(2026, 7, 25, 20, 0, 2, 0, time.UTC) }
+	}
+	timeout := options.Timeout
+	if timeout == 0 {
+		timeout = 10 * time.Second
+	}
+	skew := options.MaxClockSkew
+	if skew == 0 {
+		skew = time.Minute
+	}
+	return &Client{
+		endpoint: options.Endpoint,
+		http: &http.Client{
+			Transport:     transport,
+			Timeout:       timeout,
+			CheckRedirect: rejectRedirect,
+		},
+		token: options.AccessToken, now: now, skew: skew, timeout: timeout,
+	}
 }
 
 func TestHashHelperSanity(t *testing.T) {
