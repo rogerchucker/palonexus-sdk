@@ -187,6 +187,64 @@ func (s *unixStore) DeleteAccount(ctx context.Context, binding Binding) error {
 	})
 }
 
+func (s *unixStore) DeleteMetadata(ctx context.Context, binding Binding, kind Kind) error {
+	if !validBinding(binding) || !validKind(kind) {
+		return ErrInvalidBinding
+	}
+	return s.withLock(ctx, func() error {
+		name, _ := s.recordName(binding, kind)
+		err := unlinkRegularAt(s.rootFD, name)
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		return syncRoot(s.rootFD)
+	})
+}
+
+func (s *unixStore) WithSessionTransaction(ctx context.Context, binding Binding, transaction SessionTransaction) error {
+	if !validBinding(binding) || transaction == nil {
+		return ErrInvalidBinding
+	}
+	return s.withLock(ctx, func() error {
+		name, _ := s.recordName(binding, KindSession)
+		var current Metadata
+		found := false
+		document, err := s.readRaw(name)
+		if err == nil {
+			record, _, decodeErr := decodeAndMigrate(document)
+			if decodeErr != nil || record.Tenant != binding.Tenant || record.Account != binding.Account ||
+				record.Metadata.Kind != KindSession {
+				return ErrCorrupt
+			}
+			current, found = record.Metadata, true
+		} else if !errors.Is(err, ErrNotFound) {
+			return err
+		}
+		next, err := transaction(current, found)
+		if err != nil {
+			return err
+		}
+		if next == nil {
+			err := unlinkRegularAt(s.rootFD, name)
+			if err != nil && !errors.Is(err, ErrNotFound) {
+				return err
+			}
+			return syncRoot(s.rootFD)
+		}
+		if next.Kind != KindSession || validateMetadata(*next) != nil {
+			return ErrUnsafePayload
+		}
+		version := CurrentVersion
+		wire, err := json.Marshal(wireEnvelope{
+			Version: &version, Tenant: binding.Tenant, Account: binding.Account, Metadata: *next,
+		})
+		if err != nil {
+			return ErrUnsafePayload
+		}
+		return s.atomicWrite(ctx, name, wire)
+	})
+}
+
 func (s *unixStore) Close() error {
 	<-s.gate
 	defer func() { s.gate <- struct{}{} }()

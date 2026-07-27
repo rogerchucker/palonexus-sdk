@@ -522,3 +522,55 @@ func (s *Store) readRawForTesting(name string) ([]byte, error) {
 	})
 	return result, err
 }
+
+func TestSessionTransactionSerializesAcrossStoreInstancesAndPreservesRouting(t *testing.T) {
+	root := filepath.Join(canonicalTempDir(t), "state")
+	first, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer first.Close()
+	second, err := New(root)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer second.Close()
+	binding := Binding{Tenant: "tenant", Account: "account"}
+	if err := first.PutMetadata(context.Background(), binding, Metadata{Kind: KindRouting, RouteID: "route-default"}); err != nil {
+		t.Fatal(err)
+	}
+	entered, release, done := make(chan struct{}), make(chan struct{}), make(chan error, 1)
+	go func() {
+		done <- first.WithSessionTransaction(context.Background(), binding, func(Metadata, bool) (*Metadata, error) {
+			close(entered)
+			<-release
+			next := Metadata{Kind: KindSession, SessionID: "session_00000000000000000000000000", Generation: 1, ExpiresAt: time.Now().Add(time.Hour)}
+			return &next, nil
+		})
+	}()
+	<-entered
+	secondEntered := make(chan struct{})
+	go func() {
+		_ = second.WithSessionTransaction(context.Background(), binding, func(Metadata, bool) (*Metadata, error) {
+			close(secondEntered)
+			return nil, nil
+		})
+	}()
+	select {
+	case <-secondEntered:
+		t.Fatal("second store entered transaction before first released")
+	case <-time.After(30 * time.Millisecond):
+	}
+	close(release)
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-secondEntered:
+	case <-time.After(time.Second):
+		t.Fatal("second transaction did not acquire lock")
+	}
+	if _, err := first.GetMetadata(context.Background(), binding, KindRouting); err != nil {
+		t.Fatalf("session transaction damaged routing metadata: %v", err)
+	}
+}

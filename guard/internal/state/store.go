@@ -50,12 +50,18 @@ type Metadata struct {
 	ReconciliationID string    `json:"reconciliationId,omitempty"`
 	ReferenceHash    string    `json:"referenceHash,omitempty"`
 	ExpiresAt        time.Time `json:"expiresAt,omitempty"`
+	Generation       uint64    `json:"generation,omitempty"`
+	Tombstoned       bool      `json:"tombstoned,omitempty"`
 }
+
+type SessionTransaction func(current Metadata, found bool) (next *Metadata, err error)
 
 type storeImpl interface {
 	PutMetadata(context.Context, Binding, Metadata) error
 	GetMetadata(context.Context, Binding, Kind) (Metadata, error)
 	DeleteAccount(context.Context, Binding) error
+	DeleteMetadata(context.Context, Binding, Kind) error
+	WithSessionTransaction(context.Context, Binding, SessionTransaction) error
 	Close() error
 	recordName(Binding, Kind) (string, error)
 }
@@ -89,6 +95,27 @@ func (s *Store) DeleteAccount(ctx context.Context, binding Binding) error {
 		return ErrUnsupported
 	}
 	return s.impl.DeleteAccount(ctx, binding)
+}
+
+func (s *Store) DeleteMetadata(ctx context.Context, binding Binding, kind Kind) error {
+	if s == nil || s.impl == nil {
+		return ErrUnsupported
+	}
+	return s.impl.DeleteMetadata(ctx, binding, kind)
+}
+
+// WithSessionTransaction serializes session metadata changes across processes.
+// A nil next value deletes only session metadata; other metadata kinds are
+// never touched. The callback runs while the per-root OS lock is held and must
+// honor ctx for any external work it performs.
+func (s *Store) WithSessionTransaction(ctx context.Context, binding Binding, transaction SessionTransaction) error {
+	if s == nil || s.impl == nil {
+		return ErrUnsupported
+	}
+	if transaction == nil {
+		return ErrUnsafePayload
+	}
+	return s.impl.WithSessionTransaction(ctx, binding, transaction)
 }
 
 func (s *Store) Close() error {
@@ -125,12 +152,17 @@ func validateMetadata(metadata Metadata) error {
 		}
 	case KindSession:
 		if !sessionPattern.MatchString(metadata.SessionID) || metadata.RouteID != "" ||
-			metadata.ReconciliationID != "" || metadata.ReferenceHash != "" || metadata.ExpiresAt.IsZero() {
+			metadata.ReconciliationID != "" || metadata.ReferenceHash != "" ||
+			(!metadata.Tombstoned && metadata.ExpiresAt.IsZero()) {
+			return ErrUnsafePayload
+		}
+		if metadata.Tombstoned && (metadata.Generation == 0 || !metadata.ExpiresAt.IsZero()) {
 			return ErrUnsafePayload
 		}
 	case KindReconciliation:
 		if !reconPattern.MatchString(metadata.ReconciliationID) || !hashPattern.MatchString(metadata.ReferenceHash) ||
-			metadata.RouteID != "" || metadata.SessionID != "" || !metadata.ExpiresAt.IsZero() {
+			metadata.RouteID != "" || metadata.SessionID != "" || !metadata.ExpiresAt.IsZero() ||
+			metadata.Generation != 0 || metadata.Tombstoned {
 			return ErrUnsafePayload
 		}
 	default:

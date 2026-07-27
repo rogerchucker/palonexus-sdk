@@ -24,16 +24,23 @@ import (
 )
 
 var (
-	ErrInvalidConfig   = errors.New("invalid OIDC configuration")
-	ErrProvider        = errors.New("OIDC provider unavailable")
-	ErrInvalidCallback = errors.New("invalid OIDC callback")
-	ErrInvalidToken    = errors.New("invalid OIDC token")
-	ErrNoSession       = errors.New("OIDC session not found")
-	ErrStorage         = errors.New("OIDC session storage failed")
+	ErrInvalidConfig       = errors.New("invalid OIDC configuration")
+	ErrProvider            = errors.New("OIDC provider unavailable")
+	ErrInvalidCallback     = errors.New("invalid OIDC callback")
+	ErrInvalidToken        = errors.New("invalid OIDC token")
+	ErrNoSession           = errors.New("OIDC session not found")
+	ErrStorage             = errors.New("OIDC session storage failed")
+	ErrCommitIndeterminate = errors.New("OIDC session commit indeterminate; reauthentication required")
+	ErrPartial             = errors.New("OIDC session operation partially completed")
+	ErrRevocation          = errors.New("OIDC credential revocation failed")
 )
 
 const (
 	maxDiscoveryBytes = 64 << 10
+	maxJWKSBytes      = 256 << 10
+	maxTokenBodyBytes = 64 << 10
+	maxRevokeBytes    = 4 << 10
+	maxJWKSKeys       = 32
 	maxAttempts       = 32
 )
 
@@ -47,10 +54,13 @@ type metadataStore interface {
 	PutMetadata(context.Context, state.Binding, state.Metadata) error
 	GetMetadata(context.Context, state.Binding, state.Kind) (state.Metadata, error)
 	DeleteAccount(context.Context, state.Binding) error
+	DeleteMetadata(context.Context, state.Binding, state.Kind) error
+	WithSessionTransaction(context.Context, state.Binding, state.SessionTransaction) error
 }
 
 type Options struct {
 	Issuer, ClientID, ClientSecret string
+	RevocationAuthMethod           string
 	Tenant, Account                string
 	RedirectURI                    string
 	Algorithms                     []string
@@ -58,8 +68,15 @@ type Options struct {
 	HTTPClient                     *http.Client
 	Credentials                    credentialStore
 	Metadata                       metadataStore
-	AllowInsecureLoopback          bool
 	Now                            func() time.Time
+	testing                        *testingOptions
+}
+
+type testingOptions struct{}
+
+func newForTesting(options Options) (*Manager, error) {
+	options.testing = &testingOptions{}
+	return New(options)
 }
 
 type discovery struct {
@@ -72,14 +89,14 @@ type discovery struct {
 }
 
 type Manager struct {
-	options     Options
-	client      *http.Client
-	mu          sync.Mutex
-	config      *oauth2.Config
-	verifier    *oidc.IDTokenVerifier
-	discovery   discovery
-	attempts    map[string]attempt
-	lastRefresh map[string]time.Time
+	options   Options
+	client    *http.Client
+	mu        sync.Mutex
+	config    *oauth2.Config
+	verifier  *oidc.IDTokenVerifier
+	discovery discovery
+	attempts  map[string]attempt
+	limits    *responseLimiter
 }
 
 type attempt struct {
@@ -108,7 +125,7 @@ func New(options Options) (*Manager, error) {
 	}
 	if options.HTTPClient == nil {
 		options.HTTPClient = &http.Client{Timeout: 10 * time.Second, Transport: hardenedTransport()}
-	} else if !options.AllowInsecureLoopback {
+	} else if options.testing == nil {
 		base, ok := options.HTTPClient.Transport.(*http.Transport)
 		if options.HTTPClient.Transport == nil {
 			base = http.DefaultTransport.(*http.Transport)
@@ -126,13 +143,27 @@ func New(options Options) (*Manager, error) {
 		options.Tenant == "" || options.Account == "" || len(options.Algorithms) == 0 {
 		return nil, ErrInvalidConfig
 	}
+	if options.RevocationAuthMethod == "" {
+		if options.ClientSecret != "" {
+			options.RevocationAuthMethod = "client_secret_basic"
+		} else {
+			options.RevocationAuthMethod = "none"
+		}
+	}
+	if options.RevocationAuthMethod != "none" && options.RevocationAuthMethod != "client_secret_basic" &&
+		options.RevocationAuthMethod != "client_secret_post" {
+		return nil, ErrInvalidConfig
+	}
+	if options.RevocationAuthMethod != "none" && options.ClientSecret == "" {
+		return nil, ErrInvalidConfig
+	}
 	for _, alg := range options.Algorithms {
 		if alg != "RS256" && alg != "RS384" && alg != "RS512" &&
 			alg != "ES256" && alg != "ES384" && alg != "ES512" && alg != "PS256" && alg != "PS384" && alg != "PS512" {
 			return nil, ErrInvalidConfig
 		}
 	}
-	if err := validateRemoteURL(options.Issuer, options.AllowInsecureLoopback); err != nil {
+	if err := validateRemoteURL(options.Issuer, options.testing != nil); err != nil {
 		return nil, ErrInvalidConfig
 	}
 	redirect, err := url.Parse(options.RedirectURI)
@@ -144,7 +175,9 @@ func New(options Options) (*Manager, error) {
 	client := *options.HTTPClient
 	client.Timeout = boundedTimeout(client.Timeout)
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
-	m := &Manager{options: options, client: &client, attempts: make(map[string]attempt), lastRefresh: make(map[string]time.Time)}
+	limiter := &responseLimiter{base: client.Transport, endpoints: make(map[string]responseKind)}
+	client.Transport = limiter
+	m := &Manager{options: options, client: &client, attempts: make(map[string]attempt), limits: limiter}
 	if err := m.discover(context.Background()); err != nil {
 		return nil, err
 	}
@@ -159,7 +192,10 @@ func boundedTimeout(value time.Duration) time.Duration {
 }
 
 func (m *Manager) discover(ctx context.Context) error {
-	wellKnown := strings.TrimRight(m.options.Issuer, "/") + "/.well-known/openid-configuration"
+	wellKnown, err := discoveryURL(m.options.Issuer)
+	if err != nil {
+		return ErrProvider
+	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodGet, wellKnown, nil)
 	if err != nil {
 		return ErrProvider
@@ -183,18 +219,18 @@ func (m *Manager) discover(ctx context.Context) error {
 		return ErrProvider
 	}
 	for _, endpoint := range []string{document.AuthorizationEndpoint, document.TokenEndpoint, document.JWKSURI} {
-		if validateRemoteURL(endpoint, m.options.AllowInsecureLoopback) != nil {
+		if validateRemoteURL(endpoint, m.options.testing != nil) != nil {
 			return ErrProvider
 		}
 	}
-	if document.RevocationEndpoint != "" && validateRemoteURL(document.RevocationEndpoint, m.options.AllowInsecureLoopback) != nil {
+	if document.RevocationEndpoint != "" && validateRemoteURL(document.RevocationEndpoint, m.options.testing != nil) != nil {
 		return ErrProvider
 	}
 	if !containsAny(document.Algorithms, m.options.Algorithms) {
 		return ErrProvider
 	}
 	ctx = oidc.ClientContext(ctx, m.client)
-	if m.options.AllowInsecureLoopback {
+	if m.options.testing != nil {
 		ctx = oidc.InsecureIssuerURLContext(ctx, m.options.Issuer)
 	}
 	keySet := oidc.NewRemoteKeySet(ctx, document.JWKSURI)
@@ -203,12 +239,134 @@ func (m *Manager) discover(ctx context.Context) error {
 		Now: m.options.Now,
 	})
 	m.discovery = document
+	m.limits.configure(document)
 	m.config = &oauth2.Config{
 		ClientID: m.options.ClientID, ClientSecret: m.options.ClientSecret,
 		Endpoint:    oauth2.Endpoint{AuthURL: document.AuthorizationEndpoint, TokenURL: document.TokenEndpoint},
 		RedirectURL: m.options.RedirectURI, Scopes: []string{oidc.ScopeOpenID, "profile", "offline_access"},
 	}
 	return nil
+}
+
+type responseKind uint8
+
+const (
+	responseJWKS responseKind = iota + 1
+	responseToken
+	responseRevoke
+)
+
+type responseLimiter struct {
+	base      http.RoundTripper
+	mu        sync.RWMutex
+	endpoints map[string]responseKind
+}
+
+func (l *responseLimiter) configure(document discovery) {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	l.endpoints[document.JWKSURI] = responseJWKS
+	l.endpoints[document.TokenEndpoint] = responseToken
+	if document.RevocationEndpoint != "" {
+		l.endpoints[document.RevocationEndpoint] = responseRevoke
+	}
+}
+
+func (l *responseLimiter) RoundTrip(request *http.Request) (*http.Response, error) {
+	base := l.base
+	if base == nil {
+		base = http.DefaultTransport
+	}
+	response, err := base.RoundTrip(request)
+	if err != nil {
+		return nil, err
+	}
+	limit := int64(maxDiscoveryBytes)
+	l.mu.RLock()
+	kind := l.endpoints[request.URL.String()]
+	l.mu.RUnlock()
+	switch kind {
+	case responseJWKS:
+		limit = maxJWKSBytes
+	case responseToken:
+		limit = maxTokenBodyBytes
+	case responseRevoke:
+		limit = maxRevokeBytes
+	}
+	if response.ContentLength > limit {
+		response.Body.Close()
+		return nil, ErrProvider
+	}
+	body, readErr := io.ReadAll(io.LimitReader(response.Body, limit+1))
+	response.Body.Close()
+	if readErr != nil || int64(len(body)) > limit {
+		return nil, ErrProvider
+	}
+	if (kind == responseJWKS || kind == responseToken || kind == 0) && !boundedJSONDepth(body, 16) {
+		return nil, ErrProvider
+	}
+	if kind == responseJWKS && !validJWKSShape(body) {
+		return nil, ErrProvider
+	}
+	response.Body = io.NopCloser(strings.NewReader(string(body)))
+	response.ContentLength = int64(len(body))
+	return response, nil
+}
+
+func boundedJSONDepth(document []byte, maximum int) bool {
+	decoder := json.NewDecoder(strings.NewReader(string(document)))
+	depth := 0
+	for {
+		token, err := decoder.Token()
+		if err == io.EOF {
+			return depth == 0
+		}
+		if err != nil {
+			return false
+		}
+		delimiter, ok := token.(json.Delim)
+		if !ok {
+			continue
+		}
+		switch delimiter {
+		case '{', '[':
+			depth++
+			if depth > maximum {
+				return false
+			}
+		case '}', ']':
+			depth--
+			if depth < 0 {
+				return false
+			}
+		}
+	}
+}
+
+func validJWKSShape(document []byte) bool {
+	var value struct {
+		Keys []json.RawMessage `json:"keys"`
+	}
+	if !boundedJSONDepth(document, 16) || json.Unmarshal(document, &value) != nil ||
+		len(value.Keys) == 0 || len(value.Keys) > maxJWKSKeys {
+		return false
+	}
+	for _, key := range value.Keys {
+		if len(key) > 16<<10 {
+			return false
+		}
+	}
+	return true
+}
+
+func discoveryURL(issuer string) (string, error) {
+	u, err := url.Parse(issuer)
+	if err != nil || u.RawPath != "" || strings.Contains(strings.ToLower(u.EscapedPath()), "%2f") ||
+		strings.Contains(strings.ToLower(u.EscapedPath()), "%5c") {
+		return "", ErrInvalidConfig
+	}
+	u.Path = strings.TrimSuffix(u.Path, "/") + "/.well-known/openid-configuration"
+	return u.String(), nil
 }
 
 func validateRemoteURL(raw string, allowLocal bool) error {
@@ -251,18 +409,47 @@ func safeDial(ctx context.Context, network, address string) (net.Conn, error) {
 	if err != nil || len(addresses) == 0 {
 		return nil, ErrProvider
 	}
-	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
 	for _, candidate := range addresses {
-		ip := net.IP(candidate.AsSlice())
-		if ip.IsPrivate() || ip.IsLoopback() || ip.IsLinkLocalUnicast() || ip.IsUnspecified() {
+		if forbiddenDestination(net.IP(candidate.AsSlice())) {
 			return nil, ErrProvider
 		}
+	}
+	dialer := &net.Dialer{Timeout: 10 * time.Second, KeepAlive: 30 * time.Second}
+	for _, candidate := range addresses {
 		connection, dialErr := dialer.DialContext(ctx, network, net.JoinHostPort(candidate.String(), port))
 		if dialErr == nil {
 			return connection, nil
 		}
 	}
 	return nil, ErrProvider
+}
+
+var forbiddenNetworks = func() []*net.IPNet {
+	values := []string{
+		"0.0.0.0/8", "100.64.0.0/10", "127.0.0.0/8", "169.254.0.0/16",
+		"192.0.0.0/24", "192.0.2.0/24", "198.18.0.0/15", "198.51.100.0/24",
+		"203.0.113.0/24", "224.0.0.0/4", "240.0.0.0/4",
+		"::/128", "::1/128", "fc00::/7", "fe80::/10", "2001:db8::/32", "ff00::/8",
+	}
+	result := make([]*net.IPNet, 0, len(values))
+	for _, value := range values {
+		_, network, _ := net.ParseCIDR(value)
+		result = append(result, network)
+	}
+	return result
+}()
+
+func forbiddenDestination(ip net.IP) bool {
+	if ip == nil || !ip.IsGlobalUnicast() || ip.IsPrivate() || ip.IsLoopback() ||
+		ip.IsLinkLocalUnicast() || ip.IsUnspecified() || ip.IsMulticast() {
+		return true
+	}
+	for _, network := range forbiddenNetworks {
+		if network.Contains(ip) {
+			return true
+		}
+	}
+	return false
 }
 
 func containsAny(provider, allowed []string) bool {

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
 	"net/http"
 	"net/url"
 	"strings"
@@ -23,8 +24,26 @@ type Session struct {
 }
 
 type credential struct {
-	SessionID, Subject, AccessToken, RefreshToken string
-	ExpiresAt, RefreshedAt                        time.Time
+	SessionID, Subject, Nonce, AccessToken, RefreshToken string
+	ExpiresAt, RefreshedAt                               time.Time
+}
+
+const (
+	maxTokenBytes      = 16 << 10
+	maxCredentialBytes = 64 << 10
+)
+
+type PartialError struct {
+	RevocationFailed   bool
+	LocalCleanupFailed bool
+	CommitUncertain    bool
+}
+
+func (e *PartialError) Error() string { return ErrPartial.Error() }
+func (e *PartialError) Is(target error) bool {
+	return target == ErrPartial ||
+		(target == ErrRevocation && e.RevocationFailed) ||
+		(target == ErrCommitIndeterminate && e.CommitUncertain)
 }
 
 type verifiedClaims struct {
@@ -36,6 +55,7 @@ type verifiedClaims struct {
 	IssuedAt  int64    `json:"iat"`
 	NotBefore int64    `json:"nbf"`
 	Expiry    int64    `json:"exp"`
+	AuthTime  int64    `json:"auth_time"`
 }
 
 func (c *verifiedClaims) UnmarshalJSON(data []byte) error {
@@ -60,14 +80,14 @@ func (m *Manager) Complete(ctx context.Context, callback Callback) (Session, err
 	if err := ctx.Err(); err != nil {
 		return Session{}, err
 	}
-	if callback.Error != "" || callback.Code == "" || callback.State == "" || len(callback.Code) > 4096 {
+	if callback.State == "" || len(callback.State) > 256 || len(callback.Code) > 4096 || len(callback.Error) > 256 {
 		return Session{}, ErrInvalidCallback
 	}
 	m.mu.Lock()
 	selected, ok := m.attempts[callback.State]
 	delete(m.attempts, callback.State)
 	m.mu.Unlock()
-	if !ok || !selected.expires.After(m.options.Now()) || !constantEqual(callback.State, callback.State) {
+	if !ok || !selected.expires.After(m.options.Now()) || callback.Error != "" || callback.Code == "" {
 		return Session{}, ErrInvalidCallback
 	}
 	token, err := m.config.Exchange(oidcClientContext(ctx, m.client), callback.Code,
@@ -91,7 +111,7 @@ func (m *Manager) Complete(ctx context.Context, callback Callback) (Session, err
 	if refresh == "" {
 		refresh = token.RefreshToken
 	}
-	if token.AccessToken == "" || refresh == "" || !strings.EqualFold(token.TokenType, "Bearer") {
+	if !validTokenField(token.AccessToken) || !validTokenField(refresh) || !strings.EqualFold(token.TokenType, "Bearer") {
 		return Session{}, ErrInvalidToken
 	}
 	sessionID, err := newSessionID()
@@ -99,14 +119,44 @@ func (m *Manager) Complete(ctx context.Context, callback Callback) (Session, err
 		return Session{}, ErrStorage
 	}
 	expires := token.Expiry
-	if expires.IsZero() || expires.After(m.options.Now().Add(m.options.MaxTokenLifetime+m.options.ClockSkew)) {
+	if expires.IsZero() || !expires.After(m.options.Now().Add(-m.options.ClockSkew)) ||
+		expires.After(m.options.Now().Add(m.options.MaxTokenLifetime+m.options.ClockSkew)) {
 		return Session{}, ErrInvalidToken
 	}
-	stored := credential{SessionID: sessionID, Subject: claims.Subject, AccessToken: token.AccessToken, RefreshToken: refresh, ExpiresAt: expires}
-	if err := m.commitCredential(ctx, stored); err != nil {
-		return Session{}, err
+	stored := credential{SessionID: sessionID, Subject: claims.Subject, Nonce: selected.nonce, AccessToken: token.AccessToken, RefreshToken: refresh, ExpiresAt: expires}
+	result := Session{ID: sessionID, Subject: claims.Subject, ExpiresAt: expires}
+	var previous state.Metadata
+	var hadPrevious bool
+	binding := state.Binding{Tenant: m.options.Tenant, Account: m.options.Account}
+	err = m.options.Metadata.WithSessionTransaction(ctx, binding, func(current state.Metadata, found bool) (*state.Metadata, error) {
+		previous, hadPrevious = current, found && !current.Tombstoned
+		generation := uint64(1)
+		if found {
+			generation = current.Generation + 1
+		}
+		if err := m.putCredential(ctx, stored); err != nil {
+			return nil, err
+		}
+		next := state.Metadata{Kind: state.KindSession, SessionID: sessionID, Generation: generation, ExpiresAt: expires}
+		return &next, nil
+	})
+	if err != nil {
+		if errors.Is(err, state.ErrDurabilityIndeterminate) {
+			return result, ErrCommitIndeterminate
+		}
+		cleanupErr := m.options.Credentials.Delete(context.WithoutCancel(ctx), credentialKey(m.options.Tenant, m.options.Account, sessionID))
+		if cleanupErr != nil {
+			return Session{}, ErrCommitIndeterminate
+		}
+		return Session{}, ErrStorage
 	}
-	return Session{ID: sessionID, Subject: claims.Subject, ExpiresAt: expires}, nil
+	if hadPrevious && previous.SessionID != sessionID {
+		if err := m.options.Credentials.Delete(context.WithoutCancel(ctx),
+			credentialKey(m.options.Tenant, m.options.Account, previous.SessionID)); err != nil {
+			return result, &PartialError{LocalCleanupFailed: true}
+		}
+	}
+	return result, nil
 }
 
 func oidcClientContext(ctx context.Context, client *http.Client) context.Context {
@@ -118,10 +168,17 @@ func (m *Manager) validateClaims(claims verifiedClaims, expectedNonce string) bo
 	issued := time.Unix(claims.IssuedAt, 0)
 	notBefore := time.Unix(claims.NotBefore, 0)
 	expires := time.Unix(claims.Expiry, 0)
+	authTime := time.Unix(claims.AuthTime, 0)
 	if claims.Issuer != m.options.Issuer || claims.Subject == "" || !constantEqual(claims.Nonce, expectedNonce) ||
 		claims.IssuedAt == 0 || claims.Expiry == 0 ||
 		issued.After(now.Add(m.options.ClockSkew)) || (claims.NotBefore != 0 && notBefore.After(now.Add(m.options.ClockSkew))) ||
-		expires.Before(now.Add(-m.options.ClockSkew)) || expires.Sub(issued) > m.options.MaxTokenLifetime+m.options.ClockSkew {
+		!expires.After(now.Add(-m.options.ClockSkew)) || !expires.After(issued) ||
+		expires.Sub(issued) > m.options.MaxTokenLifetime+m.options.ClockSkew ||
+		now.Sub(issued) > m.options.MaxTokenLifetime+m.options.ClockSkew {
+		return false
+	}
+	if claims.AuthTime != 0 && (authTime.After(now.Add(m.options.ClockSkew)) ||
+		now.Sub(authTime) > m.options.MaxTokenLifetime+m.options.ClockSkew) {
 		return false
 	}
 	found := false
@@ -150,9 +207,13 @@ func newSessionID() (string, error) {
 	return builder.String(), nil
 }
 
-func (m *Manager) commitCredential(ctx context.Context, value credential) error {
+func validTokenField(value string) bool {
+	return value != "" && len(value) <= maxTokenBytes && !strings.ContainsAny(value, "\r\n\x00")
+}
+
+func (m *Manager) putCredential(ctx context.Context, value credential) error {
 	raw, err := json.Marshal(value)
-	if err != nil {
+	if err != nil || len(raw) > maxCredentialBytes {
 		return ErrStorage
 	}
 	defer keystore.Zero(raw)
@@ -160,70 +221,63 @@ func (m *Manager) commitCredential(ctx context.Context, value credential) error 
 	if err := m.options.Credentials.Put(ctx, key, raw); err != nil {
 		return ErrStorage
 	}
-	metadata := state.Metadata{Kind: state.KindSession, SessionID: value.SessionID, ExpiresAt: value.ExpiresAt}
-	if err := m.options.Metadata.PutMetadata(ctx, state.Binding{Tenant: m.options.Tenant, Account: m.options.Account}, metadata); err != nil {
-		_ = m.options.Credentials.Delete(context.WithoutCancel(ctx), key)
-		return ErrStorage
-	}
 	return nil
 }
 
 func (m *Manager) Refresh(ctx context.Context, sessionID string) (Session, error) {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	if last := m.lastRefresh[sessionID]; !last.IsZero() && m.options.Now().Sub(last) < time.Second {
-		value, err := m.loadCredential(ctx, sessionID)
-		if err != nil {
-			return Session{}, err
+	binding := state.Binding{Tenant: m.options.Tenant, Account: m.options.Account}
+	var result Session
+	var oldID, newID string
+	exchanged := false
+	err := m.options.Metadata.WithSessionTransaction(ctx, binding, func(current state.Metadata, found bool) (*state.Metadata, error) {
+		if !found || current.Tombstoned {
+			return nil, ErrNoSession
 		}
-		return Session{ID: value.SessionID, Subject: value.Subject, ExpiresAt: value.ExpiresAt}, nil
-	}
-	value, err := m.loadCredential(ctx, sessionID)
-	if err != nil {
-		return Session{}, err
-	}
-	config := *m.config
-	config.RedirectURL = ""
-	source := config.TokenSource(oidcClientContext(ctx, m.client), &oauth2.Token{
-		RefreshToken: value.RefreshToken, Expiry: time.Unix(0, 0),
+		if current.SessionID != sessionID {
+			value, loadErr := m.loadCredential(ctx, current.SessionID)
+			if loadErr != nil {
+				return nil, loadErr
+			}
+			result = Session{ID: value.SessionID, Subject: value.Subject, ExpiresAt: value.ExpiresAt}
+			return &current, nil
+		}
+		value, loadErr := m.loadCredential(ctx, current.SessionID)
+		if loadErr != nil {
+			return nil, loadErr
+		}
+		token, refreshErr := m.exchangeRefresh(ctx, value)
+		if refreshErr != nil {
+			return nil, refreshErr
+		}
+		exchanged = true
+		newID, refreshErr = newSessionID()
+		if refreshErr != nil {
+			return nil, ErrCommitIndeterminate
+		}
+		nextCredential := credential{SessionID: newID, Subject: value.Subject, Nonce: value.Nonce, AccessToken: token.AccessToken,
+			RefreshToken: token.RefreshToken, ExpiresAt: token.Expiry, RefreshedAt: m.options.Now()}
+		if putErr := m.putCredential(ctx, nextCredential); putErr != nil {
+			return nil, ErrCommitIndeterminate
+		}
+		oldID = current.SessionID
+		next := state.Metadata{Kind: state.KindSession, SessionID: newID, Generation: current.Generation + 1, ExpiresAt: token.Expiry}
+		result = Session{ID: newID, Subject: value.Subject, ExpiresAt: token.Expiry}
+		return &next, nil
 	})
-	token, err := source.Token()
 	if err != nil {
-		return Session{}, ErrProvider
-	}
-	rawID, ok := token.Extra("id_token").(string)
-	if !ok || rawID == "" {
-		return Session{}, ErrInvalidToken
-	}
-	verified, err := m.verifier.Verify(oidcClientContext(ctx, m.client), rawID)
-	if err != nil {
-		return Session{}, ErrInvalidToken
-	}
-	var claims verifiedClaims
-	if verified.Claims(&claims) != nil || claims.Subject != value.Subject || !m.validateClaims(claims, "") {
-		return Session{}, ErrInvalidToken
-	}
-	refresh := token.RefreshToken
-	if refresh == "" {
-		return Session{}, ErrInvalidToken
-	}
-	if token.AccessToken == "" || !strings.EqualFold(token.TokenType, "Bearer") || token.Expiry.IsZero() ||
-		token.Expiry.After(m.options.Now().Add(m.options.MaxTokenLifetime+m.options.ClockSkew)) {
-		return Session{}, ErrInvalidToken
-	}
-	next := credential{SessionID: sessionID, Subject: value.Subject, AccessToken: token.AccessToken,
-		RefreshToken: refresh, ExpiresAt: token.Expiry, RefreshedAt: m.options.Now()}
-	if err := m.commitCredential(ctx, next); err != nil {
-		previous, marshalErr := json.Marshal(value)
-		if marshalErr == nil {
-			_ = m.options.Credentials.Put(context.WithoutCancel(ctx),
-				credentialKey(m.options.Tenant, m.options.Account, sessionID), previous)
-			keystore.Zero(previous)
+		if exchanged {
+			m.tombstoneAfterFailedRefresh(binding, oldID, newID)
+			return Session{}, ErrCommitIndeterminate
 		}
 		return Session{}, err
 	}
-	m.lastRefresh[sessionID] = m.options.Now()
-	return Session{ID: sessionID, Subject: value.Subject, ExpiresAt: token.Expiry}, nil
+	if oldID != "" {
+		if deleteErr := m.options.Credentials.Delete(context.WithoutCancel(ctx),
+			credentialKey(m.options.Tenant, m.options.Account, oldID)); deleteErr != nil {
+			return result, &PartialError{LocalCleanupFailed: true}
+		}
+	}
+	return result, nil
 }
 
 func (m *Manager) loadCredential(ctx context.Context, sessionID string) (credential, error) {
@@ -236,40 +290,137 @@ func (m *Manager) loadCredential(ctx context.Context, sessionID string) (credent
 	}
 	defer keystore.Zero(raw)
 	var value credential
-	if json.Unmarshal(raw, &value) != nil || value.SessionID != sessionID || value.RefreshToken == "" {
+	if len(raw) > maxCredentialBytes || json.Unmarshal(raw, &value) != nil || value.SessionID != sessionID ||
+		!validTokenField(value.RefreshToken) || !validTokenField(value.AccessToken) || value.Subject == "" ||
+		len(value.Subject) > 1024 || len(value.Nonce) > 1024 {
 		return credential{}, ErrStorage
 	}
 	return value, nil
 }
 
-func (m *Manager) Logout(ctx context.Context, sessionID string) error {
-	value, err := m.loadCredential(ctx, sessionID)
-	if err != nil && !errors.Is(err, ErrNoSession) {
-		return err
+func (m *Manager) exchangeRefresh(ctx context.Context, value credential) (*oauth2.Token, error) {
+	config := *m.config
+	config.RedirectURL = ""
+	token, err := config.TokenSource(oidcClientContext(ctx, m.client), &oauth2.Token{
+		RefreshToken: value.RefreshToken, Expiry: time.Unix(0, 0),
+	}).Token()
+	if err != nil {
+		return nil, ErrProvider
 	}
-	if err == nil && m.discovery.RevocationEndpoint != "" {
-		for _, token := range []string{value.RefreshToken, value.AccessToken} {
-			if token == "" {
-				continue
-			}
-			form := url.Values{"token": {token}}
-			req, requestErr := http.NewRequestWithContext(ctx, http.MethodPost, m.discovery.RevocationEndpoint, strings.NewReader(form.Encode()))
-			if requestErr == nil {
-				req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
-				resp, revokeErr := m.client.Do(req)
-				if revokeErr == nil {
-					resp.Body.Close()
-				}
-			}
+	rawID, ok := token.Extra("id_token").(string)
+	if !ok || !validTokenField(rawID) {
+		return nil, ErrInvalidToken
+	}
+	verified, err := m.verifier.Verify(oidcClientContext(ctx, m.client), rawID)
+	if err != nil {
+		return nil, ErrInvalidToken
+	}
+	var claims verifiedClaims
+	if verified.Claims(&claims) != nil || claims.Subject != value.Subject || !m.validateClaims(claims, value.Nonce) {
+		return nil, ErrInvalidToken
+	}
+	if !validTokenField(token.RefreshToken) || !validTokenField(token.AccessToken) ||
+		!strings.EqualFold(token.TokenType, "Bearer") || token.Expiry.IsZero() ||
+		!token.Expiry.After(m.options.Now().Add(-m.options.ClockSkew)) ||
+		token.Expiry.After(m.options.Now().Add(m.options.MaxTokenLifetime+m.options.ClockSkew)) {
+		return nil, ErrInvalidToken
+	}
+	return token, nil
+}
+
+func (m *Manager) tombstoneAfterFailedRefresh(binding state.Binding, oldID, newID string) {
+	cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_ = m.options.Metadata.WithSessionTransaction(cleanup, binding, func(current state.Metadata, found bool) (*state.Metadata, error) {
+		generation := uint64(1)
+		selected := oldID
+		if found {
+			generation = current.Generation + 1
+			selected = current.SessionID
+		}
+		if selected == "" {
+			selected = newID
+		}
+		tombstone := state.Metadata{Kind: state.KindSession, SessionID: selected, Generation: generation, Tombstoned: true}
+		return &tombstone, nil
+	})
+	for _, id := range []string{oldID, newID} {
+		if id != "" {
+			_ = m.options.Credentials.Delete(cleanup, credentialKey(m.options.Tenant, m.options.Account, id))
 		}
 	}
-	deleteErr := m.options.Credentials.Delete(context.WithoutCancel(ctx), credentialKey(m.options.Tenant, m.options.Account, sessionID))
-	stateErr := m.options.Metadata.DeleteAccount(context.WithoutCancel(ctx), state.Binding{Tenant: m.options.Tenant, Account: m.options.Account})
-	if deleteErr != nil || stateErr != nil {
-		return ErrStorage
+}
+
+func (m *Manager) Logout(ctx context.Context, sessionID string) error {
+	binding := state.Binding{Tenant: m.options.Tenant, Account: m.options.Account}
+	cleanup, cancel := context.WithTimeout(context.WithoutCancel(ctx), 10*time.Second)
+	defer cancel()
+	partial := &PartialError{}
+	transactionErr := m.options.Metadata.WithSessionTransaction(cleanup, binding, func(current state.Metadata, found bool) (*state.Metadata, error) {
+		if !found || current.Tombstoned {
+			return nil, ErrNoSession
+		}
+		value, loadErr := m.loadCredential(cleanup, current.SessionID)
+		if loadErr != nil {
+			partial.LocalCleanupFailed = true
+		} else if revokeErr := m.revoke(ctx, value); revokeErr != nil {
+			partial.RevocationFailed = true
+		}
+		if deleteErr := m.options.Credentials.Delete(cleanup,
+			credentialKey(m.options.Tenant, m.options.Account, current.SessionID)); deleteErr != nil {
+			partial.LocalCleanupFailed = true
+		}
+		return nil, nil
+	})
+	if errors.Is(transactionErr, state.ErrCorrupt) {
+		partial.LocalCleanupFailed = true
+		_ = m.options.Credentials.Delete(cleanup, credentialKey(m.options.Tenant, m.options.Account, sessionID))
+		if err := m.options.Metadata.DeleteMetadata(cleanup, binding, state.KindSession); err != nil {
+			partial.LocalCleanupFailed = true
+		}
+		transactionErr = nil
 	}
-	m.mu.Lock()
-	delete(m.lastRefresh, sessionID)
-	m.mu.Unlock()
+	if transactionErr != nil {
+		return transactionErr
+	}
+	if partial.LocalCleanupFailed || partial.RevocationFailed {
+		return partial
+	}
+	return nil
+}
+
+func (m *Manager) revoke(ctx context.Context, value credential) error {
+	if m.discovery.RevocationEndpoint == "" {
+		return nil
+	}
+	if err := ctx.Err(); err != nil {
+		return ErrRevocation
+	}
+	for _, item := range []struct{ token, hint string }{
+		{value.RefreshToken, "refresh_token"}, {value.AccessToken, "access_token"},
+	} {
+		form := url.Values{"token": {item.token}, "token_type_hint": {item.hint}}
+		if m.options.RevocationAuthMethod == "client_secret_post" {
+			form.Set("client_id", m.options.ClientID)
+			form.Set("client_secret", m.options.ClientSecret)
+		}
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.discovery.RevocationEndpoint, strings.NewReader(form.Encode()))
+		if err != nil {
+			return ErrRevocation
+		}
+		req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+		if m.options.RevocationAuthMethod == "client_secret_basic" {
+			req.SetBasicAuth(m.options.ClientID, m.options.ClientSecret)
+		}
+		resp, err := m.client.Do(req)
+		if err != nil {
+			return ErrRevocation
+		}
+		_, readErr := io.Copy(io.Discard, io.LimitReader(resp.Body, 4097))
+		closeErr := resp.Body.Close()
+		if readErr != nil || closeErr != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return ErrRevocation
+		}
+	}
 	return nil
 }
