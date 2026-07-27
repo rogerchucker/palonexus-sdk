@@ -9,6 +9,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"io"
 	"net"
 	"os"
 	"os/exec"
@@ -742,6 +744,152 @@ func TestLifecycleChallengeIsPeerBoundAndNeverReachesHandler(t *testing.T) {
 	})
 	if result := probeGuard(mismatchedPath, 50*time.Millisecond); result == probeActive {
 		t.Fatal("challenge ignored peer UID")
+	}
+}
+
+type relayProcess struct {
+	command *exec.Cmd
+	done    <-chan struct{}
+	waitErr *error
+}
+
+func startRelayHelper(t *testing.T, upstream, target, mode string) relayProcess {
+	t.Helper()
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(executable, "-test.run=^TestSocketRelayHelper$")
+	command.Env = append(os.Environ(),
+		"PALONEXUS_SOCKET_RELAY_UPSTREAM="+upstream,
+		"PALONEXUS_SOCKET_RELAY_TARGET="+target,
+		"PALONEXUS_SOCKET_RELAY_MODE="+mode,
+	)
+	stdout, err := command.StdoutPipe()
+	if err != nil {
+		t.Fatal(err)
+	}
+	command.Stderr = os.Stderr
+	if err := command.Start(); err != nil {
+		t.Fatal(err)
+	}
+	ready, err := bufio.NewReader(stdout).ReadString('\n')
+	if err != nil || ready != "ready\n" {
+		_ = command.Process.Kill()
+		_ = command.Wait()
+		t.Fatalf("relay helper did not become ready: %q, %v", ready, err)
+	}
+	done := make(chan struct{})
+	var waitErr error
+	go func() {
+		waitErr = command.Wait()
+		close(done)
+	}()
+	t.Cleanup(func() {
+		select {
+		case <-done:
+			return
+		default:
+			_ = command.Process.Kill()
+			<-done
+		}
+	})
+	return relayProcess{command: command, done: done, waitErr: &waitErr}
+}
+
+func TestSocketRelayHelper(t *testing.T) {
+	upstreamPath := os.Getenv("PALONEXUS_SOCKET_RELAY_UPSTREAM")
+	if upstreamPath == "" {
+		return
+	}
+	targetPath := os.Getenv("PALONEXUS_SOCKET_RELAY_TARGET")
+	upstream, err := net.Dial("unix", upstreamPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer upstream.Close()
+	if os.Getenv("PALONEXUS_SOCKET_RELAY_MODE") == "replace" {
+		if err := os.Remove(targetPath); err != nil {
+			t.Fatal(err)
+		}
+	}
+	listener, err := net.ListenUnix(
+		"unix", &net.UnixAddr{Name: targetPath, Net: "unix"},
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener.SetUnlinkOnClose(false)
+	defer listener.Close()
+	fmt.Println("ready")
+	downstream, err := listener.AcceptUnix()
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer downstream.Close()
+	done := make(chan struct{}, 2)
+	relay := func(dst io.Writer, src io.Reader) {
+		_, _ = io.Copy(dst, src)
+		done <- struct{}{}
+	}
+	go relay(upstream, downstream)
+	go relay(downstream, upstream)
+	<-done
+}
+
+func TestLifecycleChallengeRejectsCrossProcessRelay(t *testing.T) {
+	_, upstream := startTestServer(t, func(c *Config) {
+		c.IOTimeout = 200 * time.Millisecond
+	})
+	root, err := os.MkdirTemp("", "pn-relay-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	proxy := filepath.Join(root, "proxy.sock")
+	startRelayHelper(t, upstream, proxy, "proxy")
+	if result := probeGuard(proxy, 200*time.Millisecond); result != probeAmbiguous {
+		t.Fatalf("relayed challenge result %v, want ambiguous", result)
+	}
+}
+
+func TestStageProofRejectsCrossProcessRelayAndPreservesDecoy(t *testing.T) {
+	root, err := os.MkdirTemp("", "pn-stage-relay-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(root) })
+	var stagePath string
+	var relay relayProcess
+	_, err = New(Config{
+		RuntimeDir: filepath.Join(root, "run"),
+		Handler:    echoHandler,
+		IOTimeout:  200 * time.Millisecond,
+		afterStageBind: func(path string) {
+			stagePath = path
+			relay = startRelayHelper(t, path, path, "replace")
+		},
+	})
+	if err == nil {
+		t.Fatal("cross-process stage relay was accepted")
+	}
+	if relay.command == nil {
+		t.Fatalf("stage relay was not started: %v", err)
+	}
+	select {
+	case <-relay.done:
+		if *relay.waitErr != nil {
+			t.Fatalf("relay helper did not observe the real listener closing: %v", *relay.waitErr)
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("real staged listener remained open after rejected proof")
+	}
+	info, statErr := os.Lstat(stagePath)
+	if statErr != nil {
+		t.Fatalf("decoy was removed: %v", statErr)
+	}
+	if info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("preserved decoy mode %v, want socket", info.Mode())
 	}
 }
 

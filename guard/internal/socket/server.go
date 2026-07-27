@@ -49,6 +49,8 @@ type Config struct {
 	onClosing func()
 	// beforeListenerProof exercises replacement after anchored publication.
 	beforeListenerProof func(string)
+	// afterStageBind exercises replacement before anchored inspection.
+	afterStageBind func(string)
 	// fault is a test-only crash seam at durable lifecycle boundaries.
 	fault func(string)
 }
@@ -197,6 +199,20 @@ func New(cfg Config) (*Server, error) {
 	// identity checked instead.
 	listener.SetUnlinkOnClose(false)
 	if err := verifyListenerFD(listener, stagePath); err != nil {
+		_ = listener.Close()
+		return fail(err)
+	}
+	// Make the staged listener connectable even under an all-masking umask.
+	// Identity and ownership are still established by the anchored inspection
+	// below; the process-bound proof prevents a replacement from advancing.
+	if err := chmodAt(dir, stageName, 0o600); err != nil {
+		_ = listener.Close()
+		return fail(fmt.Errorf("socket: initialize staged permissions: %w", err))
+	}
+	if cfg.afterStageBind != nil {
+		cfg.afterStageBind(stagePath)
+	}
+	if err := proveListenerPath(listener, stagePath, cfg.IOTimeout); err != nil {
 		_ = listener.Close()
 		return fail(err)
 	}
@@ -399,7 +415,10 @@ func recoverLifecycle(
 	)
 }
 
-const challengeField = "_palonexusGuardChallenge"
+const (
+	challengeField    = "_palonexusGuardChallenge"
+	challengePIDField = "serverPid"
+)
 
 func probeGuard(path string, timeout time.Duration) probeResult {
 	if timeout <= 0 || timeout > time.Second {
@@ -421,12 +440,32 @@ func probeGuard(path string, timeout time.Duration) probeResult {
 		return probeAmbiguous
 	}
 	defer conn.Close()
+	uid, err := peerUID(conn)
+	if err != nil || uid != currentUID() {
+		return probeAmbiguous
+	}
+	connectedPID, err := peerPID(conn)
+	if err != nil || connectedPID <= 0 {
+		return probeAmbiguous
+	}
 	_ = conn.SetDeadline(time.Now().Add(timeout))
 	if _, err := conn.Write(request); err != nil {
 		return probeAmbiguous
 	}
 	response, err := bufio.NewReaderSize(conn, 256).ReadBytes('\n')
-	if err != nil || len(response) > 256 || !bytes.Equal(response, request) {
+	if err != nil || len(response) > 256 || len(response) < 2 ||
+		response[len(response)-1] != '\n' {
+		return probeAmbiguous
+	}
+	object, err := decodeTopLevelObject(response[:len(response)-1])
+	if err != nil || len(object) != 2 {
+		return probeAmbiguous
+	}
+	var returned string
+	var claimedPID int
+	if json.Unmarshal(object[challengeField], &returned) != nil ||
+		json.Unmarshal(object[challengePIDField], &claimedPID) != nil ||
+		returned != value || claimedPID <= 0 || claimedPID != connectedPID {
 		return probeAmbiguous
 	}
 	return probeActive
@@ -452,7 +491,13 @@ func challengeResponse(frame []byte) ([]byte, bool) {
 	if err != nil || len(nonce) != 32 {
 		return nil, false
 	}
-	response, _ := json.Marshal(map[string]string{challengeField: value})
+	response, _ := json.Marshal(struct {
+		Challenge string `json:"_palonexusGuardChallenge"`
+		ServerPID int    `json:"serverPid"`
+	}{
+		Challenge: value,
+		ServerPID: os.Getpid(),
+	})
 	return append(response, '\n'), true
 }
 
@@ -484,6 +529,16 @@ func proveListenerPath(listener *net.UnixListener, path string, timeout time.Dur
 			return
 		}
 		defer conn.Close()
+		uid, credentialErr := peerUID(conn)
+		if credentialErr != nil || uid != currentUID() {
+			clientDone <- errors.New("socket proof peer UID mismatch")
+			return
+		}
+		pid, credentialErr := peerPID(conn)
+		if credentialErr != nil || pid != os.Getpid() {
+			clientDone <- errors.New("socket proof peer PID mismatch")
+			return
+		}
 		_ = conn.SetDeadline(time.Now().Add(timeout))
 		if _, err = conn.Write(nonce[:]); err == nil {
 			var echoed [len(nonce)]byte
@@ -500,6 +555,18 @@ func proveListenerPath(listener *net.UnixListener, path string, timeout time.Dur
 		return fmt.Errorf("socket: listener proof accept: %w", err)
 	}
 	_ = conn.SetDeadline(time.Now().Add(timeout))
+	uid, credentialErr := peerUID(conn)
+	if credentialErr != nil || uid != currentUID() {
+		_ = conn.Close()
+		<-clientDone
+		return errors.New("socket: listener proof peer UID mismatch")
+	}
+	pid, credentialErr := peerPID(conn)
+	if credentialErr != nil || pid != os.Getpid() {
+		_ = conn.Close()
+		<-clientDone
+		return errors.New("socket: listener proof peer PID mismatch")
+	}
 	var received [len(nonce)]byte
 	_, readErr := io.ReadFull(conn, received[:])
 	if readErr == nil && received != nonce {
