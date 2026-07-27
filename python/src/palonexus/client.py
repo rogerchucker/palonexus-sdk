@@ -152,7 +152,9 @@ class AuthorizationDecision:
 
 def _parse_timestamp(value: object) -> datetime:
     rendered = str(value)
-    return datetime.fromisoformat(rendered.removesuffix("Z") + "+00:00")
+    if rendered.endswith("Z"):
+        rendered = f"{rendered[:-1]}+00:00"
+    return datetime.fromisoformat(rendered)
 
 
 def _attempt_parts(

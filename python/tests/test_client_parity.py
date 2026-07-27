@@ -11,9 +11,11 @@ import pickle
 import threading
 import time
 from dataclasses import dataclass, replace
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any, Literal
 
+import httpx
 import pytest
 from palonexus import (
     ApprovalRequired,
@@ -24,9 +26,16 @@ from palonexus import (
     DecisionOutcome,
     InvalidDecision,
     PolicyDenied,
+    RetryPolicy,
     _canonicalize,
 )
 from palonexus._generated import protocol as wire
+from palonexus.credentials import Credential
+from palonexus.transports import (
+    AsyncHTTPAuthorizationTransport,
+    HTTPAuthorizationTransport,
+    HTTPTransportConfig,
+)
 
 ROOT = Path(__file__).parents[2]
 ACTION_VECTOR = ROOT / "protocol/test-vectors/action/valid/file-write.json"
@@ -105,26 +114,183 @@ class _AsyncTransport:
         self.close_calls += 1
 
 
-class _RetryingSyncTransport(_SyncTransport):
-    def __init__(self, result: wire.AuthorizationDecision) -> None:
-        super().__init__(result)
-        self.authorization_attempts = 0
+class _SyncCredentialProvider:
+    def get_credential(
+        self,
+        *,
+        deadline: float | None = None,
+        cancelled: Any = None,
+    ) -> Credential:
+        del deadline, cancelled
+        return Credential(
+            "real-retry-credential",
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
 
-    def decide(self, *args: Any, **kwargs: Any) -> wire.AuthorizationDecision:
-        # The transport, not the client, owns authorization retry.
-        self.authorization_attempts += 2
-        return super().decide(*args, **kwargs)
+
+class _AsyncCredentialProvider:
+    async def get_credential(
+        self,
+        *,
+        deadline: float | None = None,
+        cancelled: Any = None,
+    ) -> Credential:
+        del deadline, cancelled
+        return Credential(
+            "real-retry-credential",
+            expires_at=datetime.now(UTC) + timedelta(minutes=5),
+        )
 
 
-class _RetryingAsyncTransport(_AsyncTransport):
-    def __init__(self, result: wire.AuthorizationDecision) -> None:
-        super().__init__(result)
-        self.authorization_attempts = 0
+type _HTTPAttempt = tuple[bytes, str, str, str | None, str]
 
-    async def decide(self, *args: Any, **kwargs: Any) -> wire.AuthorizationDecision:
-        # The transport, not the client, owns authorization retry.
-        self.authorization_attempts += 2
-        return await super().decide(*args, **kwargs)
+
+class _CountingSyncHTTPTransport:
+    def __init__(self, transport: HTTPAuthorizationTransport) -> None:
+        self._transport = transport
+        self.calls: list[tuple[bytes, str, float | None, bool]] = []
+
+    def decide(
+        self,
+        request: wire.ActionRequest,
+        *,
+        client_scope_hash: str,
+        deadline: float | None = None,
+        cancelled: Any = None,
+    ) -> wire.AuthorizationDecision:
+        self.calls.append(
+            (
+                request.to_json_bytes(),
+                client_scope_hash,
+                deadline,
+                cancelled is not None,
+            )
+        )
+        return self._transport.decide(
+            request,
+            client_scope_hash=client_scope_hash,
+            deadline=deadline,
+            cancelled=cancelled,
+        )
+
+    def close(self) -> None:
+        self._transport.close()
+
+
+class _CountingAsyncHTTPTransport:
+    def __init__(self, transport: AsyncHTTPAuthorizationTransport) -> None:
+        self._transport = transport
+        self.calls: list[tuple[bytes, str, float | None, bool]] = []
+
+    async def decide(
+        self,
+        request: wire.ActionRequest,
+        *,
+        client_scope_hash: str,
+        deadline: float | None = None,
+        cancelled: Any = None,
+    ) -> wire.AuthorizationDecision:
+        self.calls.append(
+            (
+                request.to_json_bytes(),
+                client_scope_hash,
+                deadline,
+                cancelled is not None,
+            )
+        )
+        return await self._transport.decide(
+            request,
+            client_scope_hash=client_scope_hash,
+            deadline=deadline,
+            cancelled=cancelled,
+        )
+
+    async def aclose(self) -> None:
+        await self._transport.aclose()
+
+
+def _http_trace(request: httpx.Request) -> _HTTPAttempt:
+    return (
+        request.content,
+        request.headers["idempotency-key"],
+        request.headers["authorization"],
+        request.headers.get("cookie"),
+        request.headers["x-palonexus-protocol-version"],
+    )
+
+
+def _real_retry_transports() -> tuple[
+    _CountingSyncHTTPTransport,
+    _CountingAsyncHTTPTransport,
+    list[_HTTPAttempt],
+    list[_HTTPAttempt],
+]:
+    sync_attempts: list[_HTTPAttempt] = []
+    async_attempts: list[_HTTPAttempt] = []
+
+    async def sync_handler(request: httpx.Request) -> httpx.Response:
+        sync_attempts.append(_http_trace(request))
+        if len(sync_attempts) == 1:
+            return httpx.Response(
+                503,
+                headers={"Retry-After": "0"},
+                content=b'{"transient":true}',
+            )
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            content=_decision("allow").to_json_bytes(),
+        )
+
+    async def async_handler(request: httpx.Request) -> httpx.Response:
+        async_attempts.append(_http_trace(request))
+        if len(async_attempts) == 1:
+            return httpx.Response(
+                503,
+                headers={"Retry-After": "0"},
+                content=b'{"transient":true}',
+            )
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            content=_decision("allow").to_json_bytes(),
+        )
+
+    config = HTTPTransportConfig.for_local_testing(
+        origin="http://127.0.0.1:9191",
+        testing_only=True,
+    )
+    retry = RetryPolicy._for_testing(
+        random_source=lambda: 0.5,
+        max_attempts=2,
+        initial_delay=0.0,
+    )
+    sync_http = HTTPAuthorizationTransport._for_testing(
+        config=config,
+        credential_provider=_SyncCredentialProvider(),
+        retry_policy=retry,
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(sync_handler),
+            follow_redirects=False,
+            trust_env=False,
+        ),
+    )
+    async_http = AsyncHTTPAuthorizationTransport._for_testing(
+        config=config,
+        credential_provider=_AsyncCredentialProvider(),
+        retry_policy=retry,
+        client=httpx.AsyncClient(
+            transport=httpx.MockTransport(async_handler),
+            follow_redirects=False,
+            trust_env=False,
+        ),
+    )
+    return (
+        _CountingSyncHTTPTransport(sync_http),
+        _CountingAsyncHTTPTransport(async_http),
+        sync_attempts,
+        async_attempts,
+    )
 
 
 def _attempt() -> _Attempt:
@@ -379,11 +545,15 @@ def test_shared_sync_async_scenario_matrix(scenario: str) -> None:
         result = _decision("allow")
         operation = "decide"
 
-    sync_transport: _SyncTransport
-    async_transport: _AsyncTransport
+    sync_transport: Any
+    async_transport: Any
     if scenario == "retry_success":
-        sync_transport = _RetryingSyncTransport(result)  # type: ignore[arg-type]
-        async_transport = _RetryingAsyncTransport(result)  # type: ignore[arg-type]
+        (
+            sync_transport,
+            async_transport,
+            sync_http_attempts,
+            async_http_attempts,
+        ) = _real_retry_transports()
     else:
         sync_transport = _SyncTransport(result)
         async_transport = _AsyncTransport(
@@ -404,6 +574,8 @@ def test_shared_sync_async_scenario_matrix(scenario: str) -> None:
         sync_value = getattr(sync_client, operation)(attempt)
     except BaseException as error:
         sync_failure = error
+    if scenario == "retry_success":
+        sync_transport.close()
     if scenario == "close":
         sync_client.close()
         sync_client.close()
@@ -418,6 +590,8 @@ def test_shared_sync_async_scenario_matrix(scenario: str) -> None:
         if scenario == "close":
             await async_client.aclose()
             await async_client.aclose()
+        if scenario == "retry_success":
+            await async_transport.aclose()
         return value, failure
 
     async_value, async_failure = asyncio.run(run())
@@ -432,9 +606,10 @@ def test_shared_sync_async_scenario_matrix(scenario: str) -> None:
             assert str(sync_failure) == str(async_failure)
     assert sync_transport.calls == async_transport.calls
     if scenario == "retry_success":
-        assert sync_transport.authorization_attempts == 2
-        assert async_transport.authorization_attempts == 2
         assert len(sync_transport.calls) == len(async_transport.calls) == 1
+        assert len(sync_http_attempts) == len(async_http_attempts) == 2
+        assert sync_http_attempts == async_http_attempts
+        assert sync_http_attempts == [sync_http_attempts[0], sync_http_attempts[0]]
     if scenario == "close":
         assert sync_transport.close_calls == async_transport.close_calls == 1
 
@@ -509,6 +684,90 @@ def test_decision_binding_mismatch_fails_closed(binding: str) -> None:
             decision,
             client_scope_hash=wire.SHA256Digest(f"sha256:{'9' * 64}"),
         )
+    with pytest.raises(InvalidDecision):
+        _sync_decide(decision)
+
+
+@pytest.mark.parametrize(
+    ("outcome", "server_time", "expires_at"),
+    [
+        (
+            "allow",
+            "2026-07-25T22:00:01+02:00",
+            "2026-07-25T22:05:00+02:00",
+        ),
+        (
+            "allow",
+            "2026-07-25T15:00:01-05:00",
+            "2026-07-25T15:05:00-05:00",
+        ),
+        (
+            "approval_required",
+            "2026-07-25T22:00:01+02:00",
+            "2026-07-25T15:05:00-05:00",
+        ),
+        (
+            "approval_required",
+            "2026-07-25T15:00:01-05:00",
+            "2026-07-25T22:05:00+02:00",
+        ),
+    ],
+)
+def test_public_conversion_and_authorize_accept_numeric_offsets(
+    outcome: Literal["allow", "approval_required"],
+    server_time: str,
+    expires_at: str,
+) -> None:
+    decision = _decision(outcome)
+    approval = decision.approval
+    if approval is not None:
+        approval = replace(
+            approval,
+            expires_at=wire.RFC3339Timestamp(expires_at),
+        )
+    decision = replace(
+        decision,
+        server_time=wire.RFC3339Timestamp(server_time),
+        expires_at=wire.RFC3339Timestamp(expires_at),
+        approval=approval,
+    )
+    converted, _ = _sync_decide(decision)
+    async_converted, _ = asyncio.run(_async_decide(decision))
+    assert converted == async_converted
+    assert converted.server_time == server_time
+    assert converted.expires_at == expires_at
+    client = AuthorizationClient(_SyncTransport(decision))
+    async_client = AsyncAuthorizationClient(_AsyncTransport(decision))
+
+    async def authorize_async() -> AuthorizationDecision:
+        return await async_client.authorize(_attempt())
+
+    if outcome == "allow":
+        assert client.authorize(_attempt()) == converted
+        assert asyncio.run(authorize_async()) == converted
+    else:
+        with pytest.raises(ApprovalRequired):
+            client.authorize(_attempt())
+        with pytest.raises(ApprovalRequired):
+            asyncio.run(authorize_async())
+
+
+@pytest.mark.parametrize(
+    ("server_time", "expires_at"),
+    [
+        ("2026-07-25T20:00:01Z", "2026-07-25T22:00:01+02:00"),
+        ("2026-07-25T15:00:01-05:00", "2026-07-25T20:00:01Z"),
+    ],
+)
+def test_equivalent_offset_instants_fail_expiry_ordering(
+    server_time: str,
+    expires_at: str,
+) -> None:
+    decision = replace(
+        _decision(),
+        server_time=wire.RFC3339Timestamp(server_time),
+        expires_at=wire.RFC3339Timestamp(expires_at),
+    )
     with pytest.raises(InvalidDecision):
         _sync_decide(decision)
 
