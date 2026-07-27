@@ -78,6 +78,9 @@ def _token(
 ) -> str:
     protected: dict[str, object] = {"alg": "RS256", "kid": kid, "typ": "JWT"}
     protected.update(header or {})
+    for name in tuple(protected):
+        if protected[name] is None:
+            del protected[name]
     payload: dict[str, object] = {
         "iss": ISSUER,
         "sub": "agent-7",
@@ -162,6 +165,8 @@ def _algorithm_token(key: object, algorithm: str) -> str:
     elif algorithm == "ES256":
         der = key.sign(message, ec.ECDSA(hashes.SHA256()))  # type: ignore[union-attr]
         r, s = utils.decode_dss_signature(der)
+        order = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+        s = min(s, order - s)
         signature = r.to_bytes(32, "big") + s.to_bytes(32, "big")
     else:
         signature = key.sign(message)  # type: ignore[union-attr]
@@ -207,6 +212,7 @@ def _config(**changes: object) -> OIDCVerifierConfig:
     values: dict[str, object] = {
         "issuer": ISSUER,
         "audiences": (AUDIENCE,),
+        "client_id": "palonexus-client",
         "algorithms": ("RS256",),
         "discovery_url": DISCOVERY,
         "cache_ttl_seconds": 60,
@@ -223,6 +229,7 @@ def _verifier(
     return OIDCVerifier(
         _config(**config),
         transport=httpx.MockTransport(service),
+        testing_only=True,
         clock=lambda: NOW,
     )
 
@@ -269,6 +276,7 @@ def test_config_requires_explicit_secure_values(change: dict[str, object]) -> No
     values: dict[str, object] = {
         "issuer": ISSUER,
         "audiences": (AUDIENCE,),
+        "client_id": "palonexus-client",
         "algorithms": ("RS256",),
         "discovery_url": DISCOVERY,
     }
@@ -345,6 +353,7 @@ def test_duplicate_kid_and_dangerous_jwk_metadata_are_rejected(
         [_jwk(signing_key), _jwk(signing_key)],
         [_jwk(signing_key, jku="https://evil.example/key")],
         [_jwk(signing_key, x5u="https://evil.example/cert")],
+        [_jwk(signing_key, x5c=["forbidden"])],
         [_jwk(signing_key, use="enc")],
         [_jwk(signing_key, key_ops=["sign"])],
         [_jwk(signing_key, alg="PS256")],
@@ -395,6 +404,7 @@ def test_cache_ttl_uses_the_injected_utc_clock(
     verifier = OIDCVerifier(
         _config(cache_ttl_seconds=1),
         transport=httpx.MockTransport(service),
+        testing_only=True,
         clock=lambda: current[0],
     )
     with verifier:
@@ -423,15 +433,17 @@ def test_time_and_subject_claims_are_strict(
             verifier.verify(_token(signing_key, claims=claims))
 
 
-def test_leeway_boundary_is_accepted(signing_key: rsa.RSAPrivateKey) -> None:
+def test_expiry_at_exact_leeway_boundary_is_rejected(
+    signing_key: rsa.RSAPrivateKey,
+) -> None:
     with _verifier(ScriptedOIDC([_jwk(signing_key)])) as verifier:
-        identity = verifier.verify(
-            _token(
-                signing_key,
-                claims={"exp": int((NOW - timedelta(seconds=2)).timestamp())},
+        with pytest.raises(OIDCVerificationFailed):
+            verifier.verify(
+                _token(
+                    signing_key,
+                    claims={"exp": int((NOW - timedelta(seconds=2)).timestamp())},
+                )
             )
-        )
-    assert identity.subject == "agent-7"
 
 
 @pytest.mark.parametrize("mode", ["unavailable", "malformed", "oversize", "redirect"])
@@ -459,6 +471,7 @@ def test_unavailable_malformed_oversize_or_redirected_metadata_fails_closed(
     verifier = OIDCVerifier(
         _config(),
         transport=httpx.MockTransport(handler),
+        testing_only=True,
         clock=lambda: NOW,
     )
     with verifier, pytest.raises(OIDCVerificationFailed) as captured:
@@ -498,6 +511,7 @@ def test_control_flow_propagates_without_secret_graph(
     verifier = OIDCVerifier(
         _config(),
         transport=httpx.MockTransport(cancel),
+        testing_only=True,
         clock=lambda: NOW,
     )
     with verifier, pytest.raises(exception_type) as captured:
@@ -518,6 +532,7 @@ def test_raw_token_url_and_callback_secrets_are_unreachable_from_error_graph(
     verifier = OIDCVerifier(
         _config(),
         transport=httpx.MockTransport(broken),
+        testing_only=True,
         clock=lambda: NOW,
     )
     with verifier, pytest.raises(OIDCVerificationFailed) as captured:
@@ -538,3 +553,249 @@ def test_raw_token_url_and_callback_secrets_are_unreachable_from_error_graph(
     assert raw_token not in rendered
     assert "LEAK-claim-secret" not in rendered
     assert "LEAK-callback-secret" not in rendered
+
+
+def test_unknown_kid_and_bad_signature_have_bounded_refresh_amplification(
+    signing_key: rsa.RSAPrivateKey,
+) -> None:
+    service = ScriptedOIDC([_jwk(signing_key)])
+    attacker = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    with _verifier(service) as verifier:
+        verifier.verify(_token(signing_key))
+        for _ in range(20):
+            with pytest.raises(OIDCVerificationFailed):
+                verifier.verify(_token(attacker, kid="unknown"))
+        after_unknown = service.jwks_calls
+        for _ in range(20):
+            with pytest.raises(OIDCVerificationFailed):
+                verifier.verify(_token(attacker))
+        after_signature = service.jwks_calls
+    assert after_unknown == 2
+    assert after_signature == 3
+
+
+def test_concurrent_unknown_kid_is_singleflight(
+    signing_key: rsa.RSAPrivateKey,
+) -> None:
+    service = ScriptedOIDC([_jwk(signing_key)])
+    with _verifier(service) as verifier:
+        verifier.verify(_token(signing_key))
+
+        def rejected(_: int) -> bool:
+            with pytest.raises(OIDCVerificationFailed):
+                verifier.verify(_token(signing_key, kid="unknown"))
+            return True
+
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            assert all(pool.map(rejected, range(32)))
+    assert service.jwks_calls == 2
+
+
+def test_failed_refresh_backoff_and_rotation_after_cooldown(
+    signing_key: rsa.RSAPrivateKey,
+) -> None:
+    current = [NOW]
+    rotated = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    service = ScriptedOIDC([_jwk(signing_key)])
+    verifier = OIDCVerifier(
+        _config(refresh_cooldown_seconds=2, failure_backoff_seconds=1),
+        transport=httpx.MockTransport(service),
+        testing_only=True,
+        clock=lambda: current[0],
+    )
+    with verifier:
+        verifier.verify(_token(signing_key))
+        service.keys = [_jwk(signing_key)]
+        with pytest.raises(OIDCVerificationFailed):
+            verifier.verify(_token(rotated))
+        service.keys = [_jwk(rotated)]
+        with pytest.raises(OIDCVerificationFailed):
+            verifier.verify(_token(rotated))
+        assert service.jwks_calls == 2
+        current[0] += timedelta(seconds=2)
+        assert verifier.verify(_token(rotated)).subject == "agent-7"
+    assert service.jwks_calls == 3
+
+
+def test_failed_refresh_backoff_suppresses_distinct_attacker_kids(
+    signing_key: rsa.RSAPrivateKey,
+) -> None:
+    service = ScriptedOIDC([_jwk(signing_key)])
+    failing = [False]
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        if failing[0]:
+            with service.lock:
+                service.requests.append(request)
+                if str(request.url) == DISCOVERY:
+                    service.discovery_calls += 1
+            raise httpx.ConnectError("metadata unavailable")
+        return service(request)
+
+    verifier = OIDCVerifier(
+        _config(),
+        transport=httpx.MockTransport(handler),
+        testing_only=True,
+        clock=lambda: NOW,
+    )
+    with verifier:
+        verifier.verify(_token(signing_key))
+        failing[0] = True
+        for kid in ("unknown-1", "unknown-2", "unknown-3"):
+            with pytest.raises(OIDCVerificationFailed):
+                verifier.verify(_token(signing_key, kid=kid))
+    assert service.discovery_calls == 2
+
+
+def test_provider_style_optional_jwk_metadata_and_missing_kid(
+    signing_key: rsa.RSAPrivateKey,
+) -> None:
+    eligible = _jwk(signing_key)
+    for name in ("kid", "alg", "use", "key_ops"):
+        eligible.pop(name)
+    irrelevant = _jwk(signing_key, kid="encryption", use="enc")
+    with _verifier(
+        ScriptedOIDC([irrelevant, eligible]),
+        allow_missing_kid=True,
+        require_typ=False,
+    ) as verifier:
+        identity = verifier.verify(
+            _token(signing_key, header={"kid": None, "typ": None})
+        )
+    assert identity.subject == "agent-7"
+
+
+def test_optional_jwk_alg_is_selected_by_token_algorithm() -> None:
+    key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    eligible = _jwk(key)
+    eligible.pop("alg")
+    with _verifier(
+        ScriptedOIDC([eligible]),
+        algorithms=("RS256", "PS256"),
+    ) as verifier:
+        assert verifier.verify(_token(key)).subject == "agent-7"
+
+
+def test_es256_requires_exact_coordinate_width() -> None:
+    key, jwk, algorithm = _algorithm_case("ES256")
+    encoded_x = jwk["x"]
+    assert isinstance(encoded_x, str)
+    x = base64.urlsafe_b64decode(encoded_x + "==")
+    jwk["x"] = _b64(x[1:])
+    with _verifier(
+        ScriptedOIDC([jwk]),
+        algorithms=("ES256",),
+    ) as verifier:
+        with pytest.raises(OIDCVerificationFailed):
+            verifier.verify(_algorithm_token(key, algorithm))
+
+
+def test_missing_kid_rejects_ambiguous_eligible_keys(
+    signing_key: rsa.RSAPrivateKey,
+) -> None:
+    other = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    first = _jwk(signing_key)
+    second = _jwk(other, kid="key-2")
+    with _verifier(
+        ScriptedOIDC([first, second]),
+        allow_missing_kid=True,
+        require_typ=False,
+    ) as verifier:
+        with pytest.raises(OIDCVerificationFailed):
+            verifier.verify(_token(signing_key, header={"kid": None, "typ": None}))
+
+
+def test_multi_audience_azp_binds_distinct_client_id(
+    signing_key: rsa.RSAPrivateKey,
+) -> None:
+    with _verifier(ScriptedOIDC([_jwk(signing_key)])) as verifier:
+        accepted = verifier.verify(
+            _token(
+                signing_key,
+                claims={
+                    "aud": [AUDIENCE, "another-resource"],
+                    "azp": "palonexus-client",
+                },
+            )
+        )
+        assert accepted.authorized_party == "palonexus-client"
+        with pytest.raises(OIDCVerificationFailed):
+            verifier.verify(
+                _token(
+                    signing_key,
+                    claims={"aud": [AUDIENCE, "other"], "azp": AUDIENCE},
+                )
+            )
+
+
+def test_verified_claims_are_deeply_immutable_and_copy_on_read(
+    signing_key: rsa.RSAPrivateKey,
+) -> None:
+    with _verifier(ScriptedOIDC([_jwk(signing_key)])) as verifier:
+        identity = verifier.verify(
+            _token(
+                signing_key,
+                claims={"nested": {"values": [1, {"enabled": True}]}},
+            )
+        )
+    first = identity.claims
+    nested = first["nested"]
+    assert isinstance(nested, dict)
+    values = nested["values"]
+    assert isinstance(values, list)
+    values.append("mutated")
+    assert identity.claims["nested"] == {"values": [1, {"enabled": True}]}
+    assert type(identity._claims).__name__ == "_FrozenObject"
+
+
+def test_es256_high_s_malleated_twin_is_rejected() -> None:
+    key, jwk, algorithm = _algorithm_case("ES256")
+    token = _algorithm_token(key, algorithm)
+    first, second, encoded = token.split(".")
+    signature = base64.urlsafe_b64decode(encoded + "==")
+    order = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
+    s = int.from_bytes(signature[32:], "big")
+    twin = signature[:32] + (order - s).to_bytes(32, "big")
+    malleated = f"{first}.{second}.{_b64(twin)}"
+    with _verifier(
+        ScriptedOIDC([jwk]),
+        algorithms=("ES256",),
+    ) as verifier:
+        assert verifier.verify(token).subject == "agent-7"
+        with pytest.raises(OIDCVerificationFailed):
+            verifier.verify(malleated)
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["jku", "x5u", "x5c", "x5t", "x5t#S256", "jwk", "crit", "b64"],
+)
+def test_closed_token_metadata_policy(
+    signing_key: rsa.RSAPrivateKey,
+    name: str,
+) -> None:
+    value: object = ["unknown"] if name == "crit" else "forbidden"
+    with _verifier(ScriptedOIDC([_jwk(signing_key)])) as verifier:
+        with pytest.raises(OIDCVerificationFailed):
+            verifier.verify(_token(signing_key, header={name: value}))
+
+
+def test_numeric_date_boundaries(signing_key: rsa.RSAPrivateKey) -> None:
+    with _verifier(ScriptedOIDC([_jwk(signing_key)])) as verifier:
+        accepted = _token(
+            signing_key,
+            claims={
+                "exp": int((NOW - timedelta(seconds=1)).timestamp()),
+                "nbf": int((NOW + timedelta(seconds=2)).timestamp()),
+                "iat": int((NOW + timedelta(seconds=2)).timestamp()),
+            },
+        )
+        assert verifier.verify(accepted).subject == "agent-7"
+        for claim in ("nbf", "iat"):
+            with pytest.raises(OIDCVerificationFailed):
+                verifier.verify(
+                    _token(
+                        signing_key,
+                        claims={claim: int((NOW + timedelta(seconds=3)).timestamp())},
+                    )
+                )

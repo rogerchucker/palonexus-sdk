@@ -10,9 +10,11 @@ from .did import (
     verify_ed25519,
 )
 from .oidc import (
+    MetadataFetcher,
     OIDCVerificationFailed,
     OIDCVerifier,
     OIDCVerifierConfig,
+    PinnedHTTPSMetadataFetcher,
     VerifiedOIDCIdentity,
 )
 from .vc import (
@@ -34,9 +36,11 @@ from .vc import (
 __all__ = [
     "DidKey",
     "IdentityVerificationFailed",
+    "MetadataFetcher",
     "OIDCVerificationFailed",
     "OIDCVerifier",
     "OIDCVerifierConfig",
+    "PinnedHTTPSMetadataFetcher",
     "MemoryReplayStore",
     "ReplayStore",
     "RevocationLookup",
