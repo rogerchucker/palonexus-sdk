@@ -42,6 +42,15 @@ from ..models import DecisionOutcome, TaskContext
 from ..protocol import ActionRequestBuilder
 from . import MissingIntegrationDependency
 
+
+class MissingLangGraphDependency(MissingIntegrationDependency):
+    """The LangGraph optional dependency set is not installed."""
+
+    canonical_message = (
+        "The LangGraph integration requires the 'palonexus[langgraph]' extra."
+    )
+
+
 try:
     from langchain_core.runnables import RunnableConfig
 except ImportError:
@@ -84,7 +93,7 @@ def _langgraph_interrupt(value: object) -> object:
     try:
         from langgraph.types import interrupt
     except ImportError:
-        raise MissingIntegrationDependency() from None
+        raise MissingLangGraphDependency() from None
     return interrupt(value)
 
 
@@ -94,7 +103,7 @@ def _checkpointer(value: object | None) -> object | None:
     try:
         from langgraph.checkpoint.base import BaseCheckpointSaver
     except ImportError:
-        raise MissingIntegrationDependency() from None
+        raise MissingLangGraphDependency() from None
     if not isinstance(value, BaseCheckpointSaver):
         raise InvalidRequest() from None
     return value
@@ -690,13 +699,20 @@ def _graph_error(error: BaseException) -> BaseException:
         return LangGraphPolicyDenied(**fields)
     if isinstance(error, InvalidRequest):
         return LangGraphInvalidRequest(**fields)
-    if isinstance(error, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+    if isinstance(
+        error,
+        (KeyboardInterrupt, SystemExit, GeneratorExit, asyncio.CancelledError),
+    ):
         return error
     return LangGraphAuthorizationUnavailable(**fields)
 
 
 class PaloNexusLangGraphNode:
-    """A sync/async governed node set wired with public LangGraph APIs."""
+    """One sync or async governed node set wired with public LangGraph APIs.
+
+    Applications exposing both entry modes must create separate nodes backed by
+    the same durable SQLite execution-ledger file.
+    """
 
     def __init__(
         self,
@@ -738,6 +754,7 @@ class PaloNexusLangGraphNode:
             or (client is None) != (handler is None)
             or (async_client is None) != (async_handler is None)
             or (client is None and async_client is None)
+            or (client is not None and async_client is not None)
             or (client is None) != (execution_ledger is None)
             or (async_client is None) != (async_execution_ledger is None)
             or (
@@ -882,42 +899,44 @@ class PaloNexusLangGraphNode:
             if type(decision) is not AuthorizationDecision:
                 raise InvalidDecision() from None
         except BaseException as error:
-            raise _graph_error(error) from None
-        if decision.outcome is DecisionOutcome.DENY:
             attempt.close()
-            raise LangGraphPolicyDenied(
-                request_id=decision.request_id,
-                decision_id=decision.decision_id,
-                correlation_id=decision.correlation_id,
-            ) from None
-        if decision.outcome is DecisionOutcome.APPROVAL_REQUIRED:
-            if _thread_namespace(config) is None or self._checkpointer is None:
-                attempt.close()
-                raise LangGraphAuthorizationUnavailable(
+            raise _graph_error(error) from None
+        try:
+            if decision.outcome is DecisionOutcome.DENY:
+                raise LangGraphPolicyDenied(
                     request_id=decision.request_id,
                     decision_id=decision.decision_id,
                     correlation_id=decision.correlation_id,
                 ) from None
-            try:
-                approval = self._client.request_approval(attempt, decision)
-                if type(approval) is not ApprovalRecord:
-                    raise InvalidDecision() from None
-            except BaseException as error:
-                attempt.close()
-                raise _graph_error(error) from None
-            rendered = self._descriptor(
-                attempt, decision, approval, status="approval_pending"
+            if decision.outcome is DecisionOutcome.APPROVAL_REQUIRED:
+                if _thread_namespace(config) is None or self._checkpointer is None:
+                    raise LangGraphAuthorizationUnavailable(
+                        request_id=decision.request_id,
+                        decision_id=decision.decision_id,
+                        correlation_id=decision.correlation_id,
+                    ) from None
+                try:
+                    approval = self._client.request_approval(attempt, decision)
+                    if type(approval) is not ApprovalRecord:
+                        raise InvalidDecision() from None
+                except BaseException as error:
+                    raise _graph_error(error) from None
+                rendered = self._descriptor(
+                    attempt, decision, approval, status="approval_pending"
+                )
+                return {
+                    self._state_key: rendered,
+                    _MARKER_KEY: "INTERRUPTED",
+                }
+            rendered_descriptor = self._descriptor(
+                attempt, decision, None, status="executable"
             )
-            attempt.close()
             return {
-                self._state_key: rendered,
-                _MARKER_KEY: "INTERRUPTED",
+                self._state_key: rendered_descriptor,
+                _MARKER_KEY: "AUTHORIZED",
             }
-        rendered_descriptor = self._descriptor(
-            attempt, decision, None, status="executable"
-        )
-        attempt.close()
-        return {self._state_key: rendered_descriptor, _MARKER_KEY: "AUTHORIZED"}
+        finally:
+            attempt.close()
 
     async def aauthorize(
         self, state: Mapping[str, object], config: RunnableConfig
@@ -940,42 +959,46 @@ class PaloNexusLangGraphNode:
             if type(decision) is not AuthorizationDecision:
                 raise InvalidDecision() from None
         except BaseException as error:
-            raise _graph_error(error) from None
-        if decision.outcome is DecisionOutcome.DENY:
             attempt.close()
-            raise LangGraphPolicyDenied(
-                request_id=decision.request_id,
-                decision_id=decision.decision_id,
-                correlation_id=decision.correlation_id,
-            ) from None
-        if decision.outcome is DecisionOutcome.APPROVAL_REQUIRED:
-            if _thread_namespace(config) is None or self._checkpointer is None:
-                attempt.close()
-                raise LangGraphAuthorizationUnavailable(
+            raise _graph_error(error) from None
+        try:
+            if decision.outcome is DecisionOutcome.DENY:
+                raise LangGraphPolicyDenied(
                     request_id=decision.request_id,
                     decision_id=decision.decision_id,
                     correlation_id=decision.correlation_id,
                 ) from None
-            try:
-                approval = await self._async_client.request_approval(attempt, decision)
-                if type(approval) is not ApprovalRecord:
-                    raise InvalidDecision() from None
-            except BaseException as error:
-                attempt.close()
-                raise _graph_error(error) from None
-            rendered = self._descriptor(
-                attempt, decision, approval, status="approval_pending"
+            if decision.outcome is DecisionOutcome.APPROVAL_REQUIRED:
+                if _thread_namespace(config) is None or self._checkpointer is None:
+                    raise LangGraphAuthorizationUnavailable(
+                        request_id=decision.request_id,
+                        decision_id=decision.decision_id,
+                        correlation_id=decision.correlation_id,
+                    ) from None
+                try:
+                    approval = await self._async_client.request_approval(
+                        attempt, decision
+                    )
+                    if type(approval) is not ApprovalRecord:
+                        raise InvalidDecision() from None
+                except BaseException as error:
+                    raise _graph_error(error) from None
+                rendered = self._descriptor(
+                    attempt, decision, approval, status="approval_pending"
+                )
+                return {
+                    self._state_key: rendered,
+                    _MARKER_KEY: "INTERRUPTED",
+                }
+            rendered_descriptor = self._descriptor(
+                attempt, decision, None, status="executable"
             )
-            attempt.close()
             return {
-                self._state_key: rendered,
-                _MARKER_KEY: "INTERRUPTED",
+                self._state_key: rendered_descriptor,
+                _MARKER_KEY: "AUTHORIZED",
             }
-        rendered_descriptor = self._descriptor(
-            attempt, decision, None, status="executable"
-        )
-        attempt.close()
-        return {self._state_key: rendered_descriptor, _MARKER_KEY: "AUTHORIZED"}
+        finally:
+            attempt.close()
 
     def route_after_authorization(self, state: Mapping[str, object]) -> str:
         descriptor = _parse_descriptor(state.get(self._state_key))
@@ -1005,6 +1028,7 @@ class PaloNexusLangGraphNode:
         if namespace is None:
             raise AuthorizationUnavailable() from None
         current = self._prepare(state, action_id=descriptor["actionId"])
+        resumed: Any = None
         try:
             resumed = self._client.resume_checkpoint(
                 self._builder,
@@ -1014,13 +1038,16 @@ class PaloNexusLangGraphNode:
                 prior_decision=descriptor["priorDecision"],
                 pending_approval=descriptor["pendingApproval"],
             )
-        except Exception as error:
-            current.close()
+        except BaseException as error:
             raise _graph_error(error) from None
-        descriptor["status"] = "executable"
-        rendered = _canonical(descriptor)
-        resumed.close()
-        return {self._state_key: rendered, _MARKER_KEY: "AUTHORIZED"}
+        finally:
+            current.close()
+        try:
+            descriptor["status"] = "executable"
+            rendered = _canonical(descriptor)
+            return {self._state_key: rendered, _MARKER_KEY: "AUTHORIZED"}
+        finally:
+            resumed.close()
 
     async def _aresume_after_wake(
         self, state: Mapping[str, object], config: object
@@ -1032,6 +1059,7 @@ class PaloNexusLangGraphNode:
         if namespace is None:
             raise AuthorizationUnavailable() from None
         current = self._prepare(state, action_id=descriptor["actionId"])
+        resumed: Any = None
         try:
             resumed = await self._async_client.resume_checkpoint(
                 self._builder,
@@ -1041,13 +1069,16 @@ class PaloNexusLangGraphNode:
                 prior_decision=descriptor["priorDecision"],
                 pending_approval=descriptor["pendingApproval"],
             )
-        except Exception as error:
-            current.close()
+        except BaseException as error:
             raise _graph_error(error) from None
-        descriptor["status"] = "executable"
-        rendered = _canonical(descriptor)
-        resumed.close()
-        return {self._state_key: rendered, _MARKER_KEY: "AUTHORIZED"}
+        finally:
+            current.close()
+        try:
+            descriptor["status"] = "executable"
+            rendered = _canonical(descriptor)
+            return {self._state_key: rendered, _MARKER_KEY: "AUTHORIZED"}
+        finally:
+            resumed.close()
 
     def _history_consumed(self, thread_id: str, event_id: str) -> bool:
         """Checkpoint history is replay evidence, never the execution lock."""
@@ -1332,5 +1363,6 @@ __all__ = [
     "AsyncSQLiteExecutionLedger",
     "SyncLangGraphAuthorizationClient",
     "AsyncLangGraphAuthorizationClient",
+    "MissingLangGraphDependency",
     "PaloNexusLangGraphNode",
 ]

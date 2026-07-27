@@ -22,15 +22,18 @@ from palonexus import (
     AuthorizationUnavailable,
     CredentialRevoked,
     InvalidDecision,
+    InvalidRequest,
     PolicyDenied,
     TaskContext,
 )
+from palonexus.integrations import MissingIntegrationDependency
 from palonexus.integrations.langgraph import (
     LANGGRAPH_SCOPE_KEY,
     AsyncInMemoryExecutionLedger,
     ExecutionLedger,
     InMemoryExecutionLedger,
     LangGraphPolicyDenied,
+    MissingLangGraphDependency,
     PaloNexusLangGraphNode,
     SQLiteExecutionLedger,
 )
@@ -667,6 +670,119 @@ def test_execute_reprojects_current_state_even_with_cached_envelope() -> None:
 def test_async_testing_ledger_requires_explicit_opt_in() -> None:
     with pytest.raises(ValueError):
         AsyncInMemoryExecutionLedger(testing_only=False)  # type: ignore[arg-type]
+
+
+def test_node_rejects_dual_sync_and_async_execution_modes() -> None:
+    engine = ScriptedEngine(ScriptedEngine.allow(), testing_only=True)
+    sync_transport = FakeTransport(engine, testing_only=True)
+    async_transport = AsyncFakeTransport(engine, testing_only=True)
+    with pytest.raises(InvalidRequest):
+        PaloNexusLangGraphNode(
+            builder=_builder(),
+            client=AuthorizationClient(sync_transport),
+            async_client=AsyncAuthorizationClient(async_transport),
+            target_projector=_target,
+            handler=lambda state: {"calls": 1},
+            async_handler=lambda state: asyncio.sleep(0, result={"calls": 1}),
+            task_context=TASK,
+            correlation_id=CORRELATION,
+            tenant_ref="tenant:example",
+            actor_ref="subject:example",
+            action="file:write",
+            side_effect="write",
+            execution_ledger=InMemoryExecutionLedger(testing_only=True),
+            async_execution_ledger=AsyncInMemoryExecutionLedger(testing_only=True),
+        )
+
+
+def test_optional_dependency_messages_name_the_correct_extra() -> None:
+    assert "palonexus[langgraph]" in str(MissingLangGraphDependency())
+    assert "palonexus[langchain]" in str(MissingIntegrationDependency())
+
+
+def test_sync_control_flow_closes_prepared_attempt_and_preserves_identity() -> None:
+    interruption = KeyboardInterrupt()
+
+    class InterruptingClient:
+        authorization_client_kind = "sync"
+        captured: Any = None
+
+        def decide(self, attempt: Any, **kwargs: Any) -> Any:
+            self.captured = attempt
+            raise interruption
+
+        authorize = decide
+
+        def request_approval(self, *args: Any, **kwargs: Any) -> Any:
+            raise AssertionError
+
+        get_approval = request_approval
+        wait_for_approval = request_approval
+        resume_checkpoint = request_approval
+
+    client = InterruptingClient()
+    node = PaloNexusLangGraphNode(
+        builder=_builder(),
+        client=client,  # type: ignore[arg-type]
+        target_projector=_target,
+        handler=lambda state: {"calls": 1},
+        task_context=TASK,
+        correlation_id=CORRELATION,
+        tenant_ref="tenant:example",
+        actor_ref="subject:example",
+        action="file:write",
+        side_effect="write",
+        execution_ledger=InMemoryExecutionLedger(testing_only=True),
+    )
+    with pytest.raises(KeyboardInterrupt) as caught:
+        node.authorize({"path": "deploy/prod.yaml"}, {})
+    assert caught.value is interruption
+    with pytest.raises(InvalidRequest):
+        client.captured.consume()
+
+
+def test_async_cancellation_closes_prepared_attempt_and_preserves_identity() -> None:
+    cancellation = asyncio.CancelledError()
+
+    class CancellingClient:
+        authorization_client_kind = "async"
+        captured: Any = None
+
+        async def decide(self, attempt: Any, **kwargs: Any) -> Any:
+            self.captured = attempt
+            raise cancellation
+
+        authorize = decide
+
+        async def request_approval(self, *args: Any, **kwargs: Any) -> Any:
+            raise AssertionError
+
+        get_approval = request_approval
+        wait_for_approval = request_approval
+        resume_checkpoint = request_approval
+
+    async def run() -> None:
+        client = CancellingClient()
+        node = PaloNexusLangGraphNode(
+            builder=_builder(),
+            async_client=client,  # type: ignore[arg-type]
+            target_projector=_target,
+            async_handler=lambda state: asyncio.sleep(0, result={"calls": 1}),
+            task_context=TASK,
+            correlation_id=CORRELATION,
+            tenant_ref="tenant:example",
+            actor_ref="subject:example",
+            action="file:write",
+            side_effect="write",
+            async_execution_ledger=AsyncInMemoryExecutionLedger(testing_only=True),
+        )
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await node.aauthorize({"path": "deploy/prod.yaml"}, {})
+        assert caught.value is cancellation
+        with pytest.raises(InvalidRequest):
+            client.captured.consume()
+
+    asyncio.run(run())
 
 
 def test_async_replay_uses_alist_and_never_sync_list() -> None:
