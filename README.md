@@ -37,14 +37,6 @@ An AES-GCM file backend exists only for isolated tests. It is disabled unless
 the caller uses the explicit testing-only constructor flag and is never
 selected by native backend discovery.
 
-Pre-release build `b379ed9` used ambiguous `tenant:account` credential keys and
-an untyped local-state envelope. On first lookup or explicit logout/delete, the
-guard removes the service-scoped legacy credential instead of returning it;
-users must authenticate again. Logout also removes the three legacy
-binding-and-kind state files by their exact historical SHA-256 names without
-decoding or importing their octet-stream payloads. No legacy secret or
-arbitrary payload is migrated into the typed store.
-
 ## License
 
 Source code is licensed under the MIT License. PaloNexus names and logos are

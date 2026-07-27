@@ -1,7 +1,5 @@
 github.com/keybase/dbus v0.0.0-20220506165403-5aa21ea2c23a h1:K0EAzgzEQHW4Y5lxrmvPMltmlRDzlhLfGmots9EHUTI=
 github.com/keybase/dbus v0.0.0-20220506165403-5aa21ea2c23a/go.mod h1:YPNKjjE7Ubp9dTbnWvsP3HT+hYnY6TfXzubYTBeUxc8=
-github.com/keybase/go-keychain v0.0.2-0.20260716175100-8615c072de2a h1:YBlSR49O95QGZRO0f2K/OYYkzpSt2zJsLTXMkh/5IfY=
-github.com/keybase/go-keychain v0.0.2-0.20260716175100-8615c072de2a/go.mod h1:nlXxGe338lr5BwLC53H7sxM+C/mLPxIQ4TSbQriLqsQ=
 golang.org/x/crypto v0.54.0 h1:YLIA59K4fiNzHzjnZt2tUJQjQtUWfWbeHBqKtk3eScw=
 golang.org/x/crypto v0.54.0/go.mod h1:KWL8ny2AZdGR2cWmzeHrp2azQPGogOv+HeQaVEXC2dk=
 golang.org/x/net v0.57.0 h1:K5+3DljvIuDG9/Jv9rvyMywYNFCQ9RSUY6OOTTkT+tE=

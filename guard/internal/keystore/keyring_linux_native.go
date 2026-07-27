@@ -25,7 +25,8 @@ const (
 )
 
 type nativeLinuxFacade struct {
-	conn *dbus.Conn
+	conn    *dbus.Conn
+	connect func() (*dbus.Conn, error)
 }
 
 type linuxSession struct {
@@ -44,11 +45,9 @@ type linuxSecret struct {
 }
 
 func newNativeLinuxFacade() (*nativeLinuxFacade, error) {
-	conn, err := dbus.ConnectSessionBus()
-	if err != nil {
-		return nil, err
-	}
-	return &nativeLinuxFacade{conn: conn}, nil
+	return &nativeLinuxFacade{connect: func() (*dbus.Conn, error) {
+		return dbus.ConnectSessionBus()
+	}}, nil
 }
 
 func (f *nativeLinuxFacade) object(path dbus.ObjectPath) dbus.BusObject {
@@ -56,6 +55,15 @@ func (f *nativeLinuxFacade) object(path dbus.ObjectPath) dbus.BusObject {
 }
 
 func (f *nativeLinuxFacade) Locked(ctx context.Context) (bool, error) {
+	if f.conn == nil {
+		var result bool
+		err := f.withConnection(func(operation *nativeLinuxFacade) error {
+			var err error
+			result, err = operation.Locked(ctx)
+			return err
+		})
+		return result, err
+	}
 	var value dbus.Variant
 	err := f.object(secretDefaultCollection).
 		CallWithContext(ctx, "org.freedesktop.DBus.Properties.Get", 0,
@@ -77,6 +85,15 @@ func (f *nativeLinuxFacade) Put(
 	account string,
 	value []byte,
 ) (bool, error) {
+	if f.conn == nil {
+		var prompted bool
+		err := f.withConnection(func(operation *nativeLinuxFacade) error {
+			var err error
+			prompted, err = operation.Put(ctx, service, account, value)
+			return err
+		})
+		return prompted, err
+	}
 	session, err := f.openSession(ctx)
 	if err != nil {
 		return false, err
@@ -111,6 +128,15 @@ func (f *nativeLinuxFacade) Find(
 	service string,
 	account string,
 ) ([]linuxItem, error) {
+	if f.conn == nil {
+		var result []linuxItem
+		err := f.withConnection(func(operation *nativeLinuxFacade) error {
+			var err error
+			result, err = operation.Find(ctx, service, account)
+			return err
+		})
+		return result, err
+	}
 	var paths []dbus.ObjectPath
 	err := f.object(secretDefaultCollection).
 		CallWithContext(ctx, "org.freedesktop.Secret.Collection.SearchItems", 0,
@@ -130,6 +156,15 @@ func (f *nativeLinuxFacade) Find(
 }
 
 func (f *nativeLinuxFacade) Get(ctx context.Context, item linuxItem) ([]byte, error) {
+	if f.conn == nil {
+		var result []byte
+		err := f.withConnection(func(operation *nativeLinuxFacade) error {
+			var err error
+			result, err = operation.Get(ctx, item)
+			return err
+		})
+		return result, err
+	}
 	path := dbus.ObjectPath(item)
 	if !path.IsValid() {
 		return nil, errLinuxMalformedSecret
@@ -167,6 +202,15 @@ func (f *nativeLinuxFacade) Get(ctx context.Context, item linuxItem) ([]byte, er
 }
 
 func (f *nativeLinuxFacade) Delete(ctx context.Context, item linuxItem) (bool, error) {
+	if f.conn == nil {
+		var prompted bool
+		err := f.withConnection(func(operation *nativeLinuxFacade) error {
+			var err error
+			prompted, err = operation.Delete(ctx, item)
+			return err
+		})
+		return prompted, err
+	}
 	path := dbus.ObjectPath(item)
 	if !path.IsValid() {
 		return false, errLinuxMalformedSecret
@@ -179,6 +223,18 @@ func (f *nativeLinuxFacade) Delete(ctx context.Context, item linuxItem) (bool, e
 		return false, err
 	}
 	return prompt != secretNullPrompt, nil
+}
+
+func (f *nativeLinuxFacade) withConnection(operation func(*nativeLinuxFacade) error) error {
+	if f.connect == nil {
+		return errLinuxMalformedSecret
+	}
+	conn, err := f.connect()
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+	return operation(&nativeLinuxFacade{conn: conn})
 }
 
 func (f *nativeLinuxFacade) openSession(ctx context.Context) (*linuxSession, error) {

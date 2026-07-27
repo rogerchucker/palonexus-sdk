@@ -375,6 +375,57 @@ func TestAtomicWriteFaultBoundariesAndIndeterminateDurability(t *testing.T) {
 	}
 }
 
+func TestDeleteAccountCancellationAndFaultBoundaries(t *testing.T) {
+	binding := Binding{Tenant: "tenant", Account: "account"}
+	putAll := func(t *testing.T, store *Store) {
+		t.Helper()
+		for _, metadata := range []Metadata{
+			{Kind: KindRouting, RouteID: "route-primary"},
+			{Kind: KindSession, SessionID: "session_01ARZ3NDEKTSV4RRFFQ69G5FAV", ExpiresAt: time.Now().UTC().Add(time.Hour)},
+			{Kind: KindReconciliation, ReconciliationID: "recon_01ARZ3NDEKTSV4RRFFQ69G5FAV", ReferenceHash: "sha256:" + strings.Repeat("a", 64)},
+		} {
+			if err := store.PutMetadata(context.Background(), binding, metadata); err != nil {
+				t.Fatal(err)
+			}
+		}
+	}
+	t.Run("canceled-after-flock", func(t *testing.T) {
+		store := newTestStore(t)
+		putAll(t, store)
+		ctx, cancel := context.WithCancel(context.Background())
+		impl := store.impl.(*unixStore)
+		impl.faults.afterLock = cancel
+		for attempt := 0; attempt < 2; attempt++ {
+			if err := store.DeleteAccount(ctx, binding); !errors.Is(err, context.Canceled) {
+				t.Fatalf("attempt %d = %v", attempt, err)
+			}
+		}
+		impl.faults = unixFaults{}
+		if _, err := store.GetMetadata(context.Background(), binding, KindRouting); err != nil {
+			t.Fatalf("canceled delete mutated state: %v", err)
+		}
+	})
+	t.Run("unlink-failure", func(t *testing.T) {
+		store := newTestStore(t)
+		putAll(t, store)
+		injected := errors.New("unlink")
+		impl := store.impl.(*unixStore)
+		impl.faults.unlink = func(int, string) error { return injected }
+		if err := store.DeleteAccount(context.Background(), binding); !errors.Is(err, injected) {
+			t.Fatalf("unlink failure = %v", err)
+		}
+	})
+	t.Run("directory-sync-indeterminate", func(t *testing.T) {
+		store := newTestStore(t)
+		putAll(t, store)
+		impl := store.impl.(*unixStore)
+		impl.faults.syncDir = func(int) error { return errors.New("sync") }
+		if err := store.DeleteAccount(context.Background(), binding); !errors.Is(err, ErrDurabilityIndeterminate) {
+			t.Fatalf("sync failure = %v", err)
+		}
+	})
+}
+
 func TestCancellationBeforeAndAfterCommitBoundary(t *testing.T) {
 	t.Parallel()
 	binding := Binding{Tenant: "tenant", Account: "account"}

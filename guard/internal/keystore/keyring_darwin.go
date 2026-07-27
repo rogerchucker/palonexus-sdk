@@ -5,15 +5,77 @@ package keystore
 /*
 #cgo CFLAGS: -Wno-deprecated-declarations
 #cgo LDFLAGS: -framework Security
-#include <Security/SecKeychain.h>
+#include <Security/Security.h>
+#include <stdlib.h>
+
+static CFStringRef pnx_string(const char *value) {
+	return CFStringCreateWithCString(NULL, value, kCFStringEncodingUTF8);
+}
+
+static CFMutableDictionaryRef pnx_query(const char *service, const char *account) {
+	CFMutableDictionaryRef query = CFDictionaryCreateMutable(NULL, 0,
+		&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	CFStringRef serviceValue = pnx_string(service);
+	CFStringRef accountValue = pnx_string(account);
+	CFDictionarySetValue(query, kSecClass, kSecClassGenericPassword);
+	CFDictionarySetValue(query, kSecAttrService, serviceValue);
+	CFDictionarySetValue(query, kSecAttrAccount, accountValue);
+	CFDictionarySetValue(query, kSecAttrSynchronizable, kCFBooleanFalse);
+	CFDictionarySetValue(query, kSecUseDataProtectionKeychain, kCFBooleanTrue);
+	CFDictionarySetValue(query, kSecUseAuthenticationUI, kSecUseAuthenticationUIFail);
+	CFRelease(serviceValue);
+	CFRelease(accountValue);
+	return query;
+}
+
+static OSStatus pnx_add(const char *service, const char *account, const void *data, CFIndex length) {
+	CFMutableDictionaryRef query = pnx_query(service, account);
+	CFDataRef value = CFDataCreate(NULL, data, length);
+	CFDictionarySetValue(query, kSecValueData, value);
+	CFDictionarySetValue(query, kSecAttrAccessible, kSecAttrAccessibleWhenUnlockedThisDeviceOnly);
+	OSStatus status = SecItemAdd(query, NULL);
+	CFRelease(value);
+	CFRelease(query);
+	return status;
+}
+
+static OSStatus pnx_update(const char *service, const char *account, const void *data, CFIndex length) {
+	CFMutableDictionaryRef query = pnx_query(service, account);
+	CFMutableDictionaryRef attrs = CFDictionaryCreateMutable(NULL, 0,
+		&kCFTypeDictionaryKeyCallBacks, &kCFTypeDictionaryValueCallBacks);
+	CFDataRef value = CFDataCreate(NULL, data, length);
+	CFDictionarySetValue(attrs, kSecValueData, value);
+	CFDictionarySetValue(attrs, kSecAttrSynchronizable, kCFBooleanFalse);
+	CFDictionarySetValue(attrs, kSecAttrAccessible, kSecAttrAccessibleWhenUnlockedThisDeviceOnly);
+	OSStatus status = SecItemUpdate(query, attrs);
+	CFRelease(value);
+	CFRelease(attrs);
+	CFRelease(query);
+	return status;
+}
+
+static OSStatus pnx_get(const char *service, const char *account, CFDataRef *result) {
+	CFMutableDictionaryRef query = pnx_query(service, account);
+	CFDictionarySetValue(query, kSecReturnData, kCFBooleanTrue);
+	CFDictionarySetValue(query, kSecMatchLimit, kSecMatchLimitOne);
+	OSStatus status = SecItemCopyMatching(query, (CFTypeRef *)result);
+	CFRelease(query);
+	return status;
+}
+
+static OSStatus pnx_delete(const char *service, const char *account) {
+	CFMutableDictionaryRef query = pnx_query(service, account);
+	OSStatus status = SecItemDelete(query);
+	CFRelease(query);
+	return status;
+}
 */
 import "C"
 
 import (
 	"context"
 	"errors"
-
-	keychain "github.com/keybase/go-keychain"
+	"unsafe"
 )
 
 var (
@@ -148,83 +210,60 @@ func mapDarwinError(err error) error {
 type nativeDarwinFacade struct{}
 
 func (nativeDarwinFacade) Update(ctx context.Context, item darwinItem) error {
-	return withInteractionDisabled(ctx, func() error {
-		query := keychain.NewItem()
-		query.SetSecClass(keychain.SecClassGenericPassword)
-		query.SetService(item.Service)
-		query.SetAccount(item.Account)
-		update := keychain.NewItem()
-		update.SetData(item.Data)
-		update.SetSynchronizable(keychain.SynchronizableNo)
-		update.SetAccessible(keychain.AccessibleWhenUnlockedThisDeviceOnly)
-		return nativeDarwinError(keychain.UpdateItem(query, update))
-	})
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	service, account := C.CString(item.Service), C.CString(item.Account)
+	defer C.free(unsafe.Pointer(service))
+	defer C.free(unsafe.Pointer(account))
+	return nativeDarwinStatus(C.pnx_update(service, account, unsafe.Pointer(&item.Data[0]), C.CFIndex(len(item.Data))))
 }
 
 func (nativeDarwinFacade) Add(ctx context.Context, item darwinItem) error {
-	return withInteractionDisabled(ctx, func() error {
-		native := keychain.NewGenericPassword(item.Service, item.Account, item.Label, item.Data, "")
-		native.SetSynchronizable(keychain.SynchronizableNo)
-		native.SetAccessible(keychain.AccessibleWhenUnlockedThisDeviceOnly)
-		return nativeDarwinError(keychain.AddItem(native))
-	})
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	service, account := C.CString(item.Service), C.CString(item.Account)
+	defer C.free(unsafe.Pointer(service))
+	defer C.free(unsafe.Pointer(account))
+	return nativeDarwinStatus(C.pnx_add(service, account, unsafe.Pointer(&item.Data[0]), C.CFIndex(len(item.Data))))
 }
 
 func (nativeDarwinFacade) Get(ctx context.Context, item darwinItem) ([]byte, error) {
-	var result []byte
-	err := withInteractionDisabled(ctx, func() error {
-		var err error
-		result, err = keychain.GetGenericPassword(item.Service, item.Account, "", "")
-		if err == nil && result == nil {
-			return errNativeNotFound
-		}
-		return nativeDarwinError(err)
-	})
-	return result, err
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	service, account := C.CString(item.Service), C.CString(item.Account)
+	defer C.free(unsafe.Pointer(service))
+	defer C.free(unsafe.Pointer(account))
+	var data C.CFDataRef
+	if err := nativeDarwinStatus(C.pnx_get(service, account, &data)); err != nil {
+		return nil, err
+	}
+	defer C.CFRelease(C.CFTypeRef(data))
+	length := C.CFDataGetLength(data)
+	return C.GoBytes(unsafe.Pointer(C.CFDataGetBytePtr(data)), C.int(length)), nil
 }
 
 func (nativeDarwinFacade) Delete(ctx context.Context, item darwinItem) error {
-	return withInteractionDisabled(ctx, func() error {
-		return nativeDarwinError(keychain.DeleteGenericPasswordItem(item.Service, item.Account))
-	})
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	service, account := C.CString(item.Service), C.CString(item.Account)
+	defer C.free(unsafe.Pointer(service))
+	defer C.free(unsafe.Pointer(account))
+	return nativeDarwinStatus(C.pnx_delete(service, account))
 }
 
-func nativeDarwinError(err error) error {
+func nativeDarwinStatus(status C.OSStatus) error {
 	switch {
-	case err == nil:
+	case status == 0:
 		return nil
-	case errors.Is(err, keychain.ErrorItemNotFound):
+	case status == C.errSecItemNotFound:
 		return errNativeNotFound
-	case errors.Is(err, keychain.ErrorDuplicateItem):
+	case status == C.errSecDuplicateItem:
 		return errNativeDuplicate
 	default:
 		return ErrUnavailable
 	}
-}
-
-var darwinInteractionGate = func() chan struct{} {
-	gate := make(chan struct{}, 1)
-	gate <- struct{}{}
-	return gate
-}()
-
-func withInteractionDisabled(ctx context.Context, operation func() error) error {
-	select {
-	case <-ctx.Done():
-		return ctx.Err()
-	case <-darwinInteractionGate:
-	}
-	defer func() { darwinInteractionGate <- struct{}{} }()
-	var previous C.Boolean
-	if status := C.SecKeychainGetUserInteractionAllowed(&previous); status != 0 {
-		return ErrUnavailable
-	}
-	if status := C.SecKeychainSetUserInteractionAllowed(C.Boolean(0)); status != 0 {
-		return ErrUnavailable
-	}
-	defer C.SecKeychainSetUserInteractionAllowed(previous)
-	if err := ctx.Err(); err != nil {
-		return err
-	}
-	return operation()
 }

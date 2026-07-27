@@ -50,6 +50,8 @@ type unixFaults struct {
 	syncFile     func(*os.File) error
 	rename       func(int, string, int, string) error
 	syncDir      func(int) error
+	unlink       func(int, string) error
+	afterLock    func()
 	beforeRename func()
 	afterRename  func()
 }
@@ -177,14 +179,42 @@ func (s *unixStore) DeleteAccount(ctx context.Context, binding Binding) error {
 		return ErrInvalidBinding
 	}
 	return s.withLock(ctx, func() error {
+		names := make([]string, 0, 3)
 		for _, kind := range []Kind{KindRouting, KindSession, KindReconciliation} {
 			name, _ := s.recordName(binding, kind)
-			err := unlinkRegularAt(s.rootFD, name)
+			err := rejectUnsafeExistingAt(s.rootFD, name)
 			if err != nil && !errors.Is(err, ErrNotFound) {
 				return err
 			}
+			names = append(names, name)
 		}
-		return syncRoot(s.rootFD)
+		deleted := false
+		for _, name := range names {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+			var err error
+			if s.faults.unlink != nil {
+				err = s.faults.unlink(s.rootFD, name)
+			} else {
+				err = unlinkRegularAt(s.rootFD, name)
+			}
+			if err != nil && !errors.Is(err, ErrNotFound) {
+				return err
+			}
+			deleted = deleted || err == nil
+		}
+		syncDir := syncRoot
+		if s.faults.syncDir != nil {
+			syncDir = s.faults.syncDir
+		}
+		if err := syncDir(s.rootFD); err != nil {
+			if deleted {
+				return ErrDurabilityIndeterminate
+			}
+			return err
+		}
+		return nil
 	})
 }
 
@@ -252,8 +282,17 @@ func (s *unixStore) withLock(ctx context.Context, operation func() error) error 
 		}
 	}
 	defer unix.Flock(lockFD, unix.LOCK_UN) //nolint:errcheck
+	if s.faults.afterLock != nil {
+		s.faults.afterLock()
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := s.cleanupTemps(); err != nil {
 		return fmt.Errorf("clean state temporaries: %w", err)
+	}
+	if err := ctx.Err(); err != nil {
+		return err
 	}
 	return operation()
 }

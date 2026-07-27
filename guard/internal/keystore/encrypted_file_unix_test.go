@@ -74,3 +74,40 @@ func TestEncryptedFileFallbackMaximumSecretAndMalformedDocuments(t *testing.T) {
 		}
 	}
 }
+
+func TestEncryptedFileFallbackCloseZeroesKeyClosesFDAndRejectsReuse(t *testing.T) {
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend, err := NewEncryptedFileBackend(EncryptedFileOptions{
+		Root: filepath.Join(base, "credentials"), Key: bytes.Repeat([]byte{8}, 32), EnableForTesting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	encrypted := backend.(*encryptedFileBackend)
+	keyMaterial := encrypted.key
+	files := encrypted.files.(*unixEncryptedFiles)
+	if err := encrypted.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if !allBytesZero(keyMaterial) || files.rootFD != -1 {
+		t.Fatalf("close lifecycle: key=%x fd=%d", keyMaterial, files.rootFD)
+	}
+	if err := encrypted.Put(context.Background(), "service", "account", []byte("secret")); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("Put after Close = %v", err)
+	}
+	if err := encrypted.Close(); err != nil {
+		t.Fatalf("second Close = %v", err)
+	}
+}
+
+func allBytesZero(value []byte) bool {
+	for _, element := range value {
+		if element != 0 {
+			return false
+		}
+	}
+	return true
+}

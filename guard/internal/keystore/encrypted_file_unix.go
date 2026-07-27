@@ -26,6 +26,19 @@ type unixEncryptedFiles struct {
 	gate   chan struct{}
 }
 
+func (f *unixEncryptedFiles) Close() error {
+	<-f.gate
+	defer func() { f.gate <- struct{}{} }()
+	if f.rootFD < 0 {
+		return nil
+	}
+	if err := unix.Close(f.rootFD); err != nil {
+		return ErrUnavailable
+	}
+	f.rootFD = -1
+	return nil
+}
+
 func newEncryptedFiles(root string) (encryptedFiles, error) {
 	fd, err := openEncryptedRoot(root)
 	if err != nil {
