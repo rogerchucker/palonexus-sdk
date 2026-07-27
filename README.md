@@ -35,7 +35,10 @@ operating systems are currently unsupported.
 
 An AES-GCM file backend exists only for isolated tests. It is disabled unless
 the caller uses the explicit testing-only constructor flag and is never
-selected by native backend discovery.
+selected by native backend discovery. Closing its public store closes the
+directory descriptor, zeros the backend-owned key copy, and makes the cipher
+eligible for garbage collection; Go does not guarantee deterministic erasure
+of expanded cipher-key material held by the runtime.
 
 ## License
 

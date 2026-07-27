@@ -51,6 +51,18 @@ type Store struct {
 	backend Backend
 }
 
+// Close releases backend resources. Backends without owned resources are
+// treated as no-op closers.
+func (s *Store) Close() error {
+	if s == nil || s.backend == nil {
+		return nil
+	}
+	if closer, ok := s.backend.(interface{ Close() error }); ok {
+		return closer.Close()
+	}
+	return nil
+}
+
 func New(service string, backend Backend) (*Store, error) {
 	if !serviceName.MatchString(service) || backend == nil {
 		return nil, ErrInvalidKey

@@ -87,9 +87,13 @@ func TestEncryptedFileFallbackCloseZeroesKeyClosesFDAndRejectsReuse(t *testing.T
 		t.Fatal(err)
 	}
 	encrypted := backend.(*encryptedFileBackend)
+	store, err := New("guard.test", backend)
+	if err != nil {
+		t.Fatal(err)
+	}
 	keyMaterial := encrypted.key
 	files := encrypted.files.(*unixEncryptedFiles)
-	if err := encrypted.Close(); err != nil {
+	if err := store.Close(); err != nil {
 		t.Fatal(err)
 	}
 	if !allBytesZero(keyMaterial) || files.rootFD != -1 {
@@ -98,7 +102,7 @@ func TestEncryptedFileFallbackCloseZeroesKeyClosesFDAndRejectsReuse(t *testing.T
 	if err := encrypted.Put(context.Background(), "service", "account", []byte("secret")); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("Put after Close = %v", err)
 	}
-	if err := encrypted.Close(); err != nil {
+	if err := store.Close(); err != nil {
 		t.Fatalf("second Close = %v", err)
 	}
 }

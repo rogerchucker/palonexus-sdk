@@ -25,8 +25,13 @@ const (
 )
 
 type nativeLinuxFacade struct {
-	conn    *dbus.Conn
-	connect func() (*dbus.Conn, error)
+	conn    linuxConnection
+	connect func() (linuxConnection, error)
+}
+
+type linuxConnection interface {
+	Object(string, dbus.ObjectPath) dbus.BusObject
+	Close() error
 }
 
 type linuxSession struct {
@@ -45,7 +50,7 @@ type linuxSecret struct {
 }
 
 func newNativeLinuxFacade() (*nativeLinuxFacade, error) {
-	return &nativeLinuxFacade{connect: func() (*dbus.Conn, error) {
+	return &nativeLinuxFacade{connect: func() (linuxConnection, error) {
 		return dbus.ConnectSessionBus()
 	}}, nil
 }

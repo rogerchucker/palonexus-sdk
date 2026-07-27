@@ -190,8 +190,10 @@ func (s *unixStore) DeleteAccount(ctx context.Context, binding Binding) error {
 		}
 		deleted := false
 		for _, name := range names {
-			if err := ctx.Err(); err != nil {
-				return err
+			if !deleted {
+				if err := ctx.Err(); err != nil {
+					return err
+				}
 			}
 			var err error
 			if s.faults.unlink != nil {
@@ -200,6 +202,9 @@ func (s *unixStore) DeleteAccount(ctx context.Context, binding Binding) error {
 				err = unlinkRegularAt(s.rootFD, name)
 			}
 			if err != nil && !errors.Is(err, ErrNotFound) {
+				if deleted {
+					return ErrDurabilityIndeterminate
+				}
 				return err
 			}
 			deleted = deleted || err == nil

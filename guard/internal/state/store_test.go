@@ -415,6 +415,40 @@ func TestDeleteAccountCancellationAndFaultBoundaries(t *testing.T) {
 			t.Fatalf("unlink failure = %v", err)
 		}
 	})
+	t.Run("late-cancel-finishes", func(t *testing.T) {
+		store := newTestStore(t)
+		putAll(t, store)
+		ctx, cancel := context.WithCancel(context.Background())
+		impl := store.impl.(*unixStore)
+		calls := 0
+		impl.faults.unlink = func(fd int, name string) error {
+			calls++
+			err := unlinkRegularAt(fd, name)
+			if calls == 1 {
+				cancel()
+			}
+			return err
+		}
+		if err := store.DeleteAccount(ctx, binding); err != nil || calls != 3 {
+			t.Fatalf("late cancellation = %v, calls=%d", err, calls)
+		}
+	})
+	t.Run("later-unlink-indeterminate", func(t *testing.T) {
+		store := newTestStore(t)
+		putAll(t, store)
+		impl := store.impl.(*unixStore)
+		calls := 0
+		impl.faults.unlink = func(fd int, name string) error {
+			calls++
+			if calls == 2 {
+				return errors.New("second unlink")
+			}
+			return unlinkRegularAt(fd, name)
+		}
+		if err := store.DeleteAccount(context.Background(), binding); !errors.Is(err, ErrDurabilityIndeterminate) {
+			t.Fatalf("later unlink = %v", err)
+		}
+	})
 	t.Run("directory-sync-indeterminate", func(t *testing.T) {
 		store := newTestStore(t)
 		putAll(t, store)
