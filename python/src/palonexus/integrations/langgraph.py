@@ -14,16 +14,20 @@ commit it transactionally with its side effect.
 
 from __future__ import annotations
 
+import asyncio
+import hashlib
 import inspect
 import json
+import os
+import sqlite3
 import threading
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any, Literal, Protocol, cast, runtime_checkable
 
 from ..approvals import ApprovalRecord
-from ..async_client import AsyncAuthorizationClient
-from ..client import AuthorizationClient, AuthorizationDecision
+from ..client import AuthorizationDecision
 from ..errors import (
     ApprovalExpired,
     ApprovalRequired,
@@ -107,6 +111,31 @@ def _canonical(value: Mapping[str, object]) -> str:
         )
     except (TypeError, ValueError, OverflowError):
         raise ApprovalScopeMismatch() from None
+
+
+def _utc_now() -> str:
+    return datetime.now(UTC).isoformat(timespec="microseconds").replace("+00:00", "Z")
+
+
+def _require_fresh(expires_at: object, trusted_clock: Callable[[], str]) -> None:
+    try:
+        if type(expires_at) is not str:
+            raise TypeError
+        now = trusted_clock()
+        if type(now) is not str:
+            raise TypeError
+        parsed_expiry = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+        parsed_now = datetime.fromisoformat(now.replace("Z", "+00:00"))
+        if (
+            parsed_expiry.tzinfo is None
+            or parsed_now.tzinfo is None
+            or parsed_now >= parsed_expiry
+        ):
+            raise ApprovalExpired() from None
+    except ApprovalExpired:
+        raise
+    except Exception:
+        raise InvalidDecision() from None
 
 
 def _parse_descriptor(value: object) -> dict[str, Any]:
@@ -260,17 +289,342 @@ def _approval_document(approval: ApprovalRecord) -> dict[str, object]:
     }
 
 
+type LedgerStatus = Literal["unclaimed", "claimed", "completed", "failed"]
+
+
+@runtime_checkable
+class ExecutionLedger(Protocol):
+    """Atomic durable execution-claim boundary for synchronous nodes."""
+
+    def claim(self, event_key: str, descriptor_hash: str) -> bool: ...
+
+    def complete(self, event_key: str, descriptor_hash: str) -> None: ...
+
+    def fail(self, event_key: str, descriptor_hash: str) -> None: ...
+
+    def query(self, event_key: str) -> LedgerStatus: ...
+
+
+@runtime_checkable
+class AsyncExecutionLedger(Protocol):
+    """Atomic durable execution-claim boundary for asynchronous nodes."""
+
+    async def claim(self, event_key: str, descriptor_hash: str) -> bool: ...
+
+    async def complete(self, event_key: str, descriptor_hash: str) -> None: ...
+
+    async def fail(self, event_key: str, descriptor_hash: str) -> None: ...
+
+    async def query(self, event_key: str) -> LedgerStatus: ...
+
+
+def _checked_ledger_key(value: object) -> str:
+    if type(value) is not str or not value or len(value.encode("utf-8")) > 1024:
+        raise InvalidRequest() from None
+    return value
+
+
+def _checked_descriptor_hash(value: object) -> str:
+    if (
+        type(value) is not str
+        or len(value) != 71
+        or not value.startswith("sha256:")
+        or any(character not in "0123456789abcdef" for character in value[7:])
+    ):
+        raise InvalidRequest() from None
+    return value
+
+
+class InMemoryExecutionLedger:
+    """Testing-only process-local ledger."""
+
+    def __init__(self, *, testing_only: Literal[True]) -> None:
+        if testing_only is not True:
+            raise ValueError("testing_only=True is required")
+        self._lock = threading.Lock()
+        self._entries: dict[str, tuple[str, LedgerStatus]] = {}
+
+    def claim(self, event_key: str, descriptor_hash: str) -> bool:
+        key = _checked_ledger_key(event_key)
+        binding = _checked_descriptor_hash(descriptor_hash)
+        with self._lock:
+            existing = self._entries.get(key)
+            if existing is None:
+                self._entries[key] = (binding, "claimed")
+                return True
+            if existing[0] != binding:
+                raise ApprovalScopeMismatch() from None
+            return False
+
+    def _transition(
+        self,
+        event_key: str,
+        descriptor_hash: str,
+        status: Literal["completed", "failed"],
+    ) -> None:
+        key = _checked_ledger_key(event_key)
+        binding = _checked_descriptor_hash(descriptor_hash)
+        with self._lock:
+            existing = self._entries.get(key)
+            if existing is None or existing[0] != binding:
+                raise ApprovalScopeMismatch() from None
+            if existing[1] == status:
+                return
+            if existing[1] != "claimed":
+                raise ApprovalScopeMismatch() from None
+            self._entries[key] = (binding, status)
+
+    def complete(self, event_key: str, descriptor_hash: str) -> None:
+        self._transition(event_key, descriptor_hash, "completed")
+
+    def fail(self, event_key: str, descriptor_hash: str) -> None:
+        self._transition(event_key, descriptor_hash, "failed")
+
+    def query(self, event_key: str) -> LedgerStatus:
+        key = _checked_ledger_key(event_key)
+        with self._lock:
+            entry = self._entries.get(key)
+            return "unclaimed" if entry is None else entry[1]
+
+
+class AsyncInMemoryExecutionLedger:
+    """Testing-only asynchronous ledger."""
+
+    def __init__(self, *, testing_only: Literal[True]) -> None:
+        if testing_only is not True:
+            raise ValueError("testing_only=True is required")
+        self._ledger = InMemoryExecutionLedger(testing_only=True)
+
+    async def claim(self, event_key: str, descriptor_hash: str) -> bool:
+        return self._ledger.claim(event_key, descriptor_hash)
+
+    async def complete(self, event_key: str, descriptor_hash: str) -> None:
+        self._ledger.complete(event_key, descriptor_hash)
+
+    async def fail(self, event_key: str, descriptor_hash: str) -> None:
+        self._ledger.fail(event_key, descriptor_hash)
+
+    async def query(self, event_key: str) -> LedgerStatus:
+        return self._ledger.query(event_key)
+
+
+class SQLiteExecutionLedger:
+    """File-backed atomic execution ledger using SQLite transactions."""
+
+    def __init__(self, path: str | os.PathLike[str]) -> None:
+        try:
+            checked = Path(path).expanduser().resolve(strict=False)
+            checked.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+            connection = sqlite3.connect(
+                checked,
+                timeout=5.0,
+                isolation_level=None,
+                check_same_thread=False,
+            )
+            os.chmod(checked, 0o600)
+            connection.execute("PRAGMA journal_mode=WAL")
+            connection.execute("PRAGMA busy_timeout=5000")
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS palonexus_execution_ledger (
+                    event_key TEXT PRIMARY KEY,
+                    descriptor_hash TEXT NOT NULL,
+                    status TEXT NOT NULL CHECK (
+                        status IN ('claimed', 'completed', 'failed')
+                    )
+                )
+                """
+            )
+        except (OSError, sqlite3.Error, TypeError, ValueError):
+            raise AuthorizationUnavailable() from None
+        self._connection = connection
+        self._lock = threading.Lock()
+        self._closed = False
+
+    def _transaction(self, operation: Callable[[sqlite3.Connection], Any]) -> Any:
+        with self._lock:
+            if self._closed:
+                raise AuthorizationUnavailable() from None
+            try:
+                self._connection.execute("BEGIN IMMEDIATE")
+                value = operation(self._connection)
+                self._connection.execute("COMMIT")
+                return value
+            except BaseException:
+                try:
+                    self._connection.execute("ROLLBACK")
+                except sqlite3.Error:
+                    pass
+                raise
+
+    def claim(self, event_key: str, descriptor_hash: str) -> bool:
+        key = _checked_ledger_key(event_key)
+        binding = _checked_descriptor_hash(descriptor_hash)
+
+        def operation(connection: sqlite3.Connection) -> bool:
+            row = connection.execute(
+                "SELECT descriptor_hash FROM palonexus_execution_ledger "
+                "WHERE event_key = ?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                connection.execute(
+                    "INSERT INTO palonexus_execution_ledger "
+                    "(event_key, descriptor_hash, status) VALUES (?, ?, 'claimed')",
+                    (key, binding),
+                )
+                return True
+            if row[0] != binding:
+                raise ApprovalScopeMismatch() from None
+            return False
+
+        try:
+            return bool(self._transaction(operation))
+        except ApprovalScopeMismatch:
+            raise
+        except (sqlite3.Error, OSError):
+            raise AuthorizationUnavailable() from None
+
+    def _transition(
+        self,
+        event_key: str,
+        descriptor_hash: str,
+        status: Literal["completed", "failed"],
+    ) -> None:
+        key = _checked_ledger_key(event_key)
+        binding = _checked_descriptor_hash(descriptor_hash)
+
+        def operation(connection: sqlite3.Connection) -> None:
+            row = connection.execute(
+                "SELECT descriptor_hash, status "
+                "FROM palonexus_execution_ledger WHERE event_key = ?",
+                (key,),
+            ).fetchone()
+            if row is None or row[0] != binding:
+                raise ApprovalScopeMismatch() from None
+            if row[1] == status:
+                return
+            if row[1] != "claimed":
+                raise ApprovalScopeMismatch() from None
+            connection.execute(
+                "UPDATE palonexus_execution_ledger SET status = ? WHERE event_key = ?",
+                (status, key),
+            )
+
+        try:
+            self._transaction(operation)
+        except ApprovalScopeMismatch:
+            raise
+        except (sqlite3.Error, OSError):
+            raise AuthorizationUnavailable() from None
+
+    def complete(self, event_key: str, descriptor_hash: str) -> None:
+        self._transition(event_key, descriptor_hash, "completed")
+
+    def fail(self, event_key: str, descriptor_hash: str) -> None:
+        self._transition(event_key, descriptor_hash, "failed")
+
+    def query(self, event_key: str) -> LedgerStatus:
+        key = _checked_ledger_key(event_key)
+
+        def operation(connection: sqlite3.Connection) -> LedgerStatus:
+            row = connection.execute(
+                "SELECT status FROM palonexus_execution_ledger WHERE event_key = ?",
+                (key,),
+            ).fetchone()
+            if row is None:
+                return "unclaimed"
+            if row[0] not in {"claimed", "completed", "failed"}:
+                raise ApprovalScopeMismatch() from None
+            return cast(LedgerStatus, row[0])
+
+        try:
+            return cast(LedgerStatus, self._transaction(operation))
+        except ApprovalScopeMismatch:
+            raise
+        except (sqlite3.Error, OSError):
+            raise AuthorizationUnavailable() from None
+
+    def close(self) -> None:
+        with self._lock:
+            if self._closed:
+                return
+            self._closed = True
+            try:
+                self._connection.close()
+            except sqlite3.Error:
+                raise AuthorizationUnavailable() from None
+
+
+class AsyncSQLiteExecutionLedger:
+    """Async facade over the transactional SQLite execution ledger."""
+
+    def __init__(self, path: str | os.PathLike[str]) -> None:
+        self._ledger = SQLiteExecutionLedger(path)
+
+    async def claim(self, event_key: str, descriptor_hash: str) -> bool:
+        return await asyncio.to_thread(self._ledger.claim, event_key, descriptor_hash)
+
+    async def complete(self, event_key: str, descriptor_hash: str) -> None:
+        await asyncio.to_thread(self._ledger.complete, event_key, descriptor_hash)
+
+    async def fail(self, event_key: str, descriptor_hash: str) -> None:
+        await asyncio.to_thread(self._ledger.fail, event_key, descriptor_hash)
+
+    async def query(self, event_key: str) -> LedgerStatus:
+        return await asyncio.to_thread(self._ledger.query, event_key)
+
+    async def aclose(self) -> None:
+        await asyncio.to_thread(self._ledger.close)
+
+
+@runtime_checkable
+class SyncLangGraphAuthorizationClient(Protocol):
+    @property
+    def authorization_client_kind(self) -> Literal["sync"]: ...
+
+    def decide(self, attempt: Any, **kwargs: Any) -> AuthorizationDecision: ...
+
+    def authorize(self, attempt: Any, **kwargs: Any) -> AuthorizationDecision: ...
+
+    def request_approval(
+        self, attempt: Any, decision: AuthorizationDecision, **kwargs: Any
+    ) -> ApprovalRecord: ...
+
+    def get_approval(self, approval_id: str) -> ApprovalRecord: ...
+
+    def wait_for_approval(self, approval_id: str, **kwargs: Any) -> ApprovalRecord: ...
+
+    def resume_checkpoint(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
+@runtime_checkable
+class AsyncLangGraphAuthorizationClient(Protocol):
+    @property
+    def authorization_client_kind(self) -> Literal["async"]: ...
+
+    async def decide(self, attempt: Any, **kwargs: Any) -> AuthorizationDecision: ...
+
+    async def authorize(self, attempt: Any, **kwargs: Any) -> AuthorizationDecision: ...
+
+    async def request_approval(
+        self, attempt: Any, decision: AuthorizationDecision, **kwargs: Any
+    ) -> ApprovalRecord: ...
+
+    async def get_approval(self, approval_id: str) -> ApprovalRecord: ...
+
+    async def wait_for_approval(
+        self, approval_id: str, **kwargs: Any
+    ) -> ApprovalRecord: ...
+
+    async def resume_checkpoint(self, *args: Any, **kwargs: Any) -> Any: ...
+
+
 @runtime_checkable
 class _TargetProjector(Protocol):
     def __call__(
         self, builder: ActionRequestBuilder, state: Mapping[str, object]
     ) -> object: ...
-
-
-@dataclass(slots=True)
-class _Execution:
-    status: Literal["executable", "running", "executed", "consumed"]
-    envelope: _Closable
 
 
 class _Closable(Protocol):
@@ -310,6 +664,10 @@ class LangGraphCredentialRevoked(_LangGraphCompatible, CredentialRevoked):
     """LangGraph-compatible revoked credential or delegation."""
 
 
+class LangGraphInvalidRequest(_LangGraphCompatible, InvalidRequest):
+    """LangGraph-compatible invalid host input."""
+
+
 def _graph_error(error: BaseException) -> BaseException:
     fields = {
         "request_id": getattr(error, "request_id", None),
@@ -330,7 +688,11 @@ def _graph_error(error: BaseException) -> BaseException:
         return LangGraphAuthorizationUnavailable(**fields)
     if isinstance(error, PolicyDenied):
         return LangGraphPolicyDenied(**fields)
-    return error
+    if isinstance(error, InvalidRequest):
+        return LangGraphInvalidRequest(**fields)
+    if isinstance(error, (KeyboardInterrupt, SystemExit, asyncio.CancelledError)):
+        return error
+    return LangGraphAuthorizationUnavailable(**fields)
 
 
 class PaloNexusLangGraphNode:
@@ -347,12 +709,15 @@ class PaloNexusLangGraphNode:
         actor_ref: str,
         action: str,
         side_effect: str,
-        client: AuthorizationClient | None = None,
-        async_client: AsyncAuthorizationClient | None = None,
+        client: SyncLangGraphAuthorizationClient | None = None,
+        async_client: AsyncLangGraphAuthorizationClient | None = None,
         handler: Callable[[Mapping[str, object]], Mapping[str, object]] | None = None,
         async_handler: Callable[[Mapping[str, object]], Awaitable[Mapping[str, object]]]
         | None = None,
+        execution_ledger: ExecutionLedger | None = None,
+        async_execution_ledger: AsyncExecutionLedger | None = None,
         checkpointer: object | None = None,
+        trusted_clock: Callable[[], str] | None = None,
         state_key: str = LANGGRAPH_SCOPE_KEY,
     ) -> None:
         if (
@@ -373,6 +738,28 @@ class PaloNexusLangGraphNode:
             or (client is None) != (handler is None)
             or (async_client is None) != (async_handler is None)
             or (client is None and async_client is None)
+            or (client is None) != (execution_ledger is None)
+            or (async_client is None) != (async_execution_ledger is None)
+            or (
+                client is not None
+                and not isinstance(client, SyncLangGraphAuthorizationClient)
+            )
+            or (
+                async_client is not None
+                and not isinstance(
+                    async_client,
+                    AsyncLangGraphAuthorizationClient,
+                )
+            )
+            or (
+                execution_ledger is not None
+                and not isinstance(execution_ledger, ExecutionLedger)
+            )
+            or (
+                async_execution_ledger is not None
+                and not isinstance(async_execution_ledger, AsyncExecutionLedger)
+            )
+            or (trusted_clock is not None and not callable(trusted_clock))
         ):
             raise InvalidRequest() from None
         self._builder = builder
@@ -387,10 +774,11 @@ class PaloNexusLangGraphNode:
         self._async_client = async_client
         self._handler = handler
         self._async_handler = async_handler
+        self._execution_ledger = execution_ledger
+        self._async_execution_ledger = async_execution_ledger
+        self._trusted_clock = trusted_clock or _utc_now
         self._state_key = state_key
         self._checkpointer = _checkpointer(checkpointer)
-        self._lock = threading.RLock()
-        self._executions: dict[tuple[str, str], _Execution] = {}
 
     def _prepare(
         self, state: Mapping[str, object], *, action_id: str | None = None
@@ -491,6 +879,8 @@ class PaloNexusLangGraphNode:
         attempt = self._prepare(state)
         try:
             decision = self._client.decide(attempt)
+            if type(decision) is not AuthorizationDecision:
+                raise InvalidDecision() from None
         except BaseException as error:
             raise _graph_error(error) from None
         if decision.outcome is DecisionOutcome.DENY:
@@ -510,23 +900,23 @@ class PaloNexusLangGraphNode:
                 ) from None
             try:
                 approval = self._client.request_approval(attempt, decision)
+                if type(approval) is not ApprovalRecord:
+                    raise InvalidDecision() from None
             except BaseException as error:
                 attempt.close()
                 raise _graph_error(error) from None
+            rendered = self._descriptor(
+                attempt, decision, approval, status="approval_pending"
+            )
+            attempt.close()
             return {
-                self._state_key: self._descriptor(
-                    attempt, decision, approval, status="approval_pending"
-                ),
+                self._state_key: rendered,
                 _MARKER_KEY: "INTERRUPTED",
             }
         rendered_descriptor = self._descriptor(
             attempt, decision, None, status="executable"
         )
-        namespace = _thread_namespace(config) or "__ephemeral__"
-        with self._lock:
-            self._executions[(namespace, str(attempt.request.action_id))] = _Execution(
-                "executable", attempt
-            )
+        attempt.close()
         return {self._state_key: rendered_descriptor, _MARKER_KEY: "AUTHORIZED"}
 
     async def aauthorize(
@@ -547,6 +937,8 @@ class PaloNexusLangGraphNode:
         attempt = self._prepare(state)
         try:
             decision = await self._async_client.decide(attempt)
+            if type(decision) is not AuthorizationDecision:
+                raise InvalidDecision() from None
         except BaseException as error:
             raise _graph_error(error) from None
         if decision.outcome is DecisionOutcome.DENY:
@@ -566,23 +958,23 @@ class PaloNexusLangGraphNode:
                 ) from None
             try:
                 approval = await self._async_client.request_approval(attempt, decision)
+                if type(approval) is not ApprovalRecord:
+                    raise InvalidDecision() from None
             except BaseException as error:
                 attempt.close()
                 raise _graph_error(error) from None
+            rendered = self._descriptor(
+                attempt, decision, approval, status="approval_pending"
+            )
+            attempt.close()
             return {
-                self._state_key: self._descriptor(
-                    attempt, decision, approval, status="approval_pending"
-                ),
+                self._state_key: rendered,
                 _MARKER_KEY: "INTERRUPTED",
             }
         rendered_descriptor = self._descriptor(
             attempt, decision, None, status="executable"
         )
-        namespace = _thread_namespace(config) or "__ephemeral__"
-        with self._lock:
-            self._executions[(namespace, str(attempt.request.action_id))] = _Execution(
-                "executable", attempt
-            )
+        attempt.close()
         return {self._state_key: rendered_descriptor, _MARKER_KEY: "AUTHORIZED"}
 
     def route_after_authorization(self, state: Mapping[str, object]) -> str:
@@ -627,10 +1019,7 @@ class PaloNexusLangGraphNode:
             raise _graph_error(error) from None
         descriptor["status"] = "executable"
         rendered = _canonical(descriptor)
-        with self._lock:
-            self._executions[(namespace, descriptor["eventId"])] = _Execution(
-                "executable", resumed
-            )
+        resumed.close()
         return {self._state_key: rendered, _MARKER_KEY: "AUTHORIZED"}
 
     async def _aresume_after_wake(
@@ -657,32 +1046,12 @@ class PaloNexusLangGraphNode:
             raise _graph_error(error) from None
         descriptor["status"] = "executable"
         rendered = _canonical(descriptor)
-        with self._lock:
-            self._executions[(namespace, descriptor["eventId"])] = _Execution(
-                "executable", resumed
-            )
+        resumed.close()
         return {self._state_key: rendered, _MARKER_KEY: "AUTHORIZED"}
 
-    def _claim(
-        self, state: Mapping[str, object], config: object
-    ) -> tuple[dict[str, Any], tuple[str, str], _Execution | None]:
-        _, descriptor = self._checked_state(state)
-        namespace = _thread_namespace(config) or "__ephemeral__"
-        key = (namespace, descriptor["eventId"])
-        if self._durably_consumed(namespace, descriptor["eventId"]):
-            return descriptor, key, None
-        with self._lock:
-            execution = self._executions.get(key)
-            if descriptor["status"] in {"executed", "consumed"}:
-                return descriptor, key, None
-            if execution is not None and execution.status in {"executed", "consumed"}:
-                return descriptor, key, None
-            if execution is None or execution.status != "executable":
-                raise AuthorizationUnavailable() from None
-            execution.status = "running"
-        return descriptor, key, execution
+    def _history_consumed(self, thread_id: str, event_id: str) -> bool:
+        """Checkpoint history is replay evidence, never the execution lock."""
 
-    def _durably_consumed(self, thread_id: str, event_id: str) -> bool:
         checkpointer = self._checkpointer
         if checkpointer is None or thread_id == "__ephemeral__":
             return False
@@ -713,78 +1082,154 @@ class PaloNexusLangGraphNode:
         except Exception:
             raise AuthorizationUnavailable() from None
 
-    def _restore_executable(
-        self,
-        state: Mapping[str, object],
-        config: RunnableConfig,
-    ) -> None:
-        if self._client is None:
-            return
-        _, descriptor = self._checked_state(state)
-        namespace = _thread_namespace(config) or "__ephemeral__"
-        key = (namespace, descriptor["eventId"])
-        if self._durably_consumed(namespace, descriptor["eventId"]):
-            return
-        with self._lock:
-            if key in self._executions or descriptor["status"] != "executable":
-                return
-        current = self._prepare(state, action_id=descriptor["actionId"])
-        try:
-            decision = self._client.authorize(current)
-            if (
-                decision.authoritative_scope_hash
-                != descriptor["authoritativeScopeHash"]
-                or decision.client_scope_hash != descriptor["clientScopeHash"]
-            ):
-                raise ApprovalScopeMismatch() from None
-        except BaseException as error:
-            current.close()
-            raise _graph_error(error) from None
-        with self._lock:
-            prior = self._executions.setdefault(key, _Execution("executable", current))
-        if prior.envelope is not current:
-            current.close()
+    async def _ahistory_consumed(self, thread_id: str, event_id: str) -> bool:
+        """Async checkpoint evidence using only the saver's async iterator."""
 
-    async def _arestore_executable(
+        checkpointer = self._checkpointer
+        if checkpointer is None or thread_id == "__ephemeral__":
+            return False
+        try:
+            root_config = {
+                "configurable": {"thread_id": thread_id, "checkpoint_ns": ""}
+            }
+            index = 0
+            async for checkpoint_tuple in cast(Any, checkpointer).alist(root_config):
+                if index >= 10_000:
+                    raise AuthorizationUnavailable() from None
+                index += 1
+                values = checkpoint_tuple.checkpoint.get("channel_values", {})
+                if not isinstance(values, Mapping):
+                    raise ApprovalScopeMismatch() from None
+                value = values.get(self._state_key)
+                if value is None:
+                    continue
+                descriptor = _parse_descriptor(value)
+                if descriptor["eventId"] == event_id and descriptor["status"] in {
+                    "executed",
+                    "consumed",
+                }:
+                    return True
+            return False
+        except (ApprovalScopeMismatch, AuthorizationUnavailable):
+            raise
+        except Exception:
+            raise AuthorizationUnavailable() from None
+
+    @staticmethod
+    def _ledger_binding(descriptor: Mapping[str, object]) -> tuple[str, str]:
+        binding = dict(descriptor)
+        binding["status"] = "binding"
+        rendered = _canonical(binding)
+        digest = "sha256:" + hashlib.sha256(rendered.encode("utf-8")).hexdigest()
+        return f"{descriptor['tenantRef']}\0{descriptor['eventId']}", digest
+
+    def _validate_execution(
         self,
         state: Mapping[str, object],
-        config: RunnableConfig,
-    ) -> None:
-        if self._async_client is None:
-            return
+    ) -> tuple[dict[str, Any], Any]:
+        if self._client is None:
+            raise InvalidRequest() from None
         _, descriptor = self._checked_state(state)
-        namespace = _thread_namespace(config) or "__ephemeral__"
-        key = (namespace, descriptor["eventId"])
-        if self._durably_consumed(namespace, descriptor["eventId"]):
-            return
-        with self._lock:
-            if key in self._executions or descriptor["status"] != "executable":
-                return
+        if descriptor["status"] in {"executed", "consumed"}:
+            return descriptor, None
+        if descriptor["status"] != "executable":
+            raise ApprovalRequired() from None
+        _require_fresh(descriptor["expiresAt"], self._trusted_clock)
         current = self._prepare(state, action_id=descriptor["actionId"])
         try:
-            decision = await self._async_client.authorize(current)
+            request = current.request.to_dict()
             if (
+                request["target"] != descriptor["resource"]
+                or request["actionId"] != descriptor["actionId"]
+                or request["correlationId"] != descriptor["correlationId"]
+                or request["task"]
+                != {
+                    "taskId": descriptor["taskId"],
+                    "sessionId": descriptor["sessionId"],
+                }
+                or request["action"] != descriptor["action"]
+                or request["sideEffect"] != descriptor["sideEffect"]
+                or current.client_scope_hash != descriptor["clientScopeHash"]
+            ):
+                raise ApprovalScopeMismatch() from None
+            decision = self._client.authorize(current)
+            if type(decision) is not AuthorizationDecision or (
                 decision.authoritative_scope_hash
                 != descriptor["authoritativeScopeHash"]
                 or decision.client_scope_hash != descriptor["clientScopeHash"]
             ):
                 raise ApprovalScopeMismatch() from None
+            _require_fresh(decision.expires_at, self._trusted_clock)
         except BaseException as error:
             current.close()
             raise _graph_error(error) from None
-        with self._lock:
-            prior = self._executions.setdefault(key, _Execution("executable", current))
-        if prior.envelope is not current:
+        return descriptor, current
+
+    async def _avalidate_execution(
+        self,
+        state: Mapping[str, object],
+    ) -> tuple[dict[str, Any], Any]:
+        if self._async_client is None:
+            raise InvalidRequest() from None
+        _, descriptor = self._checked_state(state)
+        if descriptor["status"] in {"executed", "consumed"}:
+            return descriptor, None
+        if descriptor["status"] != "executable":
+            raise ApprovalRequired() from None
+        _require_fresh(descriptor["expiresAt"], self._trusted_clock)
+        current = self._prepare(state, action_id=descriptor["actionId"])
+        try:
+            request = current.request.to_dict()
+            if (
+                request["target"] != descriptor["resource"]
+                or request["actionId"] != descriptor["actionId"]
+                or request["correlationId"] != descriptor["correlationId"]
+                or request["task"]
+                != {
+                    "taskId": descriptor["taskId"],
+                    "sessionId": descriptor["sessionId"],
+                }
+                or request["action"] != descriptor["action"]
+                or request["sideEffect"] != descriptor["sideEffect"]
+                or current.client_scope_hash != descriptor["clientScopeHash"]
+            ):
+                raise ApprovalScopeMismatch() from None
+            decision = await self._async_client.authorize(current)
+            if type(decision) is not AuthorizationDecision or (
+                decision.authoritative_scope_hash
+                != descriptor["authoritativeScopeHash"]
+                or decision.client_scope_hash != descriptor["clientScopeHash"]
+            ):
+                raise ApprovalScopeMismatch() from None
+            _require_fresh(decision.expires_at, self._trusted_clock)
+        except BaseException as error:
             current.close()
+            raise _graph_error(error) from None
+        return descriptor, current
 
     def execute(
         self, state: Mapping[str, object], config: RunnableConfig
     ) -> dict[str, object]:
-        if self._handler is None:
+        if self._handler is None or self._execution_ledger is None:
             raise InvalidRequest() from None
-        self._restore_executable(state, config)
-        descriptor, key, execution = self._claim(state, config)
-        if execution is None:
+        try:
+            _, persisted = self._checked_state(state)
+            event_key, binding = self._ledger_binding(persisted)
+            if self._execution_ledger.query(event_key) != "unclaimed":
+                thread_id = _thread_namespace(config) or "__ephemeral__"
+                self._history_consumed(thread_id, persisted["eventId"])
+                return {
+                    self._state_key: _canonical(persisted),
+                    _MARKER_KEY: "REPLAY_BLOCKED",
+                }
+            descriptor, current = self._validate_execution(state)
+            event_key, binding = self._ledger_binding(descriptor)
+            claimed = self._execution_ledger.claim(event_key, binding)
+        except BaseException as error:
+            raise _graph_error(error) from None
+        if current is None or not claimed:
+            thread_id = _thread_namespace(config) or "__ephemeral__"
+            self._history_consumed(thread_id, descriptor["eventId"])
             return {
                 self._state_key: _canonical(descriptor),
                 _MARKER_KEY: "REPLAY_BLOCKED",
@@ -795,20 +1240,19 @@ class PaloNexusLangGraphNode:
                 raise InvalidRequest() from None
             if self._state_key in result or _MARKER_KEY in result:
                 raise InvalidRequest() from None
-        except BaseException:
-            with self._lock:
-                execution.status = "consumed"
+        except BaseException as error:
             try:
-                execution.envelope.close()
+                self._execution_ledger.fail(event_key, binding)
             except BaseException:
                 pass
-            raise
-        with self._lock:
-            execution.status = "executed"
+            current.close()
+            raise _graph_error(error) from None
         try:
-            execution.envelope.close()
-        except BaseException:
-            pass
+            self._execution_ledger.complete(event_key, binding)
+        except BaseException as error:
+            current.close()
+            raise _graph_error(error) from None
+        current.close()
         descriptor["status"] = "executed"
         return {
             **dict(result),
@@ -819,11 +1263,26 @@ class PaloNexusLangGraphNode:
     async def aexecute(
         self, state: Mapping[str, object], config: RunnableConfig
     ) -> dict[str, object]:
-        if self._async_handler is None:
+        if self._async_handler is None or self._async_execution_ledger is None:
             raise InvalidRequest() from None
-        await self._arestore_executable(state, config)
-        descriptor, key, execution = self._claim(state, config)
-        if execution is None:
+        try:
+            _, persisted = self._checked_state(state)
+            event_key, binding = self._ledger_binding(persisted)
+            if await self._async_execution_ledger.query(event_key) != "unclaimed":
+                thread_id = _thread_namespace(config) or "__ephemeral__"
+                await self._ahistory_consumed(thread_id, persisted["eventId"])
+                return {
+                    self._state_key: _canonical(persisted),
+                    _MARKER_KEY: "REPLAY_BLOCKED",
+                }
+            descriptor, current = await self._avalidate_execution(state)
+            event_key, binding = self._ledger_binding(descriptor)
+            claimed = await self._async_execution_ledger.claim(event_key, binding)
+        except BaseException as error:
+            raise _graph_error(error) from None
+        if current is None or not claimed:
+            thread_id = _thread_namespace(config) or "__ephemeral__"
+            await self._ahistory_consumed(thread_id, descriptor["eventId"])
             return {
                 self._state_key: _canonical(descriptor),
                 _MARKER_KEY: "REPLAY_BLOCKED",
@@ -834,20 +1293,19 @@ class PaloNexusLangGraphNode:
                 raise InvalidRequest() from None
             if self._state_key in result or _MARKER_KEY in result:
                 raise InvalidRequest() from None
-        except BaseException:
-            with self._lock:
-                execution.status = "consumed"
+        except BaseException as error:
             try:
-                execution.envelope.close()
+                await self._async_execution_ledger.fail(event_key, binding)
             except BaseException:
                 pass
-            raise
-        with self._lock:
-            execution.status = "executed"
+            current.close()
+            raise _graph_error(error) from None
         try:
-            execution.envelope.close()
-        except BaseException:
-            pass
+            await self._async_execution_ledger.complete(event_key, binding)
+        except BaseException as error:
+            current.close()
+            raise _graph_error(error) from None
+        current.close()
         descriptor["status"] = "executed"
         return {
             **dict(result),
@@ -865,5 +1323,14 @@ __all__ = [
     "LangGraphInvalidDecision",
     "LangGraphPolicyDenied",
     "LangGraphCredentialRevoked",
+    "LangGraphInvalidRequest",
+    "ExecutionLedger",
+    "AsyncExecutionLedger",
+    "InMemoryExecutionLedger",
+    "AsyncInMemoryExecutionLedger",
+    "SQLiteExecutionLedger",
+    "AsyncSQLiteExecutionLedger",
+    "SyncLangGraphAuthorizationClient",
+    "AsyncLangGraphAuthorizationClient",
     "PaloNexusLangGraphNode",
 ]

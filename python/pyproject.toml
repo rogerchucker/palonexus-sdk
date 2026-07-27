@@ -58,6 +58,7 @@ langchain = [
 langgraph = [
     "langchain-core>=1,<2",
     "langgraph>=1,<2",
+    "langgraph-checkpoint-sqlite>=3,<4",
 ]
 
 [tool.hatch.version]

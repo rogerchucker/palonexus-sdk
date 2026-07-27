@@ -5,10 +5,12 @@ from __future__ import annotations
 
 import asyncio
 import json
+from concurrent.futures import ThreadPoolExecutor
 from typing import Any, TypedDict
 
 import pytest
 from langgraph.checkpoint.memory import InMemorySaver
+from langgraph.checkpoint.sqlite import SqliteSaver
 from langgraph.graph import END, START, StateGraph
 from langgraph.types import Command
 from palonexus import (
@@ -25,8 +27,12 @@ from palonexus import (
 )
 from palonexus.integrations.langgraph import (
     LANGGRAPH_SCOPE_KEY,
+    AsyncInMemoryExecutionLedger,
+    ExecutionLedger,
+    InMemoryExecutionLedger,
     LangGraphPolicyDenied,
     PaloNexusLangGraphNode,
+    SQLiteExecutionLedger,
 )
 from palonexus.testing import (
     AsyncFakeTransport,
@@ -86,6 +92,7 @@ def _node(
     calls: list[str],
     *,
     checkpointer: Any = None,
+    execution_ledger: ExecutionLedger | None = None,
 ) -> PaloNexusLangGraphNode:
     transport = FakeTransport(engine, testing_only=True)
     client = AuthorizationClient(
@@ -109,13 +116,21 @@ def _node(
         action="file:write",
         side_effect="write",
         checkpointer=checkpointer,
+        execution_ledger=execution_ledger or InMemoryExecutionLedger(testing_only=True),
     )
 
 
 def test_allow_executes_exactly_once_and_checkpoints_only_json_scope() -> None:
     calls: list[str] = []
     graph = _graph(
-        _node(ScriptedEngine(ScriptedEngine.allow(), testing_only=True), calls)
+        _node(
+            ScriptedEngine(
+                ScriptedEngine.allow(),
+                ScriptedEngine.allow(),
+                testing_only=True,
+            ),
+            calls,
+        )
     )
     result = graph.invoke({"path": "deploy/prod.yaml", "calls": 0})
 
@@ -159,10 +174,12 @@ def test_approval_interrupt_resume_reauthorizes_and_executes_once() -> None:
     engine = ScriptedEngine(
         ScriptedEngine.approval_required(),
         ScriptedEngine.allow(),
+        ScriptedEngine.allow(),
         testing_only=True,
     )
     saver = InMemorySaver()
-    node = _node(engine, calls, checkpointer=saver)
+    ledger = InMemoryExecutionLedger(testing_only=True)
+    node = _node(engine, calls, checkpointer=saver, execution_ledger=ledger)
     graph = _graph(node, checkpointer=saver)
     config = {"configurable": {"thread_id": "thread-a"}}
 
@@ -187,11 +204,12 @@ def test_approval_interrupt_resume_reauthorizes_and_executes_once() -> None:
     )
     assert result["marker"] == "APPROVED_EXECUTED"
     assert calls == ["deploy/prod.yaml"]
-    assert len(engine.recorded_calls) == 4
+    assert len(engine.recorded_calls) == 5
     assert [call.operation for call in engine.recorded_calls] == [
         "decide",
         "request_approval",
         "get_approval",
+        "decide",
         "decide",
     ]
 
@@ -206,7 +224,12 @@ def test_approval_interrupt_resume_reauthorizes_and_executes_once() -> None:
     )
     restarted_calls: list[str] = []
     restarted_graph = _graph(
-        _node(engine, restarted_calls, checkpointer=saver),
+        _node(
+            engine,
+            restarted_calls,
+            checkpointer=saver,
+            execution_ledger=ledger,
+        ),
         checkpointer=saver,
     )
     replayed_event = restarted_graph.invoke(None, before_execute.config)
@@ -219,6 +242,7 @@ def test_checkpoint_scope_or_current_target_mutation_fails_closed() -> None:
     calls: list[str] = []
     engine = ScriptedEngine(
         ScriptedEngine.approval_required(),
+        ScriptedEngine.allow(),
         ScriptedEngine.allow(),
         testing_only=True,
     )
@@ -289,6 +313,7 @@ def test_async_nodes_authorize_resume_and_execute_once() -> None:
         engine = ScriptedEngine(
             ScriptedEngine.approval_required(),
             ScriptedEngine.allow(),
+            ScriptedEngine.allow(),
             testing_only=True,
         )
         transport = AsyncFakeTransport(engine, testing_only=True)
@@ -314,6 +339,7 @@ def test_async_nodes_authorize_resume_and_execute_once() -> None:
             action="file:write",
             side_effect="write",
             checkpointer=checkpointer,
+            async_execution_ledger=AsyncInMemoryExecutionLedger(testing_only=True),
         )
         graph_builder = StateGraph(State)
         graph_builder.add_node("authorize", node.aauthorize)
@@ -351,6 +377,7 @@ def test_process_restart_reconstructs_authorization_without_execution_checkpoint
     engine = ScriptedEngine(
         ScriptedEngine.approval_required(),
         ScriptedEngine.allow(),
+        ScriptedEngine.allow(),
         testing_only=True,
     )
     transport = FakeTransport(engine, testing_only=True)
@@ -368,6 +395,7 @@ def test_process_restart_reconstructs_authorization_without_execution_checkpoint
         action="file:write",
         side_effect="write",
         checkpointer=saver,
+        execution_ledger=InMemoryExecutionLedger(testing_only=True),
     )
     config = {"configurable": {"thread_id": "restart-thread"}}
     paused = _graph(first, checkpointer=saver).invoke(
@@ -398,6 +426,7 @@ def test_process_restart_reconstructs_authorization_without_execution_checkpoint
         action="file:write",
         side_effect="write",
         checkpointer=saver,
+        execution_ledger=InMemoryExecutionLedger(testing_only=True),
     )
     result = _graph(restarted, checkpointer=saver).invoke(
         Command(resume="wake-only"),
@@ -405,6 +434,64 @@ def test_process_restart_reconstructs_authorization_without_execution_checkpoint
     )
     assert result["marker"] == "APPROVED_EXECUTED"
     assert calls == ["deploy/prod.yaml"]
+
+
+def test_file_backed_checkpointer_and_ledger_survive_restart(tmp_path: Any) -> None:
+    calls: list[str] = []
+    engine = ScriptedEngine(
+        ScriptedEngine.approval_required(),
+        ScriptedEngine.allow(),
+        ScriptedEngine.allow(),
+        testing_only=True,
+    )
+    transport = FakeTransport(engine, testing_only=True)
+    checkpoint_path = tmp_path / "checkpoints.sqlite3"
+    ledger_path = tmp_path / "executions.sqlite3"
+    config = {"configurable": {"thread_id": "durable-restart"}}
+
+    first_ledger = SQLiteExecutionLedger(ledger_path)
+    with SqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
+        first = PaloNexusLangGraphNode(
+            builder=_builder(),
+            client=AuthorizationClient(transport, approval_transport=transport),
+            target_projector=_target,
+            handler=lambda state: {"calls": 999},
+            task_context=TASK,
+            correlation_id=CORRELATION,
+            tenant_ref="tenant:example",
+            actor_ref="subject:example",
+            action="file:write",
+            side_effect="write",
+            checkpointer=saver,
+            execution_ledger=first_ledger,
+        )
+        paused = _graph(first, checkpointer=saver).invoke(
+            {"path": "deploy/prod.yaml", "calls": 0}, config
+        )
+    first_ledger.close()
+
+    approval_id = json.loads(paused[LANGGRAPH_SCOPE_KEY])["approvalId"]
+    engine.resolve_approval(
+        approval_id,
+        status="approved",
+        reviewer_ref="subject:reviewer",
+        resolution_idempotency_key="approval_01J5ABCDEFGHJKMNPQRSTVWXY4",
+    )
+
+    reopened_ledger = SQLiteExecutionLedger(ledger_path)
+    with SqliteSaver.from_conn_string(str(checkpoint_path)) as saver:
+        restarted = _node(
+            engine,
+            calls,
+            checkpointer=saver,
+            execution_ledger=reopened_ledger,
+        )
+        result = _graph(restarted, checkpointer=saver).invoke(
+            Command(resume="wake"), config
+        )
+    assert result["marker"] == "APPROVED_EXECUTED"
+    assert calls == ["deploy/prod.yaml"]
+    reopened_ledger.close()
 
 
 @pytest.mark.parametrize("status", ["denied", "cancelled"])
@@ -482,6 +569,7 @@ def test_expired_approval_never_executes() -> None:
         action="file:write",
         side_effect="write",
         checkpointer=saver,
+        execution_ledger=InMemoryExecutionLedger(testing_only=True),
     )
     graph = _graph(node, checkpointer=saver)
     config = {"configurable": {"thread_id": "expired"}}
@@ -520,3 +608,110 @@ def test_framework_notes_are_ignored_without_retaining_host_text() -> None:
     error.add_note("HOST-SECRET")
     assert "HOST-SECRET" not in repr(error)
     assert getattr(error, "__notes__", None) is None
+
+
+def test_execution_ledger_is_required_and_atomic_across_instances(
+    tmp_path: Any,
+) -> None:
+    assert isinstance(
+        InMemoryExecutionLedger(testing_only=True),
+        ExecutionLedger,
+    )
+    path = tmp_path / "execution-ledger.sqlite3"
+    first = SQLiteExecutionLedger(path)
+    second = SQLiteExecutionLedger(path)
+    assert first.claim("tenant:example\0act_example", "sha256:" + "a" * 64)
+    assert not second.claim("tenant:example\0act_example", "sha256:" + "a" * 64)
+    first.complete("tenant:example\0act_example", "sha256:" + "a" * 64)
+    assert second.query("tenant:example\0act_example") == "completed"
+    first.close()
+    second.close()
+
+
+def test_execution_ledger_has_one_winner_under_a_real_race(tmp_path: Any) -> None:
+    path = tmp_path / "race.sqlite3"
+    ledgers = [SQLiteExecutionLedger(path) for _ in range(8)]
+    binding = "sha256:" + "b" * 64
+    with ThreadPoolExecutor(max_workers=len(ledgers)) as pool:
+        winners = list(
+            pool.map(
+                lambda ledger: ledger.claim("tenant:example\0global-event", binding),
+                ledgers,
+            )
+        )
+    assert winners.count(True) == 1
+    assert winners.count(False) == len(ledgers) - 1
+    for ledger in ledgers:
+        ledger.close()
+
+
+def test_execute_reprojects_current_state_even_with_cached_envelope() -> None:
+    calls: list[str] = []
+    engine = ScriptedEngine(
+        ScriptedEngine.allow(),
+        ScriptedEngine.allow(),
+        testing_only=True,
+    )
+    node = _node(engine, calls)
+    config = {"configurable": {"thread_id": "execute-mutation"}}
+    authorized = {
+        "path": "deploy/prod.yaml",
+        "calls": 0,
+        **node.authorize({"path": "deploy/prod.yaml", "calls": 0}, config),
+    }
+    with pytest.raises(ApprovalScopeMismatch):
+        node.execute({**authorized, "path": "deploy/other.yaml"}, config)
+    assert calls == []
+
+
+def test_async_testing_ledger_requires_explicit_opt_in() -> None:
+    with pytest.raises(ValueError):
+        AsyncInMemoryExecutionLedger(testing_only=False)  # type: ignore[arg-type]
+
+
+def test_async_replay_uses_alist_and_never_sync_list() -> None:
+    class AsyncOnlyHistorySaver(InMemorySaver):
+        def list(self, *args: Any, **kwargs: Any) -> Any:
+            raise AssertionError("sync checkpoint API must not be called")
+
+        async def alist(self, *args: Any, **kwargs: Any) -> Any:
+            if False:
+                yield None
+
+    async def run() -> None:
+        engine = ScriptedEngine(
+            ScriptedEngine.allow(),
+            ScriptedEngine.allow(),
+            testing_only=True,
+        )
+        transport = AsyncFakeTransport(engine, testing_only=True)
+        saver = AsyncOnlyHistorySaver()
+        calls: list[str] = []
+
+        async def handler(state: State) -> dict[str, object]:
+            calls.append(state["path"])
+            return {"calls": len(calls)}
+
+        node = PaloNexusLangGraphNode(
+            builder=_builder(),
+            async_client=AsyncAuthorizationClient(transport),
+            target_projector=_target,
+            async_handler=handler,
+            task_context=TASK,
+            correlation_id=CORRELATION,
+            tenant_ref="tenant:example",
+            actor_ref="subject:example",
+            action="file:write",
+            side_effect="write",
+            checkpointer=saver,
+            async_execution_ledger=AsyncInMemoryExecutionLedger(testing_only=True),
+        )
+        config = {"configurable": {"thread_id": "async-alist"}}
+        state: dict[str, object] = {"path": "deploy/prod.yaml", "calls": 0}
+        state.update(await node.aauthorize(state, config))
+        executed = await node.aexecute(state, config)
+        replay = await node.aexecute({**state, **executed}, config)
+        assert replay["marker"] == "REPLAY_BLOCKED"
+        assert calls == ["deploy/prod.yaml"]
+
+    asyncio.run(run())

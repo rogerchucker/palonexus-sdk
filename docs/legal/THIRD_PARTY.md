@@ -59,6 +59,7 @@ locked distribution without contacting the network.
 | Dependency | Version | License | Review status | Obligations | Notice | Source |
 | --- | --- | --- | --- | --- | --- | --- |
 | annotated-types | 0.8.0 | MIT | reviewed | Retain notices | None identified | PyPI |
+| aiosqlite | 0.22.1 | MIT | reviewed | Retain notices | None identified | PyPI |
 | anyio | 4.14.2 | MIT | reviewed | Retain notices | None identified | PyPI |
 | ast-serialize | 0.6.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | attrs | 26.1.0 | MIT | reviewed | Retain notices | None identified | PyPI |
@@ -84,6 +85,7 @@ locked distribution without contacting the network.
 | langchain-protocol | 0.0.18 | MIT | reviewed | Retain notices | None identified | PyPI |
 | langgraph | 1.2.9 | MIT | reviewed | Retain notices | None identified | PyPI |
 | langgraph-checkpoint | 4.1.1 | MIT | reviewed | Retain notices | None identified | PyPI |
+| langgraph-checkpoint-sqlite | 3.1.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | langgraph-prebuilt | 1.1.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | langgraph-sdk | 0.4.2 | MIT | reviewed | Retain notices | None identified | PyPI |
 | langsmith | 0.10.10 | MIT | reviewed | Retain notices | None identified | PyPI |
@@ -98,6 +100,7 @@ locked distribution without contacting the network.
 | pydantic | 2.13.4 | MIT | reviewed | Retain notices | None identified | PyPI |
 | pydantic-core | 2.46.4 | MIT | reviewed | Retain notices | None identified | PyPI |
 | pycparser | 3.0 | BSD-3-Clause | reviewed | Retain supplied license | None supplied | PyPI |
+| sqlite-vec | 0.1.9 | MIT OR Apache-2.0 | reviewed | Retain supplied licenses | None supplied | PyPI |
 | pygments | 2.20.0 | BSD-2-Clause | reviewed | Retain notices | None identified | PyPI |
 | pytest | 9.1.1 | MIT | reviewed | Retain notices | None identified | PyPI |
 | pyyaml | 6.0.3 | MIT | reviewed | Retain notices | None identified | PyPI |
