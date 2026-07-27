@@ -57,6 +57,7 @@ type metadataStore interface {
 	DeleteAccount(context.Context, state.Binding) error
 	DeleteMetadata(context.Context, state.Binding, state.Kind) error
 	WithSessionTransaction(context.Context, state.Binding, state.SessionTransaction) error
+	WithSessionLifecycle(context.Context, state.Binding, state.SessionLifecycle) error
 }
 
 type Options struct {
@@ -181,6 +182,12 @@ func New(options Options) (*Manager, error) {
 	client.Transport = limiter
 	m := &Manager{options: options, client: &client, attempts: make(map[string]attempt), limits: limiter}
 	if err := m.discover(context.Background()); err != nil {
+		return nil, err
+	}
+	binding := state.Binding{Tenant: options.Tenant, Account: options.Account}
+	if err := m.options.Metadata.WithSessionLifecycle(context.Background(), binding, func() error {
+		return m.recoverSessionJournal(context.Background(), binding)
+	}); err != nil {
 		return nil, err
 	}
 	return m, nil
@@ -439,8 +446,15 @@ func hardenedTransport() *http.Transport {
 	transport.MaxIdleConns = 16
 	transport.MaxIdleConnsPerHost = 4
 	transport.MaxConnsPerHost = 8
+	transport.MaxResponseHeaderBytes = 64 << 10
 	transport.ResponseHeaderTimeout = 10 * time.Second
 	transport.TLSHandshakeTimeout = 10 * time.Second
+	if transport.TLSClientConfig == nil {
+		transport.TLSClientConfig = &tls.Config{MinVersion: tls.VersionTLS12}
+	} else {
+		transport.TLSClientConfig = transport.TLSClientConfig.Clone()
+		transport.TLSClientConfig.MinVersion = tls.VersionTLS12
+	}
 	return transport
 }
 

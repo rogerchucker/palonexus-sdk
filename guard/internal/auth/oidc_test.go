@@ -1,6 +1,7 @@
 package auth
 
 import (
+	"bytes"
 	"context"
 	"crypto"
 	"crypto/rand"
@@ -17,6 +18,8 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"net/url"
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -46,7 +49,8 @@ type providerFixture struct {
 	jwksStatus      atomic.Int32
 	mutateClaims    func(map[string]any)
 	signingAlg      string
-	revokeBlock     func()
+	revokeBlock     func(int)
+	revokeCalls     atomic.Int32
 	refreshBlock    func()
 }
 
@@ -95,6 +99,7 @@ func newProvider(t *testing.T) *providerFixture {
 			return
 		}
 		refreshing := r.Form.Get("grant_type") == "refresh_token"
+		nonce, _ := p.nonce.Load().(string)
 		if refreshing {
 			p.refreshCount.Add(1)
 			if p.refreshBlock != nil {
@@ -108,7 +113,6 @@ func newProvider(t *testing.T) *providerFixture {
 				return
 			}
 		}
-		nonce, _ := p.nonce.Load().(string)
 		now := time.Now()
 		claims := map[string]any{
 			"iss": p.server.URL, "aud": p.clientID, "sub": "subject",
@@ -128,8 +132,9 @@ func newProvider(t *testing.T) *providerFixture {
 		})
 	})
 	mux.HandleFunc("/revoke", func(w http.ResponseWriter, r *http.Request) {
+		call := int(p.revokeCalls.Add(1))
 		if p.revokeBlock != nil {
-			p.revokeBlock()
+			p.revokeBlock(call)
 		}
 		_ = r.ParseForm()
 		p.mu.Lock()
@@ -687,6 +692,17 @@ func TestSecureTransportEnforcesTLS12FloorAndPreservesTLS13(t *testing.T) {
 	}
 }
 
+func TestDefaultHardenedTransportHasExplicitTLSAndHeaderBounds(t *testing.T) {
+	transport := hardenedTransport()
+	if transport.TLSClientConfig == nil ||
+		transport.TLSClientConfig.MinVersion != tls.VersionTLS12 {
+		t.Fatalf("default transport has no explicit TLS 1.2 floor: %#v", transport.TLSClientConfig)
+	}
+	if transport.MaxResponseHeaderBytes <= 0 || transport.MaxResponseHeaderBytes > 64<<10 {
+		t.Fatalf("default response headers are not tightly bounded: %d", transport.MaxResponseHeaderBytes)
+	}
+}
+
 func TestDiscoveryURLForRootAndPathIssuers(t *testing.T) {
 	cases := map[string]string{
 		"https://issuer.example":         "https://issuer.example/.well-known/openid-configuration",
@@ -882,7 +898,7 @@ func TestHangingRevocationCannotKeepLocalSessionLive(t *testing.T) {
 	p := newProvider(t)
 	defer p.Close()
 	entered, release := make(chan struct{}), make(chan struct{})
-	p.revokeBlock = func() {
+	p.revokeBlock = func(_ int) {
 		select {
 		case <-entered:
 		default:
@@ -927,6 +943,41 @@ func TestHangingRevocationCannotKeepLocalSessionLive(t *testing.T) {
 	}
 }
 
+func TestHangingFirstRevocationDoesNotPreventSecondAttempt(t *testing.T) {
+	p := newProvider(t)
+	defer p.Close()
+	firstEntered, secondEntered, release := make(chan struct{}), make(chan struct{}), make(chan struct{})
+	p.revokeBlock = func(call int) {
+		switch call {
+		case 1:
+			close(firstEntered)
+			<-release
+		case 2:
+			close(secondEntered)
+		}
+	}
+	m := testManager(t, p)
+	done := make(chan error, 1)
+	go func() {
+		done <- m.revoke(context.Background(), credential{RefreshToken: "refresh", AccessToken: "access"})
+	}()
+	select {
+	case <-firstEntered:
+	case <-time.After(time.Second):
+		t.Fatal("first revocation did not start")
+	}
+	select {
+	case <-secondEntered:
+	case <-time.After(2 * time.Second):
+		close(release)
+		t.Fatal("hanging first revocation prevented independent second attempt")
+	}
+	close(release)
+	if err := <-done; !errors.Is(err, ErrRevocation) {
+		t.Fatalf("timed-out first revocation was not aggregated: %v", err)
+	}
+}
+
 func TestLogoutStateLockFailureStillDeletesCredentialAndReportsUncertainInvalidation(t *testing.T) {
 	p := newProvider(t)
 	defer p.Close()
@@ -941,7 +992,7 @@ func TestLogoutStateLockFailureStillDeletesCredentialAndReportsUncertainInvalida
 		t.Fatal(err)
 	}
 	session := loginForTest(t, m, p)
-	metadata.failBefore.Store(true)
+	metadata.failDeleteMetadata.Store(true)
 	err = m.Logout(context.Background(), session.ID)
 	if !errors.Is(err, ErrPartial) || !errors.Is(err, ErrCommitIndeterminate) {
 		t.Fatalf("lock failure did not report uncertain invalidation: %v", err)
@@ -972,6 +1023,25 @@ func TestLogoutCorruptCredentialFailsRevocationButStillRemovesLocalSession(t *te
 	if _, err := m.options.Credentials.Get(context.Background(),
 		credentialKey("tenant", "account", session.ID)); !errors.Is(err, keystore.ErrNotFound) {
 		t.Fatalf("corrupt credential survived logout: %v", err)
+	}
+}
+
+func TestLogoutMatchingSessionWithMissingCredentialReportsRevocationUncertainty(t *testing.T) {
+	p := newProvider(t)
+	defer p.Close()
+	m := testManager(t, p)
+	session := loginForTest(t, m, p)
+	if err := m.options.Credentials.Delete(context.Background(),
+		credentialKey("tenant", "account", session.ID)); err != nil {
+		t.Fatal(err)
+	}
+	err := m.Logout(context.Background(), session.ID)
+	if !errors.Is(err, ErrPartial) || !errors.Is(err, ErrRevocation) {
+		t.Fatalf("matching session with missing credential was reported as stale: %v", err)
+	}
+	if _, err := m.options.Metadata.GetMetadata(context.Background(),
+		state.Binding{Tenant: "tenant", Account: "account"}, state.KindSession); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("matching missing credential prevented local invalidation: %v", err)
 	}
 }
 
@@ -1015,12 +1085,28 @@ func TestRefreshCommitFailureTombstonesWithoutRestoringConsumedToken(t *testing.
 		t.Fatalf("refresh commit failure was not indeterminate: %v", err)
 	}
 	current, err := metadata.GetMetadata(context.Background(), state.Binding{}, state.KindSession)
-	if err != nil || !current.Tombstoned {
+	if err != nil || !current.Tombstoned || current.PendingSessionID == "" ||
+		current.PreviousSessionID != session.ID {
 		t.Fatalf("failed refresh was not tombstoned: %#v, %v", current, err)
 	}
 	if _, err := credentials.Get(context.Background(),
 		credentialKey("tenant", "account", session.ID)); !errors.Is(err, keystore.ErrNotFound) {
 		t.Fatalf("consumed refresh token was restored: %v", err)
+	}
+	if _, err := credentials.Get(context.Background(),
+		credentialKey("tenant", "account", current.PendingSessionID)); err != nil {
+		t.Fatalf("pending credential was not journaled across activation crash boundary: %v", err)
+	}
+	if err := metadata.WithSessionLifecycle(context.Background(),
+		state.Binding{Tenant: "tenant", Account: "account"}, func() error {
+			return m.recoverSessionJournal(context.Background(),
+				state.Binding{Tenant: "tenant", Account: "account"})
+		}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := credentials.Get(context.Background(),
+		credentialKey("tenant", "account", current.PendingSessionID)); !errors.Is(err, keystore.ErrNotFound) {
+		t.Fatalf("recovery retained pending credential after activation crash: %v", err)
 	}
 }
 
@@ -1050,6 +1136,154 @@ func TestRefreshCleanupFailuresAreTypedAndReservationRemainsFailClosed(t *testin
 	}
 	if _, retryErr := m.Refresh(context.Background(), session.ID); retryErr == nil {
 		t.Fatalf("uncertain refresh reservation became usable: %v", retryErr)
+	}
+}
+
+func TestSessionJournalRecoveryAfterCrashReopen(t *testing.T) {
+	if os.Getenv("PALONEXUS_CRASH_RECOVERY_HELPER") == "1" {
+		base := os.Getenv("PALONEXUS_CRASH_RECOVERY_ROOT")
+		metadata, err := state.New(filepath.Join(base, "state"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer metadata.Close()
+		backend, err := keystore.NewEncryptedFileBackend(keystore.EncryptedFileOptions{
+			Root: filepath.Join(base, "credentials"), Key: bytes.Repeat([]byte{9}, 32), EnableForTesting: true,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		credentials, err := keystore.New("palonexus-test", backend)
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer credentials.Close()
+		binding := state.Binding{Tenant: "tenant", Account: "account"}
+		manager := &Manager{options: Options{
+			Tenant: "tenant", Account: "account", Metadata: metadata, Credentials: credentials,
+		}}
+		if err := metadata.WithSessionLifecycle(context.Background(), binding, func() error {
+			return manager.recoverSessionJournal(context.Background(), binding)
+		}); err != nil {
+			t.Fatal(err)
+		}
+		return
+	}
+	base, err := filepath.EvalSymlinks(t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	stateRoot := filepath.Join(base, "state")
+	credentialRoot := filepath.Join(base, "credentials")
+	keyMaterial := bytes.Repeat([]byte{9}, 32)
+	binding := state.Binding{Tenant: "tenant", Account: "account"}
+	oldID := "session_00000000000000000000000000"
+	pendingID := "session_00000000000000000000000001"
+
+	metadata, err := state.New(stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	backend, err := keystore.NewEncryptedFileBackend(keystore.EncryptedFileOptions{
+		Root: credentialRoot, Key: keyMaterial, EnableForTesting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	credentials, err := keystore.New("palonexus-test", backend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{oldID, pendingID} {
+		if err := credentials.Put(context.Background(), credentialKey("tenant", "account", id), []byte("crash-secret")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	journal := state.Metadata{
+		Kind: state.KindSession, SessionID: oldID, PendingSessionID: pendingID,
+		PreviousSessionID: oldID, SessionOperation: "refresh", Generation: 2,
+		Tombstoned: true, OperationID: "operation_00000000000000000000000000",
+	}
+	if err := metadata.PutMetadata(context.Background(), binding, journal); err != nil {
+		t.Fatal(err)
+	}
+	if err := metadata.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if err := credentials.Close(); err != nil {
+		t.Fatal(err)
+	}
+	command := exec.Command(os.Args[0], "-test.run=^TestSessionJournalRecoveryAfterCrashReopen$")
+	command.Env = append(os.Environ(),
+		"PALONEXUS_CRASH_RECOVERY_HELPER=1",
+		"PALONEXUS_CRASH_RECOVERY_ROOT="+base,
+	)
+	if output, err := command.CombinedOutput(); err != nil {
+		t.Fatalf("recovery subprocess failed: %v\n%s", err, output)
+	}
+
+	reopenedMetadata, err := state.New(stateRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopenedMetadata.Close()
+	reopenedBackend, err := keystore.NewEncryptedFileBackend(keystore.EncryptedFileOptions{
+		Root: credentialRoot, Key: keyMaterial, EnableForTesting: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	reopenedCredentials, err := keystore.New("palonexus-test", reopenedBackend)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer reopenedCredentials.Close()
+	if _, err := reopenedMetadata.GetMetadata(context.Background(), binding, state.KindSession); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("crash journal survived reopen recovery: %v", err)
+	}
+	for _, id := range []string{oldID, pendingID} {
+		if _, err := reopenedCredentials.Get(context.Background(),
+			credentialKey("tenant", "account", id)); !errors.Is(err, keystore.ErrNotFound) {
+			t.Fatalf("journal-owned credential %s survived crash recovery: %v", id, err)
+		}
+	}
+}
+
+func TestStaleJournalAbortNeverDeletesSupersedingSession(t *testing.T) {
+	metadata := newMemoryMetadata()
+	credentials := mustStore(t)
+	manager := &Manager{options: Options{
+		Tenant: "tenant", Account: "account", Metadata: metadata, Credentials: credentials,
+	}}
+	binding := state.Binding{Tenant: "tenant", Account: "account"}
+	stale := state.Metadata{
+		Kind: state.KindSession, SessionID: "session_00000000000000000000000000",
+		PendingSessionID:  "session_00000000000000000000000001",
+		PreviousSessionID: "session_00000000000000000000000000",
+		SessionOperation:  "refresh", Generation: 2, Tombstoned: true,
+		OperationID: "operation_00000000000000000000000000",
+	}
+	superseding := state.Metadata{
+		Kind: state.KindSession, SessionID: "session_00000000000000000000000002",
+		Generation: 3, ExpiresAt: time.Now().Add(time.Hour),
+	}
+	if err := metadata.PutMetadata(context.Background(), binding, superseding); err != nil {
+		t.Fatal(err)
+	}
+	if err := credentials.Put(context.Background(),
+		credentialKey("tenant", "account", superseding.SessionID), []byte("current-secret")); err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.abortSessionJournal(context.Background(), binding, stale, ErrCommitIndeterminate); !errors.Is(err, ErrCommitIndeterminate) {
+		t.Fatalf("stale abort returned unexpected error: %v", err)
+	}
+	current, err := metadata.GetMetadata(context.Background(), binding, state.KindSession)
+	if err != nil || current.SessionID != superseding.SessionID {
+		t.Fatalf("stale abort changed superseding metadata: %#v, %v", current, err)
+	}
+	if _, err := credentials.Get(context.Background(),
+		credentialKey("tenant", "account", superseding.SessionID)); err != nil {
+		t.Fatalf("stale abort deleted superseding credential: %v", err)
 	}
 }
 
@@ -1157,24 +1391,54 @@ func TestSupersedingLoginSurvivesInFlightRefreshCleanup(t *testing.T) {
 	case <-time.After(time.Second):
 		t.Fatal("refresh did not reach provider")
 	}
-	second := loginForTest(t, m, p)
-	if _, err := m.options.Credentials.Get(context.Background(),
-		credentialKey("tenant", "account", first.ID)); !errors.Is(err, keystore.ErrNotFound) {
-		t.Fatalf("superseding login left reserved predecessor credential while refresh was hung: %v", err)
+	type loginResult struct {
+		session Session
+		err     error
 	}
-	if _, err := m.options.Credentials.Get(context.Background(),
-		credentialKey("tenant", "account", second.ID)); err != nil {
-		t.Fatalf("superseding login credential was not committed: %v", err)
+	loginDone := make(chan loginResult, 1)
+	go func() {
+		request, beginErr := m.Begin(context.Background())
+		if beginErr != nil {
+			loginDone <- loginResult{err: beginErr}
+			return
+		}
+		p.nonce.Store(request.nonce)
+		callbackURL, _ := url.Parse(request.URL)
+		base := m.client.Transport
+		if previous, ok := base.(challengeTransport); ok {
+			base = previous.base
+		}
+		m.client.Transport = challengeTransport{base: base, challenge: callbackURL.Query().Get("code_challenge")}
+		session, completeErr := m.Complete(context.Background(), Callback{
+			State: callbackURL.Query().Get("state"), Code: "valid-code",
+		})
+		loginDone <- loginResult{session: session, err: completeErr}
+	}()
+	select {
+	case result := <-loginDone:
+		t.Fatalf("same-account login bypassed the in-flight lifecycle: %#v (%v)", result, result.err)
+	case <-time.After(100 * time.Millisecond):
 	}
-	p.mutateClaims = func(claims map[string]any) { claims["nonce"] = firstRequest.nonce }
 	close(release)
-	if err := <-done; !errors.Is(err, ErrCommitIndeterminate) {
-		t.Fatalf("superseded refresh returned unexpected result: %v", err)
+	if err := <-done; err != nil {
+		t.Fatalf("serialized refresh failed: %v", err)
+	}
+	second := <-loginDone
+	if second.err != nil {
+		t.Fatalf("queued replacement login failed: %v", second.err)
 	}
 	current, err := m.options.Metadata.GetMetadata(context.Background(),
 		state.Binding{Tenant: "tenant", Account: "account"}, state.KindSession)
-	if err != nil || current.SessionID != second.ID || current.Tombstoned {
+	if err != nil || current.SessionID != second.session.ID || current.Tombstoned {
 		t.Fatalf("refresh cleanup removed superseding login: %#v, %v", current, err)
+	}
+	if _, err := m.options.Credentials.Get(context.Background(),
+		credentialKey("tenant", "account", first.ID)); !errors.Is(err, keystore.ErrNotFound) {
+		t.Fatalf("replacement left original credential: %v", err)
+	}
+	if _, err := m.options.Credentials.Get(context.Background(),
+		credentialKey("tenant", "account", second.session.ID)); err != nil {
+		t.Fatalf("replacement credential was not committed: %v", err)
 	}
 }
 
@@ -1218,6 +1482,29 @@ func TestInitialMetadataCommitReconcilesPostWriteAndCleansPreWrite(t *testing.T)
 			t.Fatal("reconciled committed login returned no session")
 		}
 	})
+	t.Run("post-write replacement deletes predecessor", func(t *testing.T) {
+		metadata := &faultMetadata{memoryMetadata: newMemoryMetadata()}
+		credentials := mustStore(t)
+		m, err := newForTesting(Options{
+			Issuer: p.server.URL, ClientID: p.clientID, Tenant: "tenant", Account: "replace",
+			RedirectURI: "http://127.0.0.1:49152/callback", HTTPClient: p.server.Client(),
+			Credentials: credentials, Metadata: metadata, Algorithms: []string{"RS256"},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		first := loginForTest(t, m, p)
+		metadata.failAfterCall.Store(metadata.calls.Load() + 2)
+		second := loginForTest(t, m, p)
+		if _, err := credentials.Get(context.Background(),
+			credentialKey("tenant", "replace", first.ID)); !errors.Is(err, keystore.ErrNotFound) {
+			t.Fatalf("reconciled replacement retained predecessor: %v", err)
+		}
+		if _, err := credentials.Get(context.Background(),
+			credentialKey("tenant", "replace", second.ID)); err != nil {
+			t.Fatalf("reconciled replacement lost current credential: %v", err)
+		}
+	})
 	t.Run("pre-write leaves no credential", func(t *testing.T) {
 		metadata := &faultMetadata{memoryMetadata: newMemoryMetadata()}
 		metadata.failBeforeCall.Store(1)
@@ -1245,20 +1532,23 @@ func TestInitialMetadataCommitReconcilesPostWriteAndCleansPreWrite(t *testing.T)
 		if metadata.memoryMetadata.ok {
 			t.Fatal("pre-write failure unexpectedly installed session metadata")
 		}
-		if _, err := credentials.Get(context.Background(), credentials.lastPut); !errors.Is(err, keystore.ErrNotFound) {
-			t.Fatalf("pre-write failure orphaned credential: %v", err)
+		if credentials.lastPut.Tenant != "" {
+			if _, getErr := credentials.Get(context.Background(), credentials.lastPut); !errors.Is(getErr, keystore.ErrNotFound) {
+				t.Fatalf("pre-write failure orphaned credential: %v", getErr)
+			}
 		}
 	})
 }
 
 type faultMetadata struct {
 	*memoryMetadata
-	failAfter      atomic.Bool
-	failBefore     atomic.Bool
-	calls          atomic.Int32
-	failAfterCall  atomic.Int32
-	failBeforeCall atomic.Int32
-	failBeforeFrom atomic.Int32
+	failAfter          atomic.Bool
+	failBefore         atomic.Bool
+	calls              atomic.Int32
+	failAfterCall      atomic.Int32
+	failBeforeCall     atomic.Int32
+	failBeforeFrom     atomic.Int32
+	failDeleteMetadata atomic.Bool
 }
 
 type faultCredentials struct {
@@ -1300,6 +1590,13 @@ func (m *faultMetadata) WithSessionTransaction(ctx context.Context, binding stat
 	return err
 }
 
+func (m *faultMetadata) DeleteMetadata(ctx context.Context, binding state.Binding, kind state.Kind) error {
+	if m.failDeleteMetadata.CompareAndSwap(true, false) {
+		return state.ErrUnsafePath
+	}
+	return m.memoryMetadata.DeleteMetadata(ctx, binding, kind)
+}
+
 type roundTripFunc func(*http.Request) (*http.Response, error)
 
 func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
@@ -1319,9 +1616,10 @@ type challengeTransport struct {
 }
 
 type memoryMetadata struct {
-	mu    sync.Mutex
-	value state.Metadata
-	ok    bool
+	mu          sync.Mutex
+	lifecycleMu sync.Mutex
+	value       state.Metadata
+	ok          bool
 }
 
 func newMemoryMetadata() *memoryMetadata { return &memoryMetadata{} }
@@ -1364,6 +1662,14 @@ func (m *memoryMetadata) WithSessionTransaction(_ context.Context, _ state.Bindi
 	}
 	m.value, m.ok = *next, true
 	return nil
+}
+func (m *memoryMetadata) WithSessionLifecycle(ctx context.Context, _ state.Binding, lifecycle state.SessionLifecycle) error {
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	m.lifecycleMu.Lock()
+	defer m.lifecycleMu.Unlock()
+	return lifecycle()
 }
 
 func (t challengeTransport) RoundTrip(r *http.Request) (*http.Response, error) {

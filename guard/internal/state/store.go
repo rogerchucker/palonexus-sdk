@@ -44,18 +44,22 @@ type Binding struct {
 // Metadata is deliberately closed and cannot carry tokens, arbitrary JSON,
 // raw tool input, commands, URLs, headers, or file contents.
 type Metadata struct {
-	Kind             Kind      `json:"kind"`
-	RouteID          string    `json:"routeId,omitempty"`
-	SessionID        string    `json:"sessionId,omitempty"`
-	ReconciliationID string    `json:"reconciliationId,omitempty"`
-	ReferenceHash    string    `json:"referenceHash,omitempty"`
-	ExpiresAt        time.Time `json:"expiresAt,omitempty"`
-	Generation       uint64    `json:"generation,omitempty"`
-	Tombstoned       bool      `json:"tombstoned,omitempty"`
-	OperationID      string    `json:"operationId,omitempty"`
+	Kind              Kind      `json:"kind"`
+	RouteID           string    `json:"routeId,omitempty"`
+	SessionID         string    `json:"sessionId,omitempty"`
+	ReconciliationID  string    `json:"reconciliationId,omitempty"`
+	ReferenceHash     string    `json:"referenceHash,omitempty"`
+	ExpiresAt         time.Time `json:"expiresAt,omitempty"`
+	Generation        uint64    `json:"generation,omitempty"`
+	Tombstoned        bool      `json:"tombstoned,omitempty"`
+	OperationID       string    `json:"operationId,omitempty"`
+	PendingSessionID  string    `json:"pendingSessionId,omitempty"`
+	PreviousSessionID string    `json:"previousSessionId,omitempty"`
+	SessionOperation  string    `json:"sessionOperation,omitempty"`
 }
 
 type SessionTransaction func(current Metadata, found bool) (next *Metadata, err error)
+type SessionLifecycle func() error
 
 type storeImpl interface {
 	PutMetadata(context.Context, Binding, Metadata) error
@@ -63,6 +67,7 @@ type storeImpl interface {
 	DeleteAccount(context.Context, Binding) error
 	DeleteMetadata(context.Context, Binding, Kind) error
 	WithSessionTransaction(context.Context, Binding, SessionTransaction) error
+	WithSessionLifecycle(context.Context, Binding, SessionLifecycle) error
 	Close() error
 	recordName(Binding, Kind) (string, error)
 }
@@ -119,6 +124,19 @@ func (s *Store) WithSessionTransaction(ctx context.Context, binding Binding, tra
 	return s.impl.WithSessionTransaction(ctx, binding, transaction)
 }
 
+// WithSessionLifecycle serializes the secret-store side of one account's
+// session transition across processes without holding the root metadata lock.
+// Metadata methods may safely be called by lifecycle.
+func (s *Store) WithSessionLifecycle(ctx context.Context, binding Binding, lifecycle SessionLifecycle) error {
+	if s == nil || s.impl == nil {
+		return ErrUnsupported
+	}
+	if lifecycle == nil {
+		return ErrUnsafePayload
+	}
+	return s.impl.WithSessionLifecycle(ctx, binding, lifecycle)
+}
+
 func (s *Store) Close() error {
 	if s == nil || s.impl == nil {
 		return ErrUnsupported
@@ -143,31 +161,46 @@ var (
 
 func validateMetadata(metadata Metadata) error {
 	if containsSecretIndicator(metadata.RouteID) || containsSecretIndicator(metadata.SessionID) ||
-		containsSecretIndicator(metadata.ReconciliationID) || containsSecretIndicator(metadata.ReferenceHash) {
+		containsSecretIndicator(metadata.ReconciliationID) || containsSecretIndicator(metadata.ReferenceHash) ||
+		containsSecretIndicator(metadata.PendingSessionID) || containsSecretIndicator(metadata.PreviousSessionID) {
 		return ErrUnsafePayload
 	}
 	switch metadata.Kind {
 	case KindRouting:
 		if len(metadata.RouteID) > 48 || !routeIDPattern.MatchString(metadata.RouteID) || metadata.SessionID != "" ||
 			metadata.ReconciliationID != "" || metadata.ReferenceHash != "" || !metadata.ExpiresAt.IsZero() ||
-			metadata.OperationID != "" {
+			metadata.OperationID != "" || metadata.PendingSessionID != "" ||
+			metadata.PreviousSessionID != "" || metadata.SessionOperation != "" {
 			return ErrUnsafePayload
 		}
 	case KindSession:
 		if !sessionPattern.MatchString(metadata.SessionID) || metadata.RouteID != "" ||
 			metadata.ReconciliationID != "" || metadata.ReferenceHash != "" ||
 			(!metadata.Tombstoned && metadata.ExpiresAt.IsZero()) ||
-			(!metadata.Tombstoned && metadata.OperationID != "") ||
+			(!metadata.Tombstoned && (metadata.OperationID != "" || metadata.PendingSessionID != "" ||
+				metadata.PreviousSessionID != "" || metadata.SessionOperation != "")) ||
 			(metadata.Tombstoned && metadata.OperationID != "" && !operationPattern.MatchString(metadata.OperationID)) {
 			return ErrUnsafePayload
 		}
 		if metadata.Tombstoned && (metadata.Generation == 0 || !metadata.ExpiresAt.IsZero()) {
 			return ErrUnsafePayload
 		}
+		journalFields := metadata.PendingSessionID != "" || metadata.PreviousSessionID != "" ||
+			metadata.SessionOperation != ""
+		if metadata.Tombstoned && journalFields {
+			if !operationPattern.MatchString(metadata.OperationID) ||
+				!sessionPattern.MatchString(metadata.PendingSessionID) ||
+				(metadata.PreviousSessionID != "" && !sessionPattern.MatchString(metadata.PreviousSessionID)) ||
+				(metadata.SessionOperation != "login" && metadata.SessionOperation != "refresh") {
+				return ErrUnsafePayload
+			}
+		}
 	case KindReconciliation:
 		if !reconPattern.MatchString(metadata.ReconciliationID) || !hashPattern.MatchString(metadata.ReferenceHash) ||
 			metadata.RouteID != "" || metadata.SessionID != "" || !metadata.ExpiresAt.IsZero() ||
-			metadata.Generation != 0 || metadata.Tombstoned || metadata.OperationID != "" {
+			metadata.Generation != 0 || metadata.Tombstoned || metadata.OperationID != "" ||
+			metadata.PendingSessionID != "" || metadata.PreviousSessionID != "" ||
+			metadata.SessionOperation != "" {
 			return ErrUnsafePayload
 		}
 	default:

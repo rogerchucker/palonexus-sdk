@@ -28,6 +28,7 @@ const maxDocumentBytes = 16 * 1024
 var (
 	recordNamePattern = regexp.MustCompile(`^state-[0-9a-f]{64}\.json$`)
 	tempNamePattern   = regexp.MustCompile(`^\.state-tmp-[0-9a-f]{32}$`)
+	lifecyclePattern  = regexp.MustCompile(`^\.session-lifecycle-[0-9a-f]{64}\.lock$`)
 )
 
 type wireEnvelope struct {
@@ -243,6 +244,67 @@ func (s *unixStore) WithSessionTransaction(ctx context.Context, binding Binding,
 		}
 		return s.atomicWrite(ctx, name, wire)
 	})
+}
+
+func (s *unixStore) WithSessionLifecycle(ctx context.Context, binding Binding, lifecycle SessionLifecycle) error {
+	if !validBinding(binding) || lifecycle == nil {
+		return ErrInvalidBinding
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-s.gate:
+	}
+	s.mu.Lock()
+	if s.closed {
+		s.mu.Unlock()
+		s.gate <- struct{}{}
+		return ErrUnsafePath
+	}
+	rootFD, err := unix.Dup(s.rootFD)
+	s.mu.Unlock()
+	s.gate <- struct{}{}
+	if err != nil {
+		return ErrUnsafePath
+	}
+	defer unix.Close(rootFD)
+	unix.CloseOnExec(rootFD)
+	if err := validateDirectoryFD(rootFD); err != nil {
+		return err
+	}
+	record, _ := s.recordName(binding, KindSession)
+	name := ".session-lifecycle-" + strings.TrimSuffix(strings.TrimPrefix(record, "state-"), ".json") + ".lock"
+	if !lifecyclePattern.MatchString(name) {
+		return ErrUnsafePath
+	}
+	lockFD, err := unix.Openat(rootFD, name,
+		unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0o600)
+	if err != nil {
+		return ErrUnsafePath
+	}
+	defer unix.Close(lockFD)
+	if err := validateFileFD(lockFD); err != nil {
+		return err
+	}
+	for {
+		err = unix.Flock(lockFD, unix.LOCK_EX|unix.LOCK_NB)
+		if err == nil {
+			break
+		}
+		if !errors.Is(err, unix.EAGAIN) && !errors.Is(err, unix.EWOULDBLOCK) {
+			return ErrUnsafePath
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(5 * time.Millisecond):
+		}
+	}
+	defer unix.Flock(lockFD, unix.LOCK_UN) //nolint:errcheck
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	return lifecycle()
 }
 
 func (s *unixStore) deleteNamesLocked(ctx context.Context, names []string) error {

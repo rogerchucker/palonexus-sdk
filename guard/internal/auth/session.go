@@ -127,45 +127,32 @@ func (m *Manager) Complete(ctx context.Context, callback Callback) (Session, err
 	}
 	stored := credential{SessionID: sessionID, Subject: claims.Subject, Nonce: selected.nonce, AccessToken: token.AccessToken, RefreshToken: refresh, ExpiresAt: expires}
 	result := Session{ID: sessionID, Subject: claims.Subject, ExpiresAt: expires}
-	if err := m.putCredential(ctx, stored); err != nil {
-		if cleanupErr := m.options.Credentials.Delete(context.WithoutCancel(ctx),
-			credentialKey(m.options.Tenant, m.options.Account, sessionID)); cleanupErr != nil {
-			return Session{}, &PartialError{LocalCleanupFailed: true, CommitUncertain: true}
-		}
-		return Session{}, ErrStorage
-	}
-	var previous state.Metadata
-	var hadPrevious bool
-	var generation uint64
 	binding := state.Binding{Tenant: m.options.Tenant, Account: m.options.Account}
-	err = m.options.Metadata.WithSessionTransaction(ctx, binding, func(current state.Metadata, found bool) (*state.Metadata, error) {
-		previous, hadPrevious = current, found
-		generation = 1
-		if found {
-			generation = current.Generation + 1
+	err = m.options.Metadata.WithSessionLifecycle(ctx, binding, func() error {
+		if err := m.recoverSessionJournal(ctx, binding); err != nil {
+			return err
 		}
-		next := state.Metadata{Kind: state.KindSession, SessionID: sessionID, Generation: generation, ExpiresAt: expires}
-		return &next, nil
+		journal, err := m.beginSessionJournal(ctx, binding, "login", sessionID)
+		if err != nil {
+			return err
+		}
+		if err := m.putCredential(ctx, stored); err != nil {
+			return m.abortSessionJournal(ctx, binding, journal, ErrStorage)
+		}
+		if err := m.deleteJournalPredecessors(ctx, journal); err != nil {
+			return err
+		}
+		active := state.Metadata{
+			Kind: state.KindSession, SessionID: sessionID, Generation: journal.Generation,
+			ExpiresAt: expires,
+		}
+		if err := m.activateSessionJournal(ctx, binding, journal, active); err != nil {
+			return err
+		}
+		return nil
 	})
 	if err != nil {
-		if errors.Is(err, state.ErrDurabilityIndeterminate) {
-			current, getErr := m.options.Metadata.GetMetadata(context.WithoutCancel(ctx), binding, state.KindSession)
-			if getErr == nil && !current.Tombstoned && current.SessionID == sessionID &&
-				current.Generation == generation {
-				return result, nil
-			}
-		}
-		cleanupErr := m.options.Credentials.Delete(context.WithoutCancel(ctx), credentialKey(m.options.Tenant, m.options.Account, sessionID))
-		if cleanupErr != nil {
-			return Session{}, &PartialError{LocalCleanupFailed: true, CommitUncertain: true}
-		}
-		return Session{}, ErrCommitIndeterminate
-	}
-	if hadPrevious && previous.SessionID != sessionID {
-		if err := m.options.Credentials.Delete(context.WithoutCancel(ctx),
-			credentialKey(m.options.Tenant, m.options.Account, previous.SessionID)); err != nil {
-			return result, &PartialError{LocalCleanupFailed: true}
-		}
+		return Session{}, err
 	}
 	return result, nil
 }
@@ -237,78 +224,53 @@ func (m *Manager) putCredential(ctx context.Context, value credential) error {
 
 func (m *Manager) Refresh(ctx context.Context, sessionID string) (Session, error) {
 	binding := state.Binding{Tenant: m.options.Tenant, Account: m.options.Account}
-	value, err := m.loadCredential(ctx, sessionID)
+	var result Session
+	err := m.options.Metadata.WithSessionLifecycle(ctx, binding, func() error {
+		if err := m.recoverSessionJournal(ctx, binding); err != nil {
+			return err
+		}
+		current, err := m.options.Metadata.GetMetadata(ctx, binding, state.KindSession)
+		if err != nil || current.Tombstoned || current.SessionID != sessionID {
+			return ErrNoSession
+		}
+		value, err := m.loadCredential(ctx, sessionID)
+		if err != nil {
+			return err
+		}
+		newID, err := newSessionID()
+		if err != nil {
+			return ErrStorage
+		}
+		reservation, err := m.beginSessionJournal(ctx, binding, "refresh", newID)
+		if err != nil {
+			return err
+		}
+		token, err := m.exchangeRefresh(ctx, value)
+		if err != nil {
+			return m.abortSessionJournal(context.WithoutCancel(ctx), binding, reservation, err)
+		}
+		nextCredential := credential{
+			SessionID: newID, Subject: value.Subject, Nonce: value.Nonce, AccessToken: token.AccessToken,
+			RefreshToken: token.RefreshToken, ExpiresAt: token.Expiry, RefreshedAt: m.options.Now(),
+		}
+		if err := m.putCredential(ctx, nextCredential); err != nil {
+			return m.abortSessionJournal(ctx, binding, reservation, ErrCommitIndeterminate)
+		}
+		if err := m.deleteJournalPredecessors(ctx, reservation); err != nil {
+			return err
+		}
+		active := state.Metadata{
+			Kind: state.KindSession, SessionID: newID, Generation: reservation.Generation,
+			ExpiresAt: token.Expiry,
+		}
+		if err := m.activateSessionJournal(ctx, binding, reservation, active); err != nil {
+			return err
+		}
+		result = Session{ID: newID, Subject: value.Subject, ExpiresAt: token.Expiry}
+		return nil
+	})
 	if err != nil {
 		return Session{}, err
-	}
-	operationID, err := newOperationID()
-	if err != nil {
-		return Session{}, ErrStorage
-	}
-	var reservation state.Metadata
-	err = m.options.Metadata.WithSessionTransaction(ctx, binding, func(current state.Metadata, found bool) (*state.Metadata, error) {
-		if !found || current.Tombstoned {
-			return nil, ErrNoSession
-		}
-		if current.SessionID != sessionID {
-			return nil, ErrNoSession
-		}
-		reservation = state.Metadata{
-			Kind: state.KindSession, SessionID: sessionID, Generation: current.Generation + 1,
-			Tombstoned: true, OperationID: operationID,
-		}
-		return &reservation, nil
-	})
-	if err != nil {
-		if errors.Is(err, state.ErrDurabilityIndeterminate) {
-			current, getErr := m.options.Metadata.GetMetadata(context.WithoutCancel(ctx), binding, state.KindSession)
-			if getErr == nil && sameReservation(current, reservation) {
-				err = nil
-			}
-		}
-		if err != nil {
-			return Session{}, mapStateError(err)
-		}
-	}
-
-	token, err := m.exchangeRefresh(ctx, value)
-	if err != nil {
-		return Session{}, m.cleanupConsumedSession(binding, reservation, "", err)
-	}
-	newID, err := newSessionID()
-	if err != nil {
-		return Session{}, m.cleanupConsumedSession(binding, reservation, "", ErrCommitIndeterminate)
-	}
-	nextCredential := credential{
-		SessionID: newID, Subject: value.Subject, Nonce: value.Nonce, AccessToken: token.AccessToken,
-		RefreshToken: token.RefreshToken, ExpiresAt: token.Expiry, RefreshedAt: m.options.Now(),
-	}
-	if err := m.putCredential(ctx, nextCredential); err != nil {
-		return Session{}, m.cleanupConsumedSession(binding, reservation, newID, ErrCommitIndeterminate)
-	}
-	next := state.Metadata{
-		Kind: state.KindSession, SessionID: newID, Generation: reservation.Generation + 1,
-		ExpiresAt: token.Expiry,
-	}
-	err = m.options.Metadata.WithSessionTransaction(ctx, binding, func(current state.Metadata, found bool) (*state.Metadata, error) {
-		if !found || !sameReservation(current, reservation) {
-			return nil, ErrCommitIndeterminate
-		}
-		return &next, nil
-	})
-	if errors.Is(err, state.ErrDurabilityIndeterminate) {
-		current, getErr := m.options.Metadata.GetMetadata(context.WithoutCancel(ctx), binding, state.KindSession)
-		if getErr == nil && sameActiveSession(current, next) {
-			err = nil
-		}
-	}
-	if err != nil {
-		return Session{}, m.cleanupConsumedSession(binding, reservation, newID, ErrCommitIndeterminate)
-	}
-	result := Session{ID: newID, Subject: value.Subject, ExpiresAt: token.Expiry}
-	if deleteErr := m.options.Credentials.Delete(context.WithoutCancel(ctx),
-		credentialKey(m.options.Tenant, m.options.Account, sessionID)); deleteErr != nil {
-		return result, &PartialError{LocalCleanupFailed: true}
 	}
 	return result, nil
 }
@@ -321,53 +283,173 @@ func newOperationID() (string, error) {
 	return "operation_" + strings.TrimPrefix(id, "session_"), nil
 }
 
+func (m *Manager) beginSessionJournal(
+	ctx context.Context,
+	binding state.Binding,
+	operation string,
+	pendingID string,
+) (state.Metadata, error) {
+	current, getErr := m.options.Metadata.GetMetadata(ctx, binding, state.KindSession)
+	found := getErr == nil
+	if getErr != nil && !errors.Is(getErr, state.ErrNotFound) {
+		return state.Metadata{}, ErrCommitIndeterminate
+	}
+	if found && current.Tombstoned {
+		return state.Metadata{}, ErrCommitIndeterminate
+	}
+	operationID, err := newOperationID()
+	if err != nil {
+		return state.Metadata{}, ErrStorage
+	}
+	sessionID := pendingID
+	previousID := ""
+	generation := uint64(1)
+	if found {
+		sessionID = current.SessionID
+		previousID = current.SessionID
+		generation = current.Generation + 1
+	}
+	journal := state.Metadata{
+		Kind: state.KindSession, SessionID: sessionID, PendingSessionID: pendingID,
+		PreviousSessionID: previousID, SessionOperation: operation,
+		Generation: generation, Tombstoned: true, OperationID: operationID,
+	}
+	err = m.options.Metadata.WithSessionTransaction(ctx, binding, func(actual state.Metadata, actualFound bool) (*state.Metadata, error) {
+		if actualFound != found {
+			return nil, ErrCommitIndeterminate
+		}
+		if found && (!sameActiveSession(actual, current) || actual.ExpiresAt != current.ExpiresAt) {
+			return nil, ErrCommitIndeterminate
+		}
+		return &journal, nil
+	})
+	if errors.Is(err, state.ErrDurabilityIndeterminate) {
+		actual, readErr := m.options.Metadata.GetMetadata(context.WithoutCancel(ctx), binding, state.KindSession)
+		if readErr == nil && sameReservation(actual, journal) {
+			err = nil
+		}
+	}
+	if err != nil {
+		return state.Metadata{}, ErrCommitIndeterminate
+	}
+	return journal, nil
+}
+
+func (m *Manager) deleteJournalPredecessors(ctx context.Context, journal state.Metadata) error {
+	seen := make(map[string]struct{}, 2)
+	for _, id := range []string{journal.PreviousSessionID} {
+		if id == "" || id == journal.PendingSessionID {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		if err := m.options.Credentials.Delete(ctx,
+			credentialKey(m.options.Tenant, m.options.Account, id)); err != nil {
+			return &PartialError{LocalCleanupFailed: true, CommitUncertain: true}
+		}
+	}
+	return nil
+}
+
+func (m *Manager) activateSessionJournal(
+	ctx context.Context,
+	binding state.Binding,
+	journal state.Metadata,
+	active state.Metadata,
+) error {
+	err := m.options.Metadata.WithSessionTransaction(ctx, binding, func(current state.Metadata, found bool) (*state.Metadata, error) {
+		if !found || !sameReservation(current, journal) {
+			return nil, ErrCommitIndeterminate
+		}
+		return &active, nil
+	})
+	if errors.Is(err, state.ErrDurabilityIndeterminate) {
+		current, getErr := m.options.Metadata.GetMetadata(context.WithoutCancel(ctx), binding, state.KindSession)
+		if getErr == nil && sameActiveSession(current, active) && current.ExpiresAt == active.ExpiresAt {
+			return nil
+		}
+	}
+	if err != nil {
+		return &PartialError{CommitUncertain: true, Cause: ErrCommitIndeterminate}
+	}
+	return nil
+}
+
+func (m *Manager) abortSessionJournal(
+	ctx context.Context,
+	binding state.Binding,
+	journal state.Metadata,
+	cause error,
+) error {
+	current, err := m.options.Metadata.GetMetadata(ctx, binding, state.KindSession)
+	if err != nil || !sameReservation(current, journal) {
+		return cause
+	}
+	if err := m.recoverSessionJournal(ctx, binding); err != nil {
+		var partial *PartialError
+		if errors.As(err, &partial) {
+			partial.Cause = cause
+			return partial
+		}
+		return &PartialError{CommitUncertain: true, Cause: cause}
+	}
+	return cause
+}
+
+func (m *Manager) recoverSessionJournal(ctx context.Context, binding state.Binding) error {
+	current, err := m.options.Metadata.GetMetadata(ctx, binding, state.KindSession)
+	if errors.Is(err, state.ErrNotFound) {
+		return nil
+	}
+	if err != nil {
+		return ErrCommitIndeterminate
+	}
+	if !current.Tombstoned {
+		return nil
+	}
+	ids := []string{current.PendingSessionID, current.PreviousSessionID}
+	if current.PendingSessionID == "" {
+		ids = append(ids, current.SessionID)
+	}
+	seen := make(map[string]struct{}, len(ids))
+	partial := &PartialError{}
+	for _, id := range ids {
+		if id == "" {
+			continue
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		if err := m.options.Credentials.Delete(ctx,
+			credentialKey(m.options.Tenant, m.options.Account, id)); err != nil {
+			partial.LocalCleanupFailed = true
+		}
+	}
+	if partial.LocalCleanupFailed {
+		partial.CommitUncertain = true
+		return partial
+	}
+	if err := m.options.Metadata.DeleteMetadata(ctx, binding, state.KindSession); err != nil {
+		return &PartialError{CommitUncertain: true}
+	}
+	return nil
+}
+
 func sameReservation(actual, expected state.Metadata) bool {
 	return actual.Kind == state.KindSession && actual.Tombstoned &&
 		actual.SessionID == expected.SessionID && actual.Generation == expected.Generation &&
-		actual.OperationID == expected.OperationID
+		actual.OperationID == expected.OperationID &&
+		actual.PendingSessionID == expected.PendingSessionID &&
+		actual.PreviousSessionID == expected.PreviousSessionID &&
+		actual.SessionOperation == expected.SessionOperation
 }
 
 func sameActiveSession(actual, expected state.Metadata) bool {
 	return actual.Kind == state.KindSession && !actual.Tombstoned &&
 		actual.SessionID == expected.SessionID && actual.Generation == expected.Generation
-}
-
-func mapStateError(err error) error {
-	if errors.Is(err, ErrNoSession) {
-		return ErrNoSession
-	}
-	return ErrCommitIndeterminate
-}
-
-func (m *Manager) cleanupConsumedSession(binding state.Binding, reservation state.Metadata, newID string, cause error) error {
-	cleanup, cancel := context.WithTimeout(context.Background(), 10*time.Second)
-	defer cancel()
-	partial := &PartialError{Cause: cause}
-	err := m.options.Metadata.WithSessionTransaction(cleanup, binding, func(current state.Metadata, found bool) (*state.Metadata, error) {
-		if !found {
-			return nil, nil
-		}
-		if !sameReservation(current, reservation) {
-			return &current, nil
-		}
-		return &reservation, nil
-	})
-	if err != nil {
-		partial.CommitUncertain = true
-	}
-	for _, id := range []string{reservation.SessionID, newID} {
-		if id == "" {
-			continue
-		}
-		if err := m.options.Credentials.Delete(cleanup,
-			credentialKey(m.options.Tenant, m.options.Account, id)); err != nil {
-			partial.LocalCleanupFailed = true
-		}
-	}
-	if partial.CommitUncertain || partial.LocalCleanupFailed {
-		return partial
-	}
-	return cause
 }
 
 func (m *Manager) loadCredential(ctx context.Context, sessionID string) (credential, error) {
@@ -423,38 +505,47 @@ func (m *Manager) Logout(ctx context.Context, sessionID string) error {
 	partial := &PartialError{}
 	localContext, cancelLocal := context.WithTimeout(context.WithoutCancel(ctx), 3*time.Second)
 	defer cancelLocal()
-	value, loadErr := m.loadCredential(localContext, sessionID)
-	if loadErr != nil && !errors.Is(loadErr, ErrNoSession) {
-		partial.RevocationFailed = m.discovery.RevocationEndpoint != ""
-	}
-	transactionErr := m.options.Metadata.WithSessionTransaction(localContext, binding, func(current state.Metadata, found bool) (*state.Metadata, error) {
-		if !found {
-			return nil, nil
-		}
-		if current.SessionID != sessionID {
-			return &current, nil
-		}
-		return nil, nil
-	})
-	if errors.Is(transactionErr, state.ErrCorrupt) {
-		if err := m.options.Metadata.DeleteMetadata(localContext, binding, state.KindSession); err != nil {
-			partial.CommitUncertain = true
-		}
-		transactionErr = nil
-	}
-	if transactionErr != nil {
-		partial.CommitUncertain = true
-	}
-	if deleteErr := m.options.Credentials.Delete(localContext,
-		credentialKey(m.options.Tenant, m.options.Account, sessionID)); deleteErr != nil {
-		partial.LocalCleanupFailed = true
-	}
-	if loadErr == nil {
-		revokeContext, cancelRevoke := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
-		if revokeErr := m.revoke(revokeContext, value); revokeErr != nil {
+	var value credential
+	loadErr := ErrNoSession
+	lifecycleErr := m.options.Metadata.WithSessionLifecycle(localContext, binding, func() error {
+		current, metadataErr := m.options.Metadata.GetMetadata(localContext, binding, state.KindSession)
+		found := metadataErr == nil
+		corrupt := metadataErr != nil && !errors.Is(metadataErr, state.ErrNotFound)
+		matching := found && (current.SessionID == sessionID ||
+			current.PendingSessionID == sessionID || current.PreviousSessionID == sessionID)
+		value, loadErr = m.loadCredential(localContext, sessionID)
+		if loadErr != nil && ((!errors.Is(loadErr, ErrNoSession) || matching) &&
+			m.discovery.RevocationEndpoint != "") {
 			partial.RevocationFailed = true
 		}
-		cancelRevoke()
+		if matching && current.Tombstoned {
+			if err := m.recoverSessionJournal(localContext, binding); err != nil {
+				var cleanup *PartialError
+				if errors.As(err, &cleanup) {
+					partial.LocalCleanupFailed = partial.LocalCleanupFailed || cleanup.LocalCleanupFailed
+					partial.CommitUncertain = partial.CommitUncertain || cleanup.CommitUncertain
+				} else {
+					partial.CommitUncertain = true
+				}
+			}
+		} else if matching || corrupt {
+			if err := m.options.Metadata.DeleteMetadata(localContext, binding, state.KindSession); err != nil {
+				partial.CommitUncertain = true
+			}
+		}
+		if deleteErr := m.options.Credentials.Delete(localContext,
+			credentialKey(m.options.Tenant, m.options.Account, sessionID)); deleteErr != nil {
+			partial.LocalCleanupFailed = true
+		}
+		return nil
+	})
+	if lifecycleErr != nil {
+		partial.CommitUncertain = true
+	}
+	if loadErr == nil {
+		if revokeErr := m.revoke(context.WithoutCancel(ctx), value); revokeErr != nil {
+			partial.RevocationFailed = true
+		}
 	}
 	if partial.LocalCleanupFailed || partial.RevocationFailed || partial.CommitUncertain {
 		return partial
@@ -473,13 +564,15 @@ func (m *Manager) revoke(ctx context.Context, value credential) error {
 	for _, item := range []struct{ token, hint string }{
 		{value.RefreshToken, "refresh_token"}, {value.AccessToken, "access_token"},
 	} {
+		itemContext, cancelItem := context.WithTimeout(context.WithoutCancel(ctx), 500*time.Millisecond)
 		form := url.Values{"token": {item.token}, "token_type_hint": {item.hint}}
 		if m.options.RevocationAuthMethod == "client_secret_post" {
 			form.Set("client_id", m.options.ClientID)
 			form.Set("client_secret", m.options.ClientSecret)
 		}
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, m.discovery.RevocationEndpoint, strings.NewReader(form.Encode()))
+		req, err := http.NewRequestWithContext(itemContext, http.MethodPost, m.discovery.RevocationEndpoint, strings.NewReader(form.Encode()))
 		if err != nil {
+			cancelItem()
 			failed = true
 			continue
 		}
@@ -489,11 +582,13 @@ func (m *Manager) revoke(ctx context.Context, value credential) error {
 		}
 		resp, err := m.client.Do(req)
 		if err != nil {
+			cancelItem()
 			failed = true
 			continue
 		}
 		_, readErr := io.Copy(io.Discard, io.LimitReader(resp.Body, 4097))
 		closeErr := resp.Body.Close()
+		cancelItem()
 		if readErr != nil || closeErr != nil || resp.StatusCode < 200 || resp.StatusCode >= 300 {
 			failed = true
 		}

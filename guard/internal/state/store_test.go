@@ -676,3 +676,33 @@ func TestSessionOperationIdentifierIsAcceptedOnlyForTombstones(t *testing.T) {
 		t.Fatalf("reserved session rejected: %v", err)
 	}
 }
+
+func TestTypedSessionJournalIsBoundedAndTombstoneOnly(t *testing.T) {
+	journal := Metadata{
+		Kind: KindSession, SessionID: "session_00000000000000000000000000",
+		PendingSessionID:  "session_00000000000000000000000001",
+		PreviousSessionID: "session_00000000000000000000000000",
+		SessionOperation:  "refresh", Generation: 2, Tombstoned: true,
+		OperationID: "operation_00000000000000000000000000",
+	}
+	if err := validateMetadata(journal); err != nil {
+		t.Fatalf("typed session journal rejected: %v", err)
+	}
+	active := journal
+	active.Tombstoned = false
+	active.ExpiresAt = time.Now().Add(time.Hour)
+	if err := validateMetadata(active); !errors.Is(err, ErrUnsafePayload) {
+		t.Fatalf("active session accepted journal fields: %v", err)
+	}
+	for _, mutate := range []func(*Metadata){
+		func(value *Metadata) { value.PendingSessionID = "session_bad" },
+		func(value *Metadata) { value.PreviousSessionID = "session_bad" },
+		func(value *Metadata) { value.SessionOperation = "arbitrary" },
+	} {
+		invalid := journal
+		mutate(&invalid)
+		if err := validateMetadata(invalid); !errors.Is(err, ErrUnsafePayload) {
+			t.Fatalf("unsafe session journal accepted: %#v, %v", invalid, err)
+		}
+	}
+}
