@@ -384,7 +384,20 @@ func (m *Manager) abortSessionJournal(
 	cause error,
 ) error {
 	current, err := m.options.Metadata.GetMetadata(ctx, binding, state.KindSession)
-	if err != nil || !sameReservation(current, journal) {
+	if err != nil {
+		partial := &PartialError{CommitUncertain: true, Cause: cause}
+		retry, retryErr := m.options.Metadata.GetMetadata(ctx, binding, state.KindSession)
+		if retryErr == nil && sameReservation(retry, journal) {
+			if recoveryErr := m.recoverSessionJournal(ctx, binding); recoveryErr != nil {
+				var recoveryPartial *PartialError
+				if errors.As(recoveryErr, &recoveryPartial) {
+					partial.LocalCleanupFailed = recoveryPartial.LocalCleanupFailed
+				}
+			}
+		}
+		return partial
+	}
+	if !sameReservation(current, journal) {
 		return cause
 	}
 	if err := m.recoverSessionJournal(ctx, binding); err != nil {
@@ -564,7 +577,7 @@ func (m *Manager) revoke(ctx context.Context, value credential) error {
 	for _, item := range []struct{ token, hint string }{
 		{value.RefreshToken, "refresh_token"}, {value.AccessToken, "access_token"},
 	} {
-		itemContext, cancelItem := context.WithTimeout(context.WithoutCancel(ctx), 500*time.Millisecond)
+		itemContext, cancelItem := context.WithTimeout(context.WithoutCancel(ctx), m.options.RevocationTimeout)
 		form := url.Values{"token": {item.token}, "token_type_hint": {item.hint}}
 		if m.options.RevocationAuthMethod == "client_secret_post" {
 			form.Set("client_id", m.options.ClientID)

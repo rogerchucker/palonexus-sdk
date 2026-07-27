@@ -698,11 +698,30 @@ func TestTypedSessionJournalIsBoundedAndTombstoneOnly(t *testing.T) {
 		func(value *Metadata) { value.PendingSessionID = "session_bad" },
 		func(value *Metadata) { value.PreviousSessionID = "session_bad" },
 		func(value *Metadata) { value.SessionOperation = "arbitrary" },
+		func(value *Metadata) { value.PendingSessionID = value.PreviousSessionID },
+		func(value *Metadata) { value.SessionID = value.PendingSessionID },
+		func(value *Metadata) { value.PreviousSessionID = "" },
 	} {
 		invalid := journal
 		mutate(&invalid)
 		if err := validateMetadata(invalid); !errors.Is(err, ErrUnsafePayload) {
 			t.Fatalf("unsafe session journal accepted: %#v, %v", invalid, err)
 		}
+	}
+	loginInitial := journal
+	loginInitial.SessionOperation = "login"
+	loginInitial.PreviousSessionID = ""
+	loginInitial.SessionID = loginInitial.PendingSessionID
+	if err := validateMetadata(loginInitial); err != nil {
+		t.Fatalf("initial login journal rejected: %v", err)
+	}
+	loginReplacement := journal
+	loginReplacement.SessionOperation = "login"
+	if err := validateMetadata(loginReplacement); err != nil {
+		t.Fatalf("replacement login journal rejected: %v", err)
+	}
+	loginReplacement.SessionID = loginReplacement.PendingSessionID
+	if err := validateMetadata(loginReplacement); !errors.Is(err, ErrUnsafePayload) {
+		t.Fatalf("replacement login accepted mismatched session owner: %v", err)
 	}
 }

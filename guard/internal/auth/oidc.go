@@ -67,6 +67,7 @@ type Options struct {
 	RedirectURI                    string
 	Algorithms                     []string
 	ClockSkew, MaxTokenLifetime    time.Duration
+	RevocationTimeout              time.Duration
 	HTTPClient                     *http.Client
 	Credentials                    credentialStore
 	Metadata                       metadataStore
@@ -177,17 +178,25 @@ func New(options Options) (*Manager, error) {
 	}
 	client := *options.HTTPClient
 	client.Timeout = boundedTimeout(client.Timeout)
+	if options.RevocationTimeout <= 0 {
+		options.RevocationTimeout = 5 * time.Second
+	}
+	if options.RevocationTimeout > client.Timeout {
+		options.RevocationTimeout = client.Timeout
+	}
 	client.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
 	limiter := &responseLimiter{base: client.Transport, endpoints: make(map[string]responseKind)}
 	client.Transport = limiter
 	m := &Manager{options: options, client: &client, attempts: make(map[string]attempt), limits: limiter}
-	if err := m.discover(context.Background()); err != nil {
+	binding := state.Binding{Tenant: options.Tenant, Account: options.Account}
+	recoveryContext, cancelRecovery := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancelRecovery()
+	if err := m.options.Metadata.WithSessionLifecycle(recoveryContext, binding, func() error {
+		return m.recoverSessionJournal(recoveryContext, binding)
+	}); err != nil {
 		return nil, err
 	}
-	binding := state.Binding{Tenant: options.Tenant, Account: options.Account}
-	if err := m.options.Metadata.WithSessionLifecycle(context.Background(), binding, func() error {
-		return m.recoverSessionJournal(context.Background(), binding)
-	}); err != nil {
+	if err := m.discover(context.Background()); err != nil {
 		return nil, err
 	}
 	return m, nil

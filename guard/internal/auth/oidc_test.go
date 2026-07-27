@@ -957,6 +957,7 @@ func TestHangingFirstRevocationDoesNotPreventSecondAttempt(t *testing.T) {
 		}
 	}
 	m := testManager(t, p)
+	m.options.RevocationTimeout = 100 * time.Millisecond
 	done := make(chan error, 1)
 	go func() {
 		done <- m.revoke(context.Background(), credential{RefreshToken: "refresh", AccessToken: "access"})
@@ -975,6 +976,38 @@ func TestHangingFirstRevocationDoesNotPreventSecondAttempt(t *testing.T) {
 	close(release)
 	if err := <-done; !errors.Is(err, ErrRevocation) {
 		t.Fatalf("timed-out first revocation was not aggregated: %v", err)
+	}
+}
+
+func TestRevocationTimeoutIsConfigurableAndAllowsSlowValidResponse(t *testing.T) {
+	p := newProvider(t)
+	defer p.Close()
+	p.revokeBlock = func(_ int) { time.Sleep(600 * time.Millisecond) }
+	m := testManager(t, p)
+	m.options.RevocationTimeout = time.Second
+	if err := m.revoke(context.Background(), credential{
+		RefreshToken: "refresh", AccessToken: "access",
+	}); err != nil {
+		t.Fatalf("valid response inside configured revocation budget failed: %v", err)
+	}
+}
+
+func TestRevocationTimeoutIsCappedByManagerHTTPTimeout(t *testing.T) {
+	p := newProvider(t)
+	defer p.Close()
+	client := p.server.Client()
+	client.Timeout = 750 * time.Millisecond
+	m, err := newForTesting(Options{
+		Issuer: p.server.URL, ClientID: p.clientID, Tenant: "tenant", Account: "account",
+		RedirectURI: "http://127.0.0.1:49152/callback", HTTPClient: client,
+		Credentials: mustStore(t), Metadata: newMemoryMetadata(), Algorithms: []string{"RS256"},
+		RevocationTimeout: 2 * time.Second,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if m.options.RevocationTimeout != client.Timeout {
+		t.Fatalf("revocation timeout exceeded manager HTTP timeout: %v", m.options.RevocationTimeout)
 	}
 }
 
@@ -1249,6 +1282,48 @@ func TestSessionJournalRecoveryAfterCrashReopen(t *testing.T) {
 	}
 }
 
+func TestNewRecoversLocalCrashJournalBeforeDiscoveryOutage(t *testing.T) {
+	p := newProvider(t)
+	defer p.Close()
+	metadata := newMemoryMetadata()
+	credentials := mustStore(t)
+	binding := state.Binding{Tenant: "tenant", Account: "account"}
+	journal := state.Metadata{
+		Kind: state.KindSession, SessionID: "session_00000000000000000000000000",
+		PendingSessionID:  "session_00000000000000000000000001",
+		PreviousSessionID: "session_00000000000000000000000000",
+		SessionOperation:  "refresh", Generation: 2, Tombstoned: true,
+		OperationID: "operation_00000000000000000000000000",
+	}
+	if err := metadata.PutMetadata(context.Background(), binding, journal); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{journal.PreviousSessionID, journal.PendingSessionID} {
+		if err := credentials.Put(context.Background(),
+			credentialKey("tenant", "account", id), []byte("crash-secret")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	p.discoveryStatus.Store(http.StatusServiceUnavailable)
+	_, err := newForTesting(Options{
+		Issuer: p.server.URL, ClientID: p.clientID, Tenant: "tenant", Account: "account",
+		RedirectURI: "http://127.0.0.1:49152/callback", HTTPClient: p.server.Client(),
+		Credentials: credentials, Metadata: metadata, Algorithms: []string{"RS256"},
+	})
+	if !errors.Is(err, ErrProvider) {
+		t.Fatalf("discovery outage returned unexpected error: %v", err)
+	}
+	if _, err := metadata.GetMetadata(context.Background(), binding, state.KindSession); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("provider outage prevented local journal cleanup: %v", err)
+	}
+	for _, id := range []string{journal.PreviousSessionID, journal.PendingSessionID} {
+		if _, err := credentials.Get(context.Background(),
+			credentialKey("tenant", "account", id)); !errors.Is(err, keystore.ErrNotFound) {
+			t.Fatalf("provider outage retained journal credential %s: %v", id, err)
+		}
+	}
+}
+
 func TestStaleJournalAbortNeverDeletesSupersedingSession(t *testing.T) {
 	metadata := newMemoryMetadata()
 	credentials := mustStore(t)
@@ -1284,6 +1359,40 @@ func TestStaleJournalAbortNeverDeletesSupersedingSession(t *testing.T) {
 	if _, err := credentials.Get(context.Background(),
 		credentialKey("tenant", "account", superseding.SessionID)); err != nil {
 		t.Fatalf("stale abort deleted superseding credential: %v", err)
+	}
+}
+
+func TestJournalAbortReadFaultPreservesCauseAndReportsCommitUncertainty(t *testing.T) {
+	metadata := &faultMetadata{memoryMetadata: newMemoryMetadata()}
+	credentials := mustStore(t)
+	manager := &Manager{options: Options{
+		Tenant: "tenant", Account: "account", Metadata: metadata, Credentials: credentials,
+	}}
+	binding := state.Binding{Tenant: "tenant", Account: "account"}
+	journal := state.Metadata{
+		Kind: state.KindSession, SessionID: "session_00000000000000000000000000",
+		PendingSessionID:  "session_00000000000000000000000001",
+		PreviousSessionID: "session_00000000000000000000000000",
+		SessionOperation:  "refresh", Generation: 2, Tombstoned: true,
+		OperationID: "operation_00000000000000000000000000",
+	}
+	if err := metadata.memoryMetadata.PutMetadata(context.Background(), binding, journal); err != nil {
+		t.Fatal(err)
+	}
+	for _, id := range []string{journal.PreviousSessionID, journal.PendingSessionID} {
+		if err := credentials.Put(context.Background(),
+			credentialKey("tenant", "account", id), []byte("journal-secret")); err != nil {
+			t.Fatal(err)
+		}
+	}
+	metadata.failGets.Store(1)
+	err := manager.abortSessionJournal(context.Background(), binding, journal, ErrProvider)
+	if !errors.Is(err, ErrPartial) || !errors.Is(err, ErrCommitIndeterminate) ||
+		!errors.Is(err, ErrProvider) {
+		t.Fatalf("journal read uncertainty lost typed cause: %v", err)
+	}
+	if _, err := metadata.memoryMetadata.GetMetadata(context.Background(), binding, state.KindSession); !errors.Is(err, state.ErrNotFound) {
+		t.Fatalf("exact journal was not ownership-safely recovered after retry: %v", err)
 	}
 }
 
@@ -1549,6 +1658,7 @@ type faultMetadata struct {
 	failBeforeCall     atomic.Int32
 	failBeforeFrom     atomic.Int32
 	failDeleteMetadata atomic.Bool
+	failGets           atomic.Int32
 }
 
 type faultCredentials struct {
@@ -1595,6 +1705,19 @@ func (m *faultMetadata) DeleteMetadata(ctx context.Context, binding state.Bindin
 		return state.ErrUnsafePath
 	}
 	return m.memoryMetadata.DeleteMetadata(ctx, binding, kind)
+}
+
+func (m *faultMetadata) GetMetadata(ctx context.Context, binding state.Binding, kind state.Kind) (state.Metadata, error) {
+	for {
+		remaining := m.failGets.Load()
+		if remaining == 0 {
+			break
+		}
+		if m.failGets.CompareAndSwap(remaining, remaining-1) {
+			return state.Metadata{}, state.ErrUnsafePath
+		}
+	}
+	return m.memoryMetadata.GetMetadata(ctx, binding, kind)
 }
 
 type roundTripFunc func(*http.Request) (*http.Response, error)

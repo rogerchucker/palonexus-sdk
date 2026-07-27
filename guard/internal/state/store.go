@@ -194,6 +194,23 @@ func validateMetadata(metadata Metadata) error {
 				(metadata.SessionOperation != "login" && metadata.SessionOperation != "refresh") {
 				return ErrUnsafePayload
 			}
+			if metadata.PendingSessionID == metadata.PreviousSessionID {
+				return ErrUnsafePayload
+			}
+			switch metadata.SessionOperation {
+			case "refresh":
+				if metadata.PreviousSessionID == "" || metadata.SessionID != metadata.PreviousSessionID {
+					return ErrUnsafePayload
+				}
+			case "login":
+				expected := metadata.PreviousSessionID
+				if expected == "" {
+					expected = metadata.PendingSessionID
+				}
+				if metadata.SessionID != expected {
+					return ErrUnsafePayload
+				}
+			}
 		}
 	case KindReconciliation:
 		if !reconPattern.MatchString(metadata.ReconciliationID) || !hashPattern.MatchString(metadata.ReferenceHash) ||
