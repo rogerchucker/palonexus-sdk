@@ -8,6 +8,7 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/base64"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -23,20 +24,38 @@ import (
 )
 
 const (
-	DefaultSocketName = "guard.sock"
-	defaultMaxRequest = 1 << 20
-	defaultIOTimeout  = 5 * time.Second
+	DefaultSocketName  = "guard.sock"
+	defaultMaxRequest  = 1 << 20
+	defaultIOTimeout   = 5 * time.Second
+	defaultMaxClients  = 64
+	defaultMaxHandlers = 16
+	hardMaxConcurrency = 256
 )
 
+// Handler must honor context cancellation. The server bounds detached handlers
+// that ignore cancellation, but cannot forcibly terminate Go code.
 type Handler func(context.Context, []byte) ([]byte, error)
 
+type CloseError struct {
+	Operation string
+	Err       error
+}
+
+func (err *CloseError) Error() string {
+	return "socket: close " + err.Operation + ": " + err.Err.Error()
+}
+
+func (err *CloseError) Unwrap() error { return err.Err }
+
 type Config struct {
-	RuntimeDir      string
-	SocketName      string
-	MaxRequestBytes int
-	IOTimeout       time.Duration
-	RequestTimeout  time.Duration
-	Handler         Handler
+	RuntimeDir            string
+	SocketName            string
+	MaxRequestBytes       int
+	MaxConcurrentClients  int
+	MaxConcurrentHandlers int
+	IOTimeout             time.Duration
+	RequestTimeout        time.Duration
+	Handler               Handler
 	// beforeBind is a test seam for exercising pathname replacement races.
 	beforeBind func()
 	// afterValidationBeforeBind exercises the final pathname race window.
@@ -51,21 +70,27 @@ type Config struct {
 	beforeListenerProof func(string)
 	// afterStageBind exercises replacement before anchored inspection.
 	afterStageBind func(string)
+	// beforeStageChmod exercises replacement before no-follow permission changes.
+	beforeStageChmod func(string)
 	// fault is a test-only crash seam at durable lifecycle boundaries.
 	fault func(string)
+	// closeFault injects retryable close failures at lifecycle boundaries.
+	closeFault func(string) error
 }
 
 type Server struct {
-	listener *net.UnixListener
-	dir      *os.File
-	lock     *os.File
-	lockName string
-	lockID   fileIdentity
-	journal  string
-	dirInfo  os.FileInfo
-	path     string
-	boundID  fileIdentity
-	cfg      Config
+	listener     *net.UnixListener
+	dir          *os.File
+	lock         *os.File
+	lockName     string
+	lockID       fileIdentity
+	journal      string
+	dirInfo      os.FileInfo
+	path         string
+	boundID      fileIdentity
+	cfg          Config
+	clientSlots  chan struct{}
+	handlerSlots chan struct{}
 
 	closeOnce sync.Once
 	closeErr  error
@@ -75,12 +100,13 @@ type Server struct {
 }
 
 type lifecycleRecord struct {
-	Version   int    `json:"version"`
-	Phase     string `json:"phase"`
-	StageName string `json:"stageName,omitempty"`
-	FinalName string `json:"finalName"`
-	Device    uint64 `json:"device,omitempty"`
-	Inode     uint64 `json:"inode,omitempty"`
+	Version    int    `json:"version"`
+	Phase      string `json:"phase"`
+	Generation string `json:"generation,omitempty"`
+	StageName  string `json:"stageName,omitempty"`
+	FinalName  string `json:"finalName"`
+	Device     uint64 `json:"device,omitempty"`
+	Inode      uint64 `json:"inode,omitempty"`
 }
 
 func (record lifecycleRecord) validate() error {
@@ -88,14 +114,28 @@ func (record lifecycleRecord) validate() error {
 		record.FinalName == "." {
 		return errors.New("socket: invalid lifecycle journal")
 	}
+	if record.Generation != "" {
+		if len(record.Generation) != 32 {
+			return errors.New("socket: invalid lifecycle generation")
+		}
+		if _, err := hex.DecodeString(record.Generation); err != nil {
+			return errors.New("socket: invalid lifecycle generation")
+		}
+	}
 	switch record.Phase {
 	case "clean":
 		if record.StageName != "" || record.Device != 0 || record.Inode != 0 {
 			return errors.New("socket: invalid clean lifecycle journal")
 		}
+	case "preparing":
+		if record.Generation == "" || filepath.Base(record.StageName) != record.StageName ||
+			record.StageName == "." || record.Device != 0 || record.Inode != 0 {
+			return errors.New("socket: invalid preparing lifecycle journal")
+		}
 	case "staged", "published":
 		if filepath.Base(record.StageName) != record.StageName ||
-			record.StageName == "." || record.Device == 0 || record.Inode == 0 {
+			record.StageName == "." || record.Generation == "" ||
+			record.Device == 0 || record.Inode == 0 {
 			return errors.New("socket: invalid active lifecycle journal")
 		}
 	default:
@@ -124,8 +164,18 @@ func New(cfg Config) (*Server, error) {
 	if cfg.MaxRequestBytes == 0 {
 		cfg.MaxRequestBytes = defaultMaxRequest
 	}
-	if cfg.MaxRequestBytes < 1 || cfg.MaxRequestBytes > 16<<20 {
+	if cfg.MaxRequestBytes < 1 || cfg.MaxRequestBytes > defaultMaxRequest {
 		return nil, errors.New("socket: invalid request size limit")
+	}
+	if cfg.MaxConcurrentClients == 0 {
+		cfg.MaxConcurrentClients = defaultMaxClients
+	}
+	if cfg.MaxConcurrentHandlers == 0 {
+		cfg.MaxConcurrentHandlers = defaultMaxHandlers
+	}
+	if cfg.MaxConcurrentClients < 1 || cfg.MaxConcurrentClients > hardMaxConcurrency ||
+		cfg.MaxConcurrentHandlers < 1 || cfg.MaxConcurrentHandlers > hardMaxConcurrency {
+		return nil, errors.New("socket: invalid concurrency limit")
 	}
 	if cfg.IOTimeout <= 0 {
 		cfg.IOTimeout = defaultIOTimeout
@@ -158,6 +208,9 @@ func New(cfg Config) (*Server, error) {
 		_ = dir.Close()
 		return nil, err
 	}
+	if err := cleanupLifecycleTemps(dir, journalName, cfg.SocketName); err != nil {
+		return fail(err)
+	}
 	path := filepath.Join(cfg.RuntimeDir, cfg.SocketName)
 	record, err := readLifecycleRecord(dir, journalName)
 	if err != nil {
@@ -184,6 +237,20 @@ func New(cfg Config) (*Server, error) {
 	if err != nil {
 		return fail(err)
 	}
+	generation, err := randomGeneration()
+	if err != nil {
+		return fail(err)
+	}
+	preparingRecord := lifecycleRecord{
+		Version: 1, Phase: "preparing", Generation: generation,
+		StageName: stageName, FinalName: cfg.SocketName,
+	}
+	if err := writeLifecycleRecord(dir, journalName, preparingRecord, cfg.fault); err != nil {
+		return fail(err)
+	}
+	if cfg.fault != nil {
+		cfg.fault("after_preparing")
+	}
 	stagePath := filepath.Join(cfg.RuntimeDir, stageName)
 	// Unix has no portable bindat. Bind an unpublished random staging name,
 	// then require that exact vnode to exist beneath the held directory FD.
@@ -198,9 +265,15 @@ func New(cfg Config) (*Server, error) {
 	// Close, which could delete an attacker replacement. Cleanup below is
 	// identity checked instead.
 	listener.SetUnlinkOnClose(false)
+	if cfg.fault != nil {
+		cfg.fault("after_bind")
+	}
 	if err := verifyListenerFD(listener, stagePath); err != nil {
 		_ = listener.Close()
 		return fail(err)
+	}
+	if cfg.beforeStageChmod != nil {
+		cfg.beforeStageChmod(stagePath)
 	}
 	// Make the staged listener connectable even under an all-masking umask.
 	// Identity and ownership are still established by the anchored inspection
@@ -209,6 +282,9 @@ func New(cfg Config) (*Server, error) {
 		_ = listener.Close()
 		return fail(fmt.Errorf("socket: initialize staged permissions: %w", err))
 	}
+	if cfg.fault != nil {
+		cfg.fault("after_stage_chmod")
+	}
 	if cfg.afterStageBind != nil {
 		cfg.afterStageBind(stagePath)
 	}
@@ -216,16 +292,23 @@ func New(cfg Config) (*Server, error) {
 		_ = listener.Close()
 		return fail(err)
 	}
+	if cfg.fault != nil {
+		cfg.fault("after_stage_proof")
+	}
 	publishedName := stageName
 	var boundID fileIdentity
 	cleanupListener := func(err error) (*Server, error) {
 		_ = listener.Close()
+		removed := false
 		if boundID != (fileIdentity{}) {
-			_ = removeOwnedAt(dir, publishedName, boundID)
+			removed = removeOwnedAt(dir, publishedName, boundID) == nil
 		}
-		_ = writeLifecycleRecord(
-			dir, journalName, cleanLifecycle(cfg.SocketName), nil,
-		)
+		if removed && verifyRuntimeDir(dir, cfg.RuntimeDir, dirInfo) == nil &&
+			verifyLockPath(dir, lockName, lockID) == nil {
+			_ = writeLifecycleRecord(
+				dir, journalName, cleanLifecycle(cfg.SocketName), nil,
+			)
+		}
 		return fail(err)
 	}
 	staged, err := inspectAt(dir, stageName)
@@ -242,7 +325,7 @@ func New(cfg Config) (*Server, error) {
 		return cleanupListener(errors.New("socket: staged listener security mismatch"))
 	}
 	stagedRecord := lifecycleRecord{
-		Version: 1, Phase: "staged", StageName: stageName,
+		Version: 1, Phase: "staged", Generation: generation, StageName: stageName,
 		FinalName: cfg.SocketName, Device: boundID.device, Inode: boundID.inode,
 	}
 	if err := verifyLockPath(dir, lockName, lockID); err != nil {
@@ -306,6 +389,8 @@ func New(cfg Config) (*Server, error) {
 		listener: listener, dir: dir, lock: lock, lockName: lockName,
 		lockID: lockID, journal: journalName, dirInfo: dirInfo, path: path,
 		boundID: boundID, cfg: cfg,
+		clientSlots:  make(chan struct{}, cfg.MaxConcurrentClients),
+		handlerSlots: make(chan struct{}, cfg.MaxConcurrentHandlers),
 	}, nil
 }
 
@@ -315,6 +400,14 @@ func randomStageName() (string, error) {
 		return "", fmt.Errorf("socket: stage nonce: %w", err)
 	}
 	return ".s" + base64.RawURLEncoding.EncodeToString(nonce[:]), nil
+}
+
+func randomGeneration() (string, error) {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return "", fmt.Errorf("socket: generation nonce: %w", err)
+	}
+	return hex.EncodeToString(nonce[:]), nil
 }
 
 func unixSocketMode() uint32 { return 0o140000 }
@@ -361,6 +454,48 @@ func recoverLifecycle(
 			return fmt.Errorf("socket: inspect clean path: %w", err)
 		}
 		return nil
+	}
+	if record.Phase == "preparing" {
+		if _, err := inspectAt(dir, record.FinalName); err == nil {
+			return errors.New("socket: final path exists during preparation")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("socket: inspect preparing final path: %w", err)
+		}
+		node, err := inspectAt(dir, record.StageName)
+		if errors.Is(err, os.ErrNotExist) {
+			return writeLifecycleRecord(
+				dir, journalName, cleanLifecycle(cfg.SocketName), nil,
+			)
+		}
+		if err != nil || node.mode&0o170000 != unixSocketMode() ||
+			node.uid != currentUID() || node.nlink != 1 {
+			return errors.New("socket: ambiguous preparing lifecycle candidate")
+		}
+		if err := verifyRuntimeDir(dir, cfg.RuntimeDir, dirInfo); err != nil {
+			return err
+		}
+		if err := verifyLockPath(dir, lockName, lockID); err != nil {
+			return err
+		}
+		if probeGuard(filepath.Join(cfg.RuntimeDir, record.StageName), cfg.IOTimeout) != probeRefused {
+			return errors.New("socket: preparing lifecycle candidate may still be active")
+		}
+		if err := verifyRuntimeDir(dir, cfg.RuntimeDir, dirInfo); err != nil {
+			return err
+		}
+		if err := verifyLockPath(dir, lockName, lockID); err != nil {
+			return err
+		}
+		current, err := inspectAt(dir, record.StageName)
+		if err != nil || current.identity != node.identity {
+			return errors.New("socket: preparing lifecycle candidate changed")
+		}
+		if err := removeOwnedAt(dir, record.StageName, node.identity); err != nil {
+			return err
+		}
+		return writeLifecycleRecord(
+			dir, journalName, cleanLifecycle(cfg.SocketName), nil,
+		)
 	}
 	expected := fileIdentity{device: record.Device, inode: record.Inode}
 	type candidate struct {
@@ -623,9 +758,19 @@ func (s *Server) Serve(ctx context.Context) error {
 		if s.cfg.afterAccept != nil {
 			s.cfg.afterAccept()
 		}
+		select {
+		case s.clientSlots <- struct{}{}:
+		default:
+			s.write(conn, failure(
+				protocol.ProtocolErrorCodeAuthorizationUnavailable, true,
+			))
+			_ = conn.Close()
+			continue
+		}
 		s.acceptMu.Lock()
 		if s.closing {
 			s.acceptMu.Unlock()
+			<-s.clientSlots
 			_ = conn.Close()
 			return nil
 		}
@@ -633,6 +778,7 @@ func (s *Server) Serve(ctx context.Context) error {
 		s.acceptMu.Unlock()
 		go func() {
 			defer s.wg.Done()
+			defer func() { <-s.clientSlots }()
 			s.handle(ctx, conn)
 		}()
 	}
@@ -658,7 +804,9 @@ func (s *Server) handle(parent context.Context, conn *net.UnixConn) {
 	}
 	ctx, cancel := context.WithTimeout(parent, s.cfg.RequestTimeout)
 	defer cancel()
-	response := processFrame(ctx, frame, s.cfg.MaxRequestBytes, s.cfg.Handler)
+	response := processFrameLimited(
+		ctx, frame, s.cfg.MaxRequestBytes, s.cfg.Handler, s.handlerSlots,
+	)
 	s.write(conn, response)
 }
 
@@ -695,6 +843,16 @@ func readFrame(reader *bufio.Reader, maximum int) ([]byte, error) {
 }
 
 func processFrame(ctx context.Context, frame []byte, maximum int, handler Handler) []byte {
+	return processFrameLimited(ctx, frame, maximum, handler, nil)
+}
+
+func processFrameLimited(
+	ctx context.Context,
+	frame []byte,
+	maximum int,
+	handler Handler,
+	handlerSlots chan struct{},
+) []byte {
 	if len(frame) < 2 || len(frame) > maximum+1 || frame[len(frame)-1] != '\n' ||
 		bytes.IndexByte(frame[:len(frame)-1], '\n') >= 0 {
 		return failure(protocol.ProtocolErrorCodeInvalidRequest, false)
@@ -719,8 +877,18 @@ func processFrame(ctx context.Context, frame []byte, maximum int, handler Handle
 		response []byte
 		err      error
 	}
+	if handlerSlots != nil {
+		select {
+		case handlerSlots <- struct{}{}:
+		default:
+			return failure(protocol.ProtocolErrorCodeAuthorizationUnavailable, true)
+		}
+	}
 	resultChannel := make(chan handlerResult, 1)
 	go func() {
+		if handlerSlots != nil {
+			defer func() { <-handlerSlots }()
+		}
 		result := handlerResult{}
 		defer func() {
 			if recover() != nil {
@@ -744,6 +912,11 @@ func processFrame(ctx context.Context, frame []byte, maximum int, handler Handle
 	response = bytes.TrimSpace(response)
 	if len(response) == 0 || len(response) > maximum || !json.Valid(response) {
 		return failure(protocol.ProtocolErrorCodeInvalidDecision, false)
+	}
+	if _, decisionErr := protocol.ParseAuthorizationDecision(response); decisionErr != nil {
+		if _, protocolErr := protocol.ParseProtocolError(response); protocolErr != nil {
+			return failure(protocol.ProtocolErrorCodeInvalidDecision, false)
+		}
 	}
 	var compact bytes.Buffer
 	if err := json.Compact(&compact, response); err != nil || compact.Len() > maximum {
@@ -811,6 +984,11 @@ func failure(code protocol.ProtocolErrorCode, retryable bool) []byte {
 
 func (s *Server) Close() error {
 	s.closeOnce.Do(func() {
+		failClose := func(operation string, err error) {
+			if s.closeErr == nil && err != nil {
+				s.closeErr = &CloseError{Operation: operation, Err: err}
+			}
+		}
 		s.acceptMu.Lock()
 		s.closing = true
 		if s.cfg.onClosing != nil {
@@ -819,28 +997,43 @@ func (s *Server) Close() error {
 		listenErr := s.listener.Close()
 		s.acceptMu.Unlock()
 		s.wg.Wait()
-		runtimeErr := verifyRuntimeDir(s.dir, filepath.Dir(s.path), s.dirInfo)
-		lockErr := verifyLockPath(s.dir, s.lockName, s.lockID)
-		if lockErr != nil {
-			s.closeErr = lockErr
-		} else if err := removeOwnedAt(s.dir, filepath.Base(s.path), s.boundID); err != nil {
-			s.closeErr = err
-		} else if runtimeErr != nil {
-			s.closeErr = runtimeErr
-		} else if listenErr != nil && !errors.Is(listenErr, net.ErrClosed) {
-			s.closeErr = listenErr
+		if listenErr != nil && !errors.Is(listenErr, net.ErrClosed) {
+			failClose("listener", listenErr)
 		}
-		if err := writeLifecycleRecord(
-			s.dir, s.journal, cleanLifecycle(filepath.Base(s.path)), nil,
-		); s.closeErr == nil && err != nil {
-			s.closeErr = err
+		if s.closeErr == nil {
+			failClose("runtime verification",
+				verifyRuntimeDir(s.dir, filepath.Dir(s.path), s.dirInfo))
 		}
-		if err := releaseServerLock(s.lock); s.closeErr == nil && err != nil {
-			s.closeErr = err
+		if s.closeErr == nil {
+			failClose("lock verification",
+				verifyLockPath(s.dir, s.lockName, s.lockID))
 		}
-		if err := s.dir.Close(); s.closeErr == nil && err != nil {
-			s.closeErr = err
+		if s.closeErr == nil {
+			if s.cfg.closeFault != nil {
+				failClose("fault before removal", s.cfg.closeFault("before_remove"))
+			}
 		}
+		if s.closeErr == nil {
+			failClose("socket removal",
+				removeOwnedAt(s.dir, filepath.Base(s.path), s.boundID))
+		}
+		if s.closeErr == nil {
+			if s.cfg.closeFault != nil {
+				failClose("fault after removal", s.cfg.closeFault("after_remove"))
+			}
+		}
+		if s.closeErr == nil {
+			if s.cfg.closeFault != nil {
+				failClose("fault before clean transition", s.cfg.closeFault("before_clean"))
+			}
+		}
+		if s.closeErr == nil {
+			failClose("journal transition", writeLifecycleRecord(
+				s.dir, s.journal, cleanLifecycle(filepath.Base(s.path)), nil,
+			))
+		}
+		failClose("lock release", releaseServerLock(s.lock))
+		failClose("runtime directory", s.dir.Close())
 	})
 	return s.closeErr
 }

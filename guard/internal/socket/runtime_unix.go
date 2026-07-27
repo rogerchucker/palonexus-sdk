@@ -92,6 +92,7 @@ type nodeInfo struct {
 	identity fileIdentity
 	mode     uint32
 	uid      uint32
+	nlink    uint64
 }
 
 func inspectAt(dir *os.File, name string) (nodeInfo, error) {
@@ -105,6 +106,7 @@ func inspectAt(dir *os.File, name string) (nodeInfo, error) {
 		identity: fileIdentity{device: uint64(stat.Dev), inode: uint64(stat.Ino)},
 		mode:     uint32(stat.Mode),
 		uid:      stat.Uid,
+		nlink:    uint64(stat.Nlink),
 	}, nil
 }
 
@@ -142,7 +144,9 @@ func verifyListenerFD(listener *net.UnixListener, expectedPath string) error {
 }
 
 func chmodAt(dir *os.File, name string, mode uint32) error {
-	return unix.Fchmodat(int(dir.Fd()), name, mode, 0)
+	return unix.Fchmodat(
+		int(dir.Fd()), name, mode, unix.AT_SYMLINK_NOFOLLOW,
+	)
 }
 
 func acquireServerLock(dir *os.File, name string) (*os.File, fileIdentity, error) {
@@ -259,6 +263,13 @@ func writeLifecycleRecord(
 	record lifecycleRecord,
 	fault func(string),
 ) error {
+	if record.Generation == "" {
+		var generation [16]byte
+		if _, err := rand.Read(generation[:]); err != nil {
+			return fmt.Errorf("socket: lifecycle generation: %w", err)
+		}
+		record.Generation = hex.EncodeToString(generation[:])
+	}
 	if err := record.validate(); err != nil {
 		return err
 	}
@@ -270,7 +281,8 @@ func writeLifecycleRecord(
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return fmt.Errorf("socket: lifecycle temp nonce: %w", err)
 	}
-	tempName := "." + name + ".tmp-" + hex.EncodeToString(nonce[:])
+	tempName := "." + name + ".tmp-" + record.Generation + "-" +
+		hex.EncodeToString(nonce[:])
 	fd, err := unix.Openat(
 		int(dir.Fd()), tempName,
 		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW,
@@ -330,6 +342,81 @@ func writeLifecycleRecord(
 	}
 	if fault != nil {
 		fault("journal_after_dirsync")
+	}
+	return nil
+}
+
+func cleanupLifecycleTemps(dir *os.File, journalName, finalName string) error {
+	duplicate, err := unix.Dup(int(dir.Fd()))
+	if err != nil {
+		return fmt.Errorf("socket: duplicate runtime directory: %w", err)
+	}
+	scan := os.NewFile(uintptr(duplicate), "lifecycle-temp-scan")
+	defer scan.Close()
+	names, err := scan.Readdirnames(257)
+	if err != nil && !errors.Is(err, io.EOF) {
+		return fmt.Errorf("socket: scan lifecycle temps: %w", err)
+	}
+	if len(names) > 256 {
+		return errors.New("socket: runtime directory entry limit exceeded")
+	}
+	prefix := "." + journalName + ".tmp-"
+	count := 0
+	for _, name := range names {
+		if !strings.HasPrefix(name, prefix) {
+			continue
+		}
+		count++
+		if count > 64 {
+			return errors.New("socket: too many lifecycle temp artifacts")
+		}
+		suffix := strings.TrimPrefix(name, prefix)
+		parts := strings.Split(suffix, "-")
+		if len(parts) != 2 || len(parts[0]) != 32 || len(parts[1]) != 32 {
+			continue
+		}
+		if _, err := hex.DecodeString(parts[0]); err != nil {
+			continue
+		}
+		if _, err := hex.DecodeString(parts[1]); err != nil {
+			continue
+		}
+		node, err := inspectAt(dir, name)
+		if err != nil || node.mode&unix.S_IFMT != unix.S_IFREG ||
+			node.mode&0o777 != 0o600 || node.uid != currentUID() || node.nlink != 1 {
+			continue
+		}
+		fd, err := unix.Openat(
+			int(dir.Fd()), name,
+			unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK,
+			0,
+		)
+		if err != nil {
+			continue
+		}
+		file := os.NewFile(uintptr(fd), name)
+		document, readErr := io.ReadAll(io.LimitReader(file, maxLifecycleRecord+1))
+		_ = file.Close()
+		if readErr != nil || len(document) > maxLifecycleRecord {
+			continue
+		}
+		if len(document) == 0 {
+			if err := removeOwnedRegularAt(dir, name, node.identity); err != nil {
+				return err
+			}
+			continue
+		}
+		decoder := json.NewDecoder(strings.NewReader(string(document)))
+		decoder.DisallowUnknownFields()
+		var record lifecycleRecord
+		if decoder.Decode(&record) != nil || decoder.Decode(&struct{}{}) != io.EOF ||
+			record.validate() != nil || record.Generation != parts[0] ||
+			record.FinalName != finalName {
+			continue
+		}
+		if err := removeOwnedRegularAt(dir, name, node.identity); err != nil {
+			return err
+		}
 	}
 	return nil
 }

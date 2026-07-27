@@ -35,6 +35,7 @@ type nodeInfo struct {
 	identity fileIdentity
 	mode     uint32
 	uid      uint32
+	nlink    uint64
 }
 
 func removeOwnedAt(*os.File, string, fileIdentity) error {
@@ -74,5 +75,9 @@ func readLifecycleRecord(*os.File, string) (*lifecycleRecord, error) {
 }
 
 func writeLifecycleRecord(*os.File, string, lifecycleRecord, func(string)) error {
+	return errors.New("socket: Unix lifecycle journal is unsupported on this platform")
+}
+
+func cleanupLifecycleTemps(*os.File, string, string) error {
 	return errors.New("socket: Unix lifecycle journal is unsupported on this platform")
 }

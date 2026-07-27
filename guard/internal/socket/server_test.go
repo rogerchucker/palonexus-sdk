@@ -15,7 +15,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"runtime"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -25,11 +27,9 @@ import (
 )
 
 func echoHandler(_ context.Context, request []byte) ([]byte, error) {
-	var value map[string]any
-	if err := json.Unmarshal(request, &value); err != nil {
-		return nil, err
-	}
-	return json.Marshal(value)
+	return bytes.TrimSpace(failure(
+		protocol.ProtocolErrorCodeInvalidRequest, false,
+	)), nil
 }
 
 func startTestServer(t *testing.T, mutate func(*Config)) (*Server, string) {
@@ -121,20 +121,58 @@ func TestPermissionsAreIndependentOfUmask(t *testing.T) {
 func TestOneRequestOneResponseNDJSON(t *testing.T) {
 	_, path := startTestServer(t, nil)
 	got := exchange(t, path, `{"schemaVersion":"1","value":"ok"}`+"\n")
-	if string(got) != `{"schemaVersion":"1","value":"ok"}`+"\n" {
-		t.Fatalf("unexpected response %q", got)
+	if _, err := protocol.ParseProtocolError(got); err != nil {
+		t.Fatalf("unexpected response %q: %v", got, err)
 	}
 }
 
 func TestHandlerResponseIsOneCompactPhysicalLine(t *testing.T) {
 	_, path := startTestServer(t, func(c *Config) {
 		c.Handler = func(context.Context, []byte) ([]byte, error) {
-			return []byte("{\n  \"schemaVersion\": \"1\",\n  \"value\": \"ok\"\n}"), nil
+			return []byte("{\n  \"schemaVersion\": \"1\",\n" +
+				"  \"code\": \"invalid_request\",\n" +
+				"  \"safeMessage\": \"The request is invalid.\",\n" +
+				"  \"retryable\": false\n}"), nil
 		}
 	})
 	got := exchange(t, path, `{"schemaVersion":"1"}`+"\n")
-	if string(got) != `{"schemaVersion":"1","value":"ok"}`+"\n" {
+	if string(got) != `{"schemaVersion":"1","code":"invalid_request","safeMessage":"The request is invalid.","retryable":false}`+"\n" {
 		t.Fatalf("response is not compact NDJSON: %q", got)
+	}
+}
+
+func TestHandlerResponseMustBeAProtocolDecisionOrError(t *testing.T) {
+	invalid := [][]byte{
+		[]byte(`null`),
+		[]byte(`[]`),
+		[]byte(`{"schemaVersion":"1","schemaVersion":"1"}`),
+		[]byte(`{"code":"invalid_request"}`),
+		[]byte(`{"schemaVersion":"2"}`),
+		[]byte(`{"schemaVersion":"1","value":"not-a-decision"}`),
+	}
+	for _, response := range invalid {
+		t.Run(string(response), func(t *testing.T) {
+			_, path := startTestServer(t, func(c *Config) {
+				c.Handler = func(context.Context, []byte) ([]byte, error) {
+					return response, nil
+				}
+			})
+			document := exchange(t, path, `{"schemaVersion":"1"}`+"\n")
+			failure, err := protocol.ParseProtocolError(document)
+			if err != nil || failure.Code != protocol.ProtocolErrorCodeInvalidDecision {
+				t.Fatalf("invalid handler response escaped: %s, %v", document, err)
+			}
+		})
+	}
+	validDecision := []byte(`{"schemaVersion":"1","requestId":"req_01J5ABCDEFGHJKMNPQRSTVWXY0","decisionId":"dec_01J5ABCDEFGHJKMNPQRSTVWXY0","correlationId":"corr_01J5ABCDEFGHJKMNPQRSTVWXY0","outcome":"allow","reasonCode":"policy_allowed","displayReason":"The action is authorized.","clientScopeHash":"sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","authoritativeScopeHash":"sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb","policyRevision":"policy_42","serverTime":"2026-07-25T20:00:01Z","expiresAt":"2026-07-25T20:05:00Z","auditRef":"audit_01J5ABCDEFGHJKMNPQRSTVWXY0","cache":{"cacheable":false}}`)
+	_, path := startTestServer(t, func(c *Config) {
+		c.Handler = func(context.Context, []byte) ([]byte, error) {
+			return validDecision, nil
+		}
+	})
+	document := exchange(t, path, `{"schemaVersion":"1"}`+"\n")
+	if _, err := protocol.ParseAuthorizationDecision(document); err != nil {
+		t.Fatalf("valid decision was rejected: %s, %v", document, err)
 	}
 }
 
@@ -489,11 +527,77 @@ func TestRuntimeDirectorySwapDuringCleanupPreservesReplacement(t *testing.T) {
 	if err := os.WriteFile(replacement, []byte("replacement"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := srv.Close(); err == nil {
+	closeErr := srv.Close()
+	if closeErr == nil {
 		t.Fatal("runtime replacement was not reported")
+	}
+	var typed *CloseError
+	if !errors.As(closeErr, &typed) {
+		t.Fatalf("close error is not typed: %T", closeErr)
 	}
 	if data, err := os.ReadFile(replacement); err != nil || string(data) != "replacement" {
 		t.Fatalf("replacement changed: %q, %v", data, err)
+	}
+	oldDir, _, err := prepareRuntimeDir(old)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer oldDir.Close()
+	record, err := readLifecycleRecord(oldDir, "."+DefaultSocketName+".lifecycle")
+	if err != nil || record == nil || record.Phase != "published" {
+		t.Fatalf("close erased retryable ownership record: %#v, %v", record, err)
+	}
+}
+
+func TestCloseFaultRetainsDurableOwnershipForRestart(t *testing.T) {
+	for _, point := range []string{"before_remove", "after_remove", "before_clean"} {
+		t.Run(point, func(t *testing.T) {
+			root, err := os.MkdirTemp("", "pn-close-fault-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(root)
+			dir := filepath.Join(root, "run")
+			srv, err := New(Config{
+				RuntimeDir: dir,
+				Handler:    echoHandler,
+				closeFault: func(actual string) error {
+					if actual == point {
+						return errors.New("injected close fault")
+					}
+					return nil
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			closeErr := srv.Close()
+			var typed *CloseError
+			if !errors.As(closeErr, &typed) {
+				t.Fatalf("close fault was not typed: %v", closeErr)
+			}
+			dirFile, _, err := prepareRuntimeDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			record, err := readLifecycleRecord(
+				dirFile, "."+DefaultSocketName+".lifecycle",
+			)
+			_ = dirFile.Close()
+			if err != nil || record == nil || record.Phase != "published" {
+				t.Fatalf("ownership record was erased: %#v, %v", record, err)
+			}
+			restarted, err := New(Config{
+				RuntimeDir: dir, Handler: echoHandler,
+				IOTimeout: 50 * time.Millisecond,
+			})
+			if err != nil {
+				t.Fatalf("restart could not retry cleanup: %v", err)
+			}
+			if err := restarted.Close(); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
@@ -535,6 +639,100 @@ func TestRequestDeadlineDoesNotDependOnHandlerCooperation(t *testing.T) {
 	if json.Unmarshal(response, &failure) != nil || !failure.Retryable {
 		t.Fatalf("expected retryable structured failure: %s", response)
 	}
+}
+
+func TestUncooperativeHandlersAreStrictlyBounded(t *testing.T) {
+	release := make(chan struct{})
+	var calls atomic.Int32
+	runtime.GC()
+	var memoryBefore runtime.MemStats
+	runtime.ReadMemStats(&memoryBefore)
+	before := runtime.NumGoroutine()
+	fdBefore := openFDCount(t)
+	_, path := startTestServer(t, func(c *Config) {
+		c.MaxConcurrentClients = 8
+		c.MaxConcurrentHandlers = 2
+		c.RequestTimeout = 5 * time.Millisecond
+		c.Handler = func(context.Context, []byte) ([]byte, error) {
+			calls.Add(1)
+			<-release
+			return bytes.TrimSpace(failure(
+				protocol.ProtocolErrorCodeAuthorizationUnavailable, true,
+			)), nil
+		}
+	})
+	for i := 0; i < 200; i++ {
+		response := exchange(t, path, `{"schemaVersion":"1"}`+"\n")
+		failure, err := protocol.ParseProtocolError(response)
+		if err != nil || failure.Code != protocol.ProtocolErrorCodeAuthorizationUnavailable {
+			t.Fatalf("request %d did not fail closed: %s, %v", i, response, err)
+		}
+	}
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("started %d detached handlers, want 2", got)
+	}
+	if growth := runtime.NumGoroutine() - before; growth > 16 {
+		t.Fatalf("goroutine growth %d is not bounded", growth)
+	}
+	if growth := openFDCount(t) - fdBefore; growth > 16 {
+		t.Fatalf("file descriptor growth %d is not bounded", growth)
+	}
+	runtime.GC()
+	var memoryAfter runtime.MemStats
+	runtime.ReadMemStats(&memoryAfter)
+	if growth := int64(memoryAfter.HeapAlloc) - int64(memoryBefore.HeapAlloc); growth > 16<<20 {
+		t.Fatalf("heap growth %d is not bounded", growth)
+	}
+	close(release)
+}
+
+func TestClientAdmissionIsBoundedBeforeReading(t *testing.T) {
+	srv, path := startTestServer(t, func(c *Config) {
+		c.MaxConcurrentClients = 2
+		c.MaxConcurrentHandlers = 1
+		c.IOTimeout = time.Second
+	})
+	var held []net.Conn
+	for i := 0; i < 2; i++ {
+		conn, err := net.DialTimeout("unix", path, time.Second)
+		if err != nil {
+			t.Fatal(err)
+		}
+		held = append(held, conn)
+	}
+	defer func() {
+		for _, conn := range held {
+			_ = conn.Close()
+		}
+	}()
+	deadline := time.Now().Add(time.Second)
+	for len(srv.clientSlots) != 2 && time.Now().Before(deadline) {
+		runtime.Gosched()
+	}
+	if len(srv.clientSlots) != 2 {
+		t.Fatal("held clients were not admitted")
+	}
+	start := time.Now()
+	response := exchange(t, path, `{"schemaVersion":"1"}`+"\n")
+	if time.Since(start) > 250*time.Millisecond {
+		t.Fatal("client admission waited for a read slot")
+	}
+	failure, err := protocol.ParseProtocolError(response)
+	if err != nil || failure.Code != protocol.ProtocolErrorCodeAuthorizationUnavailable {
+		t.Fatalf("overload was not fail closed: %s, %v", response, err)
+	}
+}
+
+func openFDCount(t *testing.T) int {
+	t.Helper()
+	for _, directory := range []string{"/dev/fd", "/proc/self/fd"} {
+		entries, err := os.ReadDir(directory)
+		if err == nil {
+			return len(entries)
+		}
+	}
+	t.Skip("platform does not expose process file descriptors")
+	return 0
 }
 
 func TestReadTimeoutReturnsStructuredFailure(t *testing.T) {
@@ -893,6 +1091,47 @@ func TestStageProofRejectsCrossProcessRelayAndPreservesDecoy(t *testing.T) {
 	}
 }
 
+func TestStagePermissionChangeNeverFollowsSymlink(t *testing.T) {
+	root, err := os.MkdirTemp("", "pn-stage-mode-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	target := filepath.Join(root, "target")
+	if err := os.WriteFile(target, []byte("unchanged"), 0o640); err != nil {
+		t.Fatal(err)
+	}
+	var stagePath string
+	_, err = New(Config{
+		RuntimeDir: filepath.Join(root, "run"),
+		Handler:    echoHandler,
+		beforeStageChmod: func(path string) {
+			stagePath = path
+			if err := os.Remove(path); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, path); err != nil {
+				t.Fatal(err)
+			}
+		},
+	})
+	if err == nil {
+		t.Fatal("symlink replacement was accepted")
+	}
+	info, statErr := os.Stat(target)
+	if statErr != nil || info.Mode().Perm() != 0o640 {
+		t.Fatalf("symlink target mode changed: %v, %v", info, statErr)
+	}
+	data, readErr := os.ReadFile(target)
+	if readErr != nil || string(data) != "unchanged" {
+		t.Fatalf("symlink target content changed: %q, %v", data, readErr)
+	}
+	replacement, linkErr := os.Lstat(stagePath)
+	if linkErr != nil || replacement.Mode()&os.ModeSymlink == 0 {
+		t.Fatalf("symlink replacement was not preserved: %v", linkErr)
+	}
+}
+
 func TestLifecycleCrashHelper(t *testing.T) {
 	point := os.Getenv("PALONEXUS_SOCKET_CRASH_POINT")
 	if point == "" {
@@ -925,6 +1164,10 @@ func TestSIGKILLAtLifecycleBoundariesRecoversOnReopen(t *testing.T) {
 		"journal_before_rename",
 		"journal_after_rename",
 		"journal_after_dirsync",
+		"after_preparing",
+		"after_bind",
+		"after_stage_chmod",
+		"after_stage_proof",
 		"before_publish",
 		"after_publish",
 		"after_publish_dirsync",
@@ -955,6 +1198,18 @@ func TestSIGKILLAtLifecycleBoundariesRecoversOnReopen(t *testing.T) {
 			}
 			if err := restarted.Close(); err != nil {
 				t.Fatalf("cleanup failed after %s: %v", point, err)
+			}
+			entries, err := os.ReadDir(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				switch entry.Name() {
+				case "." + DefaultSocketName + ".lock",
+					"." + DefaultSocketName + ".lifecycle":
+					continue
+				}
+				t.Fatalf("orphan artifact after %s: %s", point, entry.Name())
 			}
 		})
 	}
