@@ -478,16 +478,19 @@ def test_fresh_resume_preserves_action_scope_but_rotates_attempt_identity() -> N
         path="deploy/production.yaml",
         cwd="/workspace",
     )
-    current = sdk_builder.new(
-        action="file:write",
-        target=fresh_target,
-        side_effect="write",
-        task_context=TaskContext(
-            task_id=str(original.request.task.task_id),
-            session_id=str(original.request.task.session_id),
+    current = sdk_builder.build(
+        sdk_builder.new(
+            action="file:write",
+            target=fresh_target,
+            side_effect="write",
+            task_context=TaskContext(
+                task_id=str(original.request.task.task_id),
+                session_id=str(original.request.task.session_id),
+            ),
+            action_id=str(original.request.action_id),
+            correlation_id=str(original.request.correlation_id),
         ),
-        action_id=str(original.request.action_id),
-        correlation_id=str(original.request.correlation_id),
+        prepared_target=fresh_target,
     )
     resumed = sdk_builder.resume(
         original,

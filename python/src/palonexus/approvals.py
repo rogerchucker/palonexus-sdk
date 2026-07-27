@@ -3,12 +3,82 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable
+from datetime import datetime
 from enum import StrEnum
+from itertools import zip_longest
 from typing import Never, Protocol, Self, runtime_checkable
 
+from . import _canonicalize as _canonical
 from ._generated import protocol as _wire
-from .errors import InvalidDecision
+from .errors import ApprovalScopeMismatch, InvalidDecision
+
+_RFC3339 = re.compile(
+    r"^([0-9]{4}-[0-9]{2}-[0-9]{2}T"
+    r"[0-9]{2}:[0-9]{2}:[0-9]{2})"
+    r"(\.([0-9]+))?(Z|[+-][0-9]{2}:[0-9]{2})\Z"
+)
+_UNIX_EPOCH_ORDINAL = datetime(1970, 1, 1).toordinal()
+type _Timestamp = tuple[int, str]
+
+
+def _parse_timestamp(value: object) -> _Timestamp:
+    if type(value) is not str:
+        raise ValueError
+    match = _RFC3339.fullmatch(value)
+    if match is None:
+        raise ValueError
+    base, _fraction_with_dot, fraction, zone = match.groups()
+    parsed = datetime.fromisoformat(base)
+    offset_seconds = 0
+    if zone != "Z":
+        offset_hour = int(zone[1:3])
+        offset_minute = int(zone[4:6])
+        if offset_hour > 23 or offset_minute > 59:
+            raise ValueError
+        offset_seconds = (offset_hour * 60 + offset_minute) * 60
+        if zone[0] == "-":
+            offset_seconds = -offset_seconds
+    local_seconds = (
+        (parsed.toordinal() - _UNIX_EPOCH_ORDINAL) * 86_400
+        + parsed.hour * 3_600
+        + parsed.minute * 60
+        + parsed.second
+    )
+    return local_seconds - offset_seconds, fraction or ""
+
+
+def _timestamp_order(left: _Timestamp, right: _Timestamp) -> int:
+    if left[0] != right[0]:
+        return -1 if left[0] < right[0] else 1
+    for left_digit, right_digit in zip_longest(left[1], right[1], fillvalue="0"):
+        if left_digit != right_digit:
+            return -1 if left_digit < right_digit else 1
+    return 0
+
+
+def _validate_record_timestamps(value: _wire.ApprovalRecord) -> None:
+    requested = _parse_timestamp(str(value.requested_at))
+    expires = _parse_timestamp(str(value.expires_at))
+    if _timestamp_order(expires, requested) <= 0:
+        raise ValueError
+    status = ApprovalStatus(str(value.status))
+    if status is ApprovalStatus.PENDING:
+        if value.decided_at is not None:
+            raise ValueError
+        return
+    if value.decided_at is None:
+        raise ValueError
+    decided = _parse_timestamp(str(value.decided_at))
+    if status is ApprovalStatus.EXPIRED:
+        if _timestamp_order(decided, expires) < 0:
+            raise ValueError
+    elif (
+        _timestamp_order(decided, requested) < 0
+        or _timestamp_order(decided, expires) >= 0
+    ):
+        raise ValueError
 
 
 class ApprovalStatus(StrEnum):
@@ -33,6 +103,7 @@ class ApprovalRecord:
         "creation_audit_ref",
         "decided_at",
         "expires_at",
+        "_extensions_canonical",
         "requested_at",
         "requester_ref",
         "resolution_audit_ref",
@@ -70,6 +141,7 @@ class ApprovalRecord:
             if type(value) is not _wire.ApprovalRecord:
                 raise TypeError
             value.validate_structural()
+            _validate_record_timestamps(value)
             instance = object.__new__(cls)
             fields: dict[str, object] = {
                 "action_id": str(value.action_id),
@@ -82,6 +154,9 @@ class ApprovalRecord:
                     None if value.decided_at is None else str(value.decided_at)
                 ),
                 "expires_at": str(value.expires_at),
+                "_extensions_canonical": _canonical.canonical_json(
+                    value.extensions
+                ),
                 "requested_at": str(value.requested_at),
                 "requester_ref": value.requester_ref,
                 "resolution_audit_ref": (
@@ -151,6 +226,35 @@ class ApprovalRecord:
         )
 
 
+def _validate_transition(
+    expected: ApprovalRecord,
+    current: ApprovalRecord,
+) -> None:
+    immutable_fields = (
+        "approval_id",
+        "action_id",
+        "correlation_id",
+        "authoritative_scope_hash",
+        "requested_at",
+        "expires_at",
+        "requester_ref",
+        "authorization_decision_id",
+        "creation_audit_ref",
+        "_extensions_canonical",
+    )
+    if any(
+        getattr(expected, field) != getattr(current, field)
+        for field in immutable_fields
+    ):
+        raise ApprovalScopeMismatch() from None
+    if expected.status is ApprovalStatus.PENDING:
+        if current.status is ApprovalStatus.PENDING and current != expected:
+            raise InvalidDecision() from None
+        return
+    if current != expected:
+        raise InvalidDecision() from None
+
+
 @runtime_checkable
 class ApprovalTransport(Protocol):
     """Synchronous transport for approval creation and observation."""
@@ -173,6 +277,9 @@ class ApprovalTransport(Protocol):
         deadline: float | None = None,
         cancelled: Callable[[], bool] | None = None,
     ) -> _wire.ApprovalRecord: ...
+
+    def close(self) -> None:
+        """Release approval transport resources idempotently."""
 
 
 @runtime_checkable
@@ -197,6 +304,9 @@ class AsyncApprovalTransport(Protocol):
         deadline: float | None = None,
         cancelled: Callable[[], bool] | None = None,
     ) -> _wire.ApprovalRecord: ...
+
+    async def aclose(self) -> None:
+        """Release approval transport resources idempotently."""
 
 
 __all__ = [

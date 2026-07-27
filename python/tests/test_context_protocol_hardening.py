@@ -20,9 +20,7 @@ from typing import Any
 
 import pytest
 from palonexus import (
-    ActionRequest,
     ActionRequestBuilder,
-    ActionTarget,
     ApprovalScopeMismatch,
     ModelValidationError,
     TaskContext,
@@ -334,17 +332,21 @@ def test_concurrent_idna_canonicalization_does_not_mutate_globals() -> None:
 def test_resume_requires_fresh_normalization_and_exact_prior_identity() -> None:
     builder = _test_builder()
     _first_target, original = _path_action(builder)
-    current = builder.new(
-        action="file:write",
-        target=builder.prepare_path_target(
-            service="workspace",
-            path="/workspace/one",
-            cwd="/workspace",
+    current_target = builder.prepare_path_target(
+        service="workspace",
+        path="/workspace/one",
+        cwd="/workspace",
+    )
+    current = builder.build(
+        builder.new(
+            action="file:write",
+            target=current_target,
+            side_effect="write",
+            task_context=_context(),
+            action_id=str(original.request.action_id),
+            correlation_id=str(original.request.correlation_id),
         ),
-        side_effect="write",
-        task_context=_context(),
-        action_id=str(original.request.action_id),
-        correlation_id=str(original.request.correlation_id),
+        prepared_target=current_target,
     )
     resumed = builder.resume(
         original,
@@ -383,13 +385,16 @@ def test_resume_rejects_mutated_scope_with_typed_error() -> None:
         path="/workspace/two",
         cwd="/workspace",
     )
-    changed = builder.new(
-        action="file:write",
-        target=changed_target,
-        side_effect="write",
-        task_context=_context(),
-        action_id=str(original.request.action_id),
-        correlation_id=str(original.request.correlation_id),
+    changed = builder.build(
+        builder.new(
+            action="file:write",
+            target=changed_target,
+            side_effect="write",
+            task_context=_context(),
+            action_id=str(original.request.action_id),
+            correlation_id=str(original.request.correlation_id),
+        ),
+        prepared_target=changed_target,
     )
     with pytest.raises(ApprovalScopeMismatch):
         builder.resume(
@@ -419,15 +424,20 @@ def test_resume_final_nonce_failure_preserves_original_and_wipes_copy(
         task_context=_context(),
     )
     original = builder.build(intent, prepared_target=target)
-    current = ActionRequest(
-        action_id=str(original.request.action_id),
-        request_id="req_01J5ABCDEFGHJKMNPQRSTVWXY4",
-        correlation_id=str(original.request.correlation_id),
-        idempotency_key="authz_01J5ABCDEFGHJKMNPQRSTVWXY5",
-        action="shell:exec",
-        target=intent.target,
-        task=_context(),
-        side_effect="write",
+    current_target = builder.prepare_shell_target(
+        service="workspace",
+        command=f"echo {secret}",
+    )
+    current = builder.build(
+        builder.new(
+            action="shell:exec",
+            target=current_target,
+            side_effect="write",
+            task_context=_context(),
+            action_id=str(original.request.action_id),
+            correlation_id=str(original.request.correlation_id),
+        ),
+        prepared_target=current_target,
     )
 
     real_entropy = protocol.secrets.token_bytes
@@ -437,7 +447,7 @@ def test_resume_final_nonce_failure_preserves_original_and_wipes_copy(
         nonlocal nonce_calls
         if size == 16:
             nonce_calls += 1
-            if nonce_calls == 3:
+            if nonce_calls == 1:
                 raise OSError(f"entropy failed near {secret}")
         return real_entropy(size)
 
@@ -476,19 +486,21 @@ def test_resume_fresh_id_failure_preserves_original_without_raw_error(
 
     builder = _test_builder()
     _target, original = _path_action(builder)
-    current = ActionRequest(
-        action_id=str(original.request.action_id),
-        request_id="req_01J5ABCDEFGHJKMNPQRSTVWXY4",
-        correlation_id=str(original.request.correlation_id),
-        idempotency_key="authz_01J5ABCDEFGHJKMNPQRSTVWXY5",
-        action="file:write",
-        target=ActionTarget(
-            kind="local-action",
-            service="workspace",
-            resource="path:/workspace/one",
+    current_target = builder.prepare_path_target(
+        service="workspace",
+        path="/workspace/one",
+        cwd="/workspace",
+    )
+    current = builder.build(
+        builder.new(
+            action="file:write",
+            target=current_target,
+            side_effect="write",
+            task_context=_context(),
+            action_id=str(original.request.action_id),
+            correlation_id=str(original.request.correlation_id),
         ),
-        task=_context(),
-        side_effect="write",
+        prepared_target=current_target,
     )
 
     def fail_id(_kind: str) -> str:

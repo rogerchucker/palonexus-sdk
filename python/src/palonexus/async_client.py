@@ -5,7 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import time
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from contextvars import ContextVar
 from typing import Literal, Self
 
@@ -13,8 +13,10 @@ from .approvals import (
     ApprovalRecord,
     ApprovalStatus,
     AsyncApprovalTransport,
+    _validate_transition,
 )
 from .client import (
+    _MAX_CANCELLATION_LATENCY_SECONDS,
     AuthorizationDecision,
     _attempt_parts,
     _AuthorizationAttempt,
@@ -24,9 +26,11 @@ from .client import (
     _require_allow,
     _require_resumable,
     _safe_request_identifiers,
+    _trusted_now,
+    _utc_now,
 )
 from .errors import AuthorizationUnavailable, InvalidDecision, InvalidRequest
-from .models import ActionRequest, DecisionOutcome
+from .models import DecisionOutcome
 from .protocol import ActionRequestBuilder, _PreparedAction
 from .transports import AsyncAuthorizationTransport
 
@@ -60,8 +64,10 @@ class AsyncAuthorizationClient:
         "_close_task",
         "_condition",
         "_owns_transport",
+        "_owns_approval_transport",
         "_state",
         "_transport",
+        "_trusted_clock",
     )
 
     def __init__(
@@ -70,18 +76,28 @@ class AsyncAuthorizationClient:
         *,
         approval_transport: AsyncApprovalTransport | None = None,
         owns_transport: bool = False,
+        owns_approval_transport: bool = False,
+        trusted_clock: Callable[[], str] | None = None,
     ) -> None:
         if not isinstance(transport, AsyncAuthorizationTransport):
             raise InvalidRequest() from None
         if type(owns_transport) is not bool:
             raise InvalidRequest() from None
+        if type(owns_approval_transport) is not bool:
+            raise InvalidRequest() from None
         if approval_transport is not None and not isinstance(
             approval_transport, AsyncApprovalTransport
         ):
             raise InvalidRequest() from None
+        if owns_approval_transport and approval_transport is None:
+            raise InvalidRequest() from None
+        if trusted_clock is not None and not callable(trusted_clock):
+            raise InvalidRequest() from None
         self._transport = transport
         self._approval_transport = approval_transport
         self._owns_transport = owns_transport
+        self._owns_approval_transport = owns_approval_transport
+        self._trusted_clock = trusted_clock or _utc_now
         self._state = "OPEN"
         self._active = 0
         self._close_failure: AuthorizationUnavailable | None = None
@@ -213,6 +229,7 @@ class AsyncAuthorizationClient:
         self,
         approval_id: str,
         *,
+        expected: ApprovalRecord,
         deadline: float | None = None,
         cancelled: Callable[[], bool] | None = None,
     ) -> ApprovalRecord:
@@ -236,6 +253,7 @@ class AsyncAuthorizationClient:
             )
             if record.approval_id != checked_id:
                 raise InvalidDecision() from None
+            _validate_transition(expected, record)
             return record
         finally:
             _ACTIVE_CLIENTS.reset(token)
@@ -243,15 +261,18 @@ class AsyncAuthorizationClient:
 
     async def wait_for_approval(
         self,
-        approval_id: str,
+        approval: ApprovalRecord,
         *,
         deadline: float,
         cancelled: Callable[[], bool] | None = None,
         poll_interval: float = 0.25,
     ) -> ApprovalRecord:
-        """Poll without busy-looping until a terminal approval or deadline."""
+        """Poll until terminal, checking cancellation at least every 50 ms."""
 
         checked_deadline, checked_interval = _poll_parameters(deadline, poll_interval)
+        if type(approval) is not ApprovalRecord:
+            raise InvalidRequest() from None
+        observed = approval
         while True:
             if cancelled is not None and cancelled():
                 raise asyncio.CancelledError
@@ -259,22 +280,30 @@ class AsyncAuthorizationClient:
             if now >= checked_deadline:
                 raise AuthorizationUnavailable() from None
             record = await self.get_approval(
-                approval_id,
+                approval.approval_id,
+                expected=observed,
                 deadline=checked_deadline,
                 cancelled=cancelled,
             )
             if record.status is not ApprovalStatus.PENDING:
                 return record
+            observed = record
             remaining = checked_deadline - time.monotonic()
             if remaining <= 0:
                 raise AuthorizationUnavailable() from None
-            await asyncio.sleep(min(checked_interval, remaining))
+            await asyncio.sleep(
+                min(
+                    checked_interval,
+                    remaining,
+                    _MAX_CANCELLATION_LATENCY_SECONDS,
+                )
+            )
 
     async def resume(
         self,
         builder: ActionRequestBuilder,
         original: _PreparedAction,
-        current: ActionRequest,
+        current: _PreparedAction,
         prior_decision: AuthorizationDecision,
         approval: ApprovalRecord,
         *,
@@ -283,7 +312,12 @@ class AsyncAuthorizationClient:
     ) -> _PreparedAction:
         """Reauthorize a sealed resume candidate, then transfer execution."""
 
-        _require_resumable(original, prior_decision, approval)
+        _require_resumable(
+            original,
+            prior_decision,
+            approval,
+            trusted_now=_trusted_now(self._trusted_clock),
+        )
         candidate: _PreparedAction | None = None
         committed = False
         try:
@@ -309,7 +343,7 @@ class AsyncAuthorizationClient:
                     decision_id=fresh_decision.decision_id,
                     correlation_id=fresh_decision.correlation_id,
                 ) from None
-            builder._commit_resume(original, candidate)  # noqa: SLF001
+            builder._commit_resume(original, current, candidate)  # noqa: SLF001
             committed = True
             return candidate
         finally:
@@ -324,9 +358,26 @@ class AsyncAuthorizationClient:
             while self._active:
                 await self._condition.wait()
         failure: AuthorizationUnavailable | None = None
+        close_targets: list[Callable[[], Awaitable[None]]] = []
         if self._owns_transport:
+            close_targets.append(self._transport.aclose)
+        approval_transport = self._approval_transport
+        if (
+            self._owns_approval_transport
+            and approval_transport is not None
+            and id(approval_transport) != id(self._transport)
+        ):
+            close_targets.append(approval_transport.aclose)
+        elif (
+            self._owns_approval_transport
+            and approval_transport is not None
+            and id(approval_transport) == id(self._transport)
+            and not close_targets
+        ):
+            close_targets.append(approval_transport.aclose)
+        for close_target in close_targets:
             try:
-                await self._transport.aclose()
+                await close_target()
             except BaseException:
                 failure = AuthorizationUnavailable()
         async with self._condition:

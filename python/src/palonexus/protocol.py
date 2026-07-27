@@ -769,7 +769,7 @@ class ActionRequestBuilder:
     def resume(
         self,
         original: _PreparedAction,
-        current: ActionRequest,
+        current: _PreparedAction,
         *,
         prior_decision_id: str,
         approval_id: str,
@@ -787,7 +787,7 @@ class ActionRequestBuilder:
             approval_id=approval_id,
         )
         try:
-            self._commit_resume(original, resumed)
+            self._commit_resume(original, current, resumed)
         except BaseException:
             resumed.close()
             raise
@@ -796,7 +796,7 @@ class ActionRequestBuilder:
     def _prepare_resume(
         self,
         original: _PreparedAction,
-        current: ActionRequest,
+        current: _PreparedAction,
         *,
         prior_decision_id: str,
         approval_id: str,
@@ -807,85 +807,81 @@ class ActionRequestBuilder:
         decision before committing execution ownership. The public ``resume``
         method above retains its original atomic-transfer contract.
         """
-        if not isinstance(original, _PreparedAction):
+        if not isinstance(original, _PreparedAction) or not isinstance(
+            current, _PreparedAction
+        ) or current is original:
             raise _invalid()
         original._verify_for(self._seal_key)
-        fresh_target: _PreparedTarget | None = None
-        temporary: _PreparedAction | None = None
+        current._verify_for(self._seal_key)
         try:
             _wire.DecisionID(prior_decision_id)
             _wire.ApprovalID(approval_id)
-            checked = ActionRequest.model_validate(
-                {
-                    name: getattr(current, name)
-                    for name in type(current).model_fields
-                }
-            )
             prior = original.request
+            checked = current.request
             if (
-                checked.action_id != str(prior.action_id)
-                or checked.correlation_id != str(prior.correlation_id)
-                or checked.task.task_id != str(prior.task.task_id)
-                or checked.task.session_id != str(prior.task.session_id)
-                or checked.action != str(prior.action)
-                or checked.target.kind != str(prior.target.kind)
-                or checked.target.service != str(prior.target.service)
-                or checked.target.resource != str(prior.target.resource)
-                or checked.side_effect != str(prior.side_effect)
+                checked.action_id != prior.action_id
+                or checked.correlation_id != prior.correlation_id
+                or checked.task != prior.task
+                or checked.adapter != prior.adapter
+                or checked.action != prior.action
+                or checked.target != prior.target
+                or checked.side_effect != prior.side_effect
+                or current.client_scope_hash != original.client_scope_hash
+                or checked.request_id == prior.request_id
+                or checked.idempotency_key == prior.idempotency_key
             ):
                 raise ApprovalScopeMismatch(
                     request_id=prior.request_id,
                     decision_id=prior_decision_id,
                     correlation_id=prior.correlation_id,
                 )
-            fresh_target = self.prepare_generic_target(checked.target)
-            resumed_intent = ActionRequest(
-                action_id=str(prior.action_id),
-                request_id=self._new_id("request"),
-                correlation_id=str(prior.correlation_id),
-                idempotency_key=self._new_id("idempotency"),
+            resumed_request = _wire.ActionRequest(
+                schema_version=checked.schema_version,
+                action_id=checked.action_id,
+                request_id=_wire.RequestID(self._new_id("request")),
+                correlation_id=checked.correlation_id,
+                idempotency_key=_wire.AuthorizationIdempotencyKey(
+                    self._new_id("idempotency")
+                ),
+                adapter=checked.adapter,
+                task=checked.task,
                 action=checked.action,
                 target=checked.target,
-                task=checked.task,
                 side_effect=checked.side_effect,
-                causation_id=prior_decision_id,
-                resume_from_approval_id=approval_id,
+                occurred_at=_timestamp(lambda: datetime.now(UTC)),
+                context=checked.context,
+                causation_id=_wire.CausationID(prior_decision_id),
+                resume_from_approval_id=_wire.ApprovalID(approval_id),
             )
-            context = prior.context
-            temporary = self.build(
-                resumed_intent,
-                prepared_target=fresh_target,
-                cwd=None if context.cwd is None else str(context.cwd),
-                repository=(
-                    None if context.repository is None else str(context.repository)
-                ),
-                tool_name=(
-                    None if context.tool_name is None else str(context.tool_name)
-                ),
-                safe_display=(
-                    None if context.safe_display is None else str(context.safe_display)
-                ),
+            resumed_request.validate_structural()
+            if (
+                resumed_request.request_id
+                in {prior.request_id, checked.request_id}
+                or resumed_request.idempotency_key
+                in {prior.idempotency_key, checked.idempotency_key}
+            ):
+                raise _invalid()
+            resumed_scope_hash = _canonical.client_scope_hash(
+                resumed_request.to_dict()
             )
-            if temporary.client_scope_hash != original.client_scope_hash:
+            if resumed_scope_hash != original.client_scope_hash:
                 raise ApprovalScopeMismatch(
-                    request_id=temporary.request.request_id,
+                    request_id=resumed_request.request_id,
                     decision_id=prior_decision_id,
-                    correlation_id=temporary.request.correlation_id,
+                    correlation_id=resumed_request.correlation_id,
                 )
-            original_state = original._verify_for(self._seal_key)
-            with original_state.lock:
-                original._verify_for(self._seal_key)
-                kind = original_state.kind
-                execution = bytearray(original_state.buffer)
-                temporary.close()
+            current_state = current._verify_for(self._seal_key)
+            with current_state.lock:
+                current._verify_for(self._seal_key)
+                execution = bytearray(current_state.buffer)
                 try:
                     resumed = _PreparedAction(
                         _CAPABILITY,
                         key=self._seal_key,
-                        request=temporary.request,
-                        client_scope_hash=temporary.client_scope_hash,
-                        target_nonce=fresh_target._target_nonce,
-                        kind=kind,
+                        request=resumed_request,
+                        client_scope_hash=resumed_scope_hash,
+                        target_nonce=current._target_nonce,
+                        kind=current_state.kind,
                         buffer=execution,
                     )
                 except Exception:
@@ -894,26 +890,30 @@ class ActionRequestBuilder:
                 return resumed
         except (ApprovalScopeMismatch, ModelValidationError):
             raise
-        except (AttributeError, TypeError, ValueError):
+        except (
+            AttributeError,
+            TypeError,
+            ValueError,
+            _canonical.CanonicalizationError,
+        ):
             raise _invalid() from None
-        finally:
-            if temporary is not None:
-                temporary.close()
-            if fresh_target is not None:
-                fresh_target.close()
 
     def _commit_resume(
         self,
         original: _PreparedAction,
+        current: _PreparedAction,
         resumed: _PreparedAction,
     ) -> None:
         """Atomically retire an original after its candidate is allowed."""
 
-        if not isinstance(original, _PreparedAction) or not isinstance(
-            resumed, _PreparedAction
+        if (
+            not isinstance(original, _PreparedAction)
+            or not isinstance(current, _PreparedAction)
+            or not isinstance(resumed, _PreparedAction)
         ):
             raise _invalid()
         original_state = original._verify_for(self._seal_key)
+        current_state = current._verify_for(self._seal_key)
         resumed._verify_for(self._seal_key)
         try:
             if (
@@ -921,12 +921,19 @@ class ActionRequestBuilder:
                 or resumed.request.correlation_id != original.request.correlation_id
                 or resumed.request.task != original.request.task
                 or resumed.client_scope_hash != original.client_scope_hash
+                or current.client_scope_hash != original.client_scope_hash
             ):
                 raise _invalid()
-            with original_state.lock:
+            locks = sorted(
+                (original_state, current_state),
+                key=id,
+            )
+            with locks[0].lock, locks[1].lock:
                 original._verify_for(self._seal_key)
+                current._verify_for(self._seal_key)
                 resumed._verify_for(self._seal_key)
                 original_state.close()
+                current_state.close()
         except ModelValidationError:
             raise
         except (AttributeError, TypeError, ValueError):
