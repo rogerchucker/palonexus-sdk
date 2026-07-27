@@ -60,15 +60,22 @@ locked distribution without contacting the network.
 | --- | --- | --- | --- | --- | --- | --- |
 | annotated-types | 0.8.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | aiosqlite | 0.22.1 | MIT | reviewed | Retain notices | None identified | PyPI |
+| anthropic | 0.120.0 | MIT | reviewed | Retain supplied license | None supplied | PyPI |
 | anyio | 4.14.2 | MIT | reviewed | Retain notices | None identified | PyPI |
 | ast-serialize | 0.6.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | attrs | 26.1.0 | MIT | reviewed | Retain notices | None identified | PyPI |
+| bracex | 3.0.1 | MIT | reviewed | Retain supplied license | None supplied | PyPI |
 | certifi | 2026.7.22 | MPL-2.0 | reviewed | Retain notices; disclose modifications to covered files | None identified | PyPI |
 | cffi | 2.1.0 | MIT-0 | reviewed | Retain supplied license | None supplied | PyPI |
 | charset-normalizer | 3.4.9 | MIT | reviewed | Retain notices | None identified | PyPI |
 | colorama | 0.4.6 | BSD-3-Clause | reviewed | Retain notices | None identified | PyPI |
 | cryptography | 46.0.7 | Apache-2.0 OR BSD-3-Clause | reviewed | Retain supplied licenses | None supplied | PyPI |
+| deepagents | 0.6.12 | MIT | reviewed | Retain notices | None identified | PyPI |
 | distro | 1.9.0 | Apache-2.0 | reviewed | Retain supplied license | None supplied | PyPI |
+| docstring-parser | 0.18.0 | MIT | reviewed | Retain supplied license | None supplied | PyPI |
+| filetype | 1.2.0 | MIT | reviewed | Retain supplied license | None supplied | PyPI |
+| google-auth | 2.56.2 | Apache-2.0 | reviewed | Retain supplied license | None supplied | PyPI |
+| google-genai | 2.14.0 | Apache-2.0 | reviewed | Retain supplied license | None supplied | PyPI |
 | hatch-vcs | 0.5.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | hatchling | 1.31.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | h11 | 0.16.0 | MIT | reviewed | Retain notices | None identified | PyPI |
@@ -80,8 +87,11 @@ locked distribution without contacting the network.
 | jsonschema-specifications | 2025.9.1 | MIT | reviewed | Retain notices | None identified | PyPI |
 | jsonpatch | 1.33 | BSD-3-Clause | reviewed | Retain notices | None identified | PyPI |
 | jsonpointer | 3.1.1 | BSD-3-Clause | reviewed | Retain notices | None identified | PyPI |
+| jiter | 0.16.0 | MIT | reviewed | Retain supplied license | None supplied | PyPI |
 | langchain | 1.3.14 | MIT | reviewed | Retain notices | None identified | PyPI |
+| langchain-anthropic | 1.5.2 | MIT | reviewed | Retain supplied license | None supplied | PyPI |
 | langchain-core | 1.5.1 | MIT | reviewed | Retain notices | None identified | PyPI |
+| langchain-google-genai | 4.3.1 | MIT | reviewed | Retain supplied license | None supplied | PyPI |
 | langchain-protocol | 0.0.18 | MIT | reviewed | Retain notices | None identified | PyPI |
 | langgraph | 1.2.9 | MIT | reviewed | Retain notices | None identified | PyPI |
 | langgraph-checkpoint | 4.1.1 | MIT | reviewed | Retain notices | None identified | PyPI |
@@ -99,6 +109,8 @@ locked distribution without contacting the network.
 | pluggy | 1.6.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | pydantic | 2.13.4 | MIT | reviewed | Retain notices | None identified | PyPI |
 | pydantic-core | 2.46.4 | MIT | reviewed | Retain notices | None identified | PyPI |
+| pyasn1 | 0.6.4 | BSD-2-Clause | reviewed | Retain supplied license | None supplied | PyPI |
+| pyasn1-modules | 0.4.2 | BSD-2-Clause | reviewed | Retain supplied license | None supplied | PyPI |
 | pycparser | 3.0 | BSD-3-Clause | reviewed | Retain supplied license | None supplied | PyPI |
 | sqlite-vec | 0.1.9 | MIT OR Apache-2.0 | reviewed | Retain supplied licenses | None supplied | PyPI |
 | pygments | 2.20.0 | BSD-2-Clause | reviewed | Retain notices | None identified | PyPI |
@@ -120,6 +132,7 @@ locked distribution without contacting the network.
 | urllib3 | 2.7.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | uuid-utils | 0.17.0 | BSD-3-Clause | reviewed | Retain notices | None identified | PyPI |
 | vcs-versioning | 2.2.2 | MIT | reviewed | Retain notices | None identified | PyPI |
+| wcmatch | 11.0 | MIT | reviewed | Retain supplied license | None supplied | PyPI |
 | websockets | 15.0.1 | BSD-3-Clause | reviewed | Retain notices | None identified | PyPI |
 | xxhash | 3.8.1 | BSD-2-Clause | reviewed | Retain notices | None identified | PyPI |
 | zstandard | 0.25.0 | BSD-3-Clause | reviewed | Retain notices | None identified | PyPI |

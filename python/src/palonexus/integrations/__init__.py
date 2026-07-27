@@ -50,10 +50,18 @@ _LANGGRAPH_EXPORTS = frozenset(
         "PaloNexusLangGraphNode",
     }
 )
+_DEEPAGENTS_EXPORTS = frozenset(
+    {
+        "DeepAgentsAuthorizationContext",
+        "MissingDeepAgentsDependency",
+        "PaloNexusDeepAgentsMiddleware",
+        "create_authorized_deep_agent",
+    }
+)
 
 
 def __getattr__(name: str) -> Any:
-    if name not in _LANGCHAIN_EXPORTS | _LANGGRAPH_EXPORTS:
+    if name not in _LANGCHAIN_EXPORTS | _LANGGRAPH_EXPORTS | _DEEPAGENTS_EXPORTS:
         raise AttributeError(name)
     if name == "MissingIntegrationDependency":
         return MissingIntegrationDependency
@@ -61,13 +69,17 @@ def __getattr__(name: str) -> Any:
         from . import langgraph
 
         return getattr(langgraph, name)
+    if name in _DEEPAGENTS_EXPORTS:
+        from . import deepagents
+
+        return getattr(deepagents, name)
     from . import langchain
 
     return getattr(langchain, name)
 
 
 def __dir__() -> list[str]:
-    return sorted(_LANGCHAIN_EXPORTS | _LANGGRAPH_EXPORTS)
+    return sorted(_LANGCHAIN_EXPORTS | _LANGGRAPH_EXPORTS | _DEEPAGENTS_EXPORTS)
 
 
-__all__ = sorted(_LANGCHAIN_EXPORTS | _LANGGRAPH_EXPORTS)
+__all__ = sorted(_LANGCHAIN_EXPORTS | _LANGGRAPH_EXPORTS | _DEEPAGENTS_EXPORTS)

@@ -60,6 +60,9 @@ langgraph = [
     "langgraph>=1,<2",
     "langgraph-checkpoint-sqlite>=3,<4",
 ]
+deepagents = [
+    "deepagents>=0.3,<1",
+]
 
 [tool.hatch.version]
 source = "vcs"
