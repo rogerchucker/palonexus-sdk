@@ -9,6 +9,8 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
+	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -17,6 +19,7 @@ import (
 	"os"
 	"os/signal"
 	"path/filepath"
+	"sort"
 	"strings"
 	"sync"
 	"syscall"
@@ -38,7 +41,7 @@ const (
 	defaultStartup   = 5 * time.Second
 	defaultStop      = 3 * time.Second
 	defaultKill      = 2 * time.Second
-	maxOneShot       = 15 * time.Second
+	maxOneShot       = 5 * time.Second
 	maxOneShotActive = 16
 )
 
@@ -50,14 +53,16 @@ var (
 )
 
 type Config struct {
-	RuntimeDir     string
-	Handler        socket.Handler
-	Executable     string
-	Arguments      []string
-	ChildEnv       []string
-	StartupTimeout time.Duration
-	StopTimeout    time.Duration
-	KillTimeout    time.Duration
+	RuntimeDir           string
+	Handler              socket.Handler
+	Executable           string
+	Arguments            []string
+	ChildEnv             []string
+	ConfigurationDigest  string
+	StartupTimeout       time.Duration
+	StopTimeout          time.Duration
+	KillTimeout          time.Duration
+	afterSocketPublished func()
 }
 
 type Status struct {
@@ -72,12 +77,17 @@ type lifecycleState struct {
 	Executable string `json:"executable"`
 	Device     uint64 `json:"device"`
 	Inode      uint64 `json:"inode"`
+	Mode       uint32 `json:"mode"`
+	UID        uint32 `json:"uid"`
+	BinaryHash string `json:"binaryHash"`
+	LaunchHash string `json:"launchHash"`
+	StartToken string `json:"startToken"`
 }
 
 type Manager struct {
 	cfg          Config
-	launchDevice uint64
-	launchInode  uint64
+	launch       executableIdentity
+	launchHash   string
 	oneShotSlots chan struct{}
 	mu           sync.Mutex
 }
@@ -87,20 +97,23 @@ func New(cfg Config) (*Manager, error) {
 		filepath.Clean(cfg.RuntimeDir) == string(filepath.Separator) || cfg.Handler == nil {
 		return nil, ErrUnsafeRuntime
 	}
-	var launchDevice, launchInode uint64
+	var launch executableIdentity
 	if cfg.Executable != "" {
 		canonical, err := filepath.EvalSymlinks(cfg.Executable)
 		if err != nil {
 			return nil, ErrUnsafeExecutable
 		}
 		cfg.Executable = canonical
-		device, inode, launchErr := validateLaunch(
+		identity, launchErr := validateLaunch(
 			cfg.Executable, cfg.Arguments, cfg.ChildEnv,
 		)
 		if launchErr != nil {
 			return nil, launchErr
 		}
-		launchDevice, launchInode = device, inode
+		launch = identity
+	}
+	if cfg.ConfigurationDigest != "" && !validHexDigest(cfg.ConfigurationDigest) {
+		return nil, ErrUnsafeExecutable
 	}
 	if cfg.StartupTimeout == 0 {
 		cfg.StartupTimeout = defaultStartup
@@ -124,7 +137,10 @@ func New(cfg Config) (*Manager, error) {
 		return nil, ErrUnsafeRuntime
 	}
 	return &Manager{
-		cfg: cloneConfig(cfg), launchDevice: launchDevice, launchInode: launchInode,
+		cfg: cloneConfig(cfg), launch: launch,
+		launchHash: canonicalLaunchHash(
+			launch.Digest, cfg.Arguments, cfg.ChildEnv, cfg.ConfigurationDigest,
+		),
 		oneShotSlots: make(chan struct{}, maxOneShotActive),
 	}, nil
 }
@@ -149,28 +165,45 @@ func (m *Manager) Run(ctx context.Context) error {
 		return ErrUnavailable
 	}
 	handler := func(requestCtx context.Context, document []byte) ([]byte, error) {
-		if isStopRequest(document, token) {
-			cancel()
-			return marshalFailure(), nil
-		}
 		return m.cfg.Handler(requestCtx, document)
 	}
 	server, err := socket.New(socket.Config{
 		RuntimeDir: m.cfg.RuntimeDir,
 		SocketName: socketName,
 		Handler:    handler,
+		ControlHandler: func(_ context.Context, document []byte) ([]byte, bool) {
+			if !isStopRequest(document, token) {
+				return nil, false
+			}
+			cancel()
+			return marshalFailure(), true
+		},
+		RequestTimeout: maxOneShot,
 	})
 	if err != nil {
 		return classifyRuntime(err)
 	}
-	executable, device, inode, err := currentExecutableIdentity()
+	if m.cfg.afterSocketPublished != nil {
+		m.cfg.afterSocketPublished()
+	}
+	executable, identity, err := currentExecutableIdentity()
 	if err != nil {
 		_ = server.Close()
 		return ErrUnsafeExecutable
 	}
+	startToken, err := processStartToken(os.Getpid())
+	if err != nil {
+		_ = server.Close()
+		return ErrUnprovenProcess
+	}
 	state := lifecycleState{
 		Version: lifecycleVersion, PID: os.Getpid(), Token: token,
-		Executable: executable, Device: device, Inode: inode,
+		Executable: executable, Device: identity.Device, Inode: identity.Inode,
+		Mode: identity.Mode, UID: identity.UID, BinaryHash: identity.Digest,
+		LaunchHash: canonicalLaunchHash(
+			identity.Digest, m.cfg.Arguments, m.cfg.ChildEnv, m.cfg.ConfigurationDigest,
+		),
+		StartToken: startToken,
 	}
 	dir, err := openRuntime(m.cfg.RuntimeDir, false)
 	if err != nil {
@@ -208,8 +241,12 @@ func (m *Manager) Status(ctx context.Context) (Status, error) {
 	defer dir.Close()
 	state, err := readState(dir)
 	if errors.Is(err, os.ErrNotExist) {
-		if existsAt(dir, socketName) {
-			return Status{}, ErrUnsafeRuntime
+		candidate, candidateErr := recoverableSocketCandidate(dir)
+		if candidateErr != nil {
+			return Status{}, candidateErr
+		}
+		if candidate {
+			return Status{}, ErrUnavailable
 		}
 		return Status{}, nil
 	}
@@ -221,6 +258,12 @@ func (m *Manager) Status(ctx context.Context) (Status, error) {
 	}
 	pid, probeErr := socket.Probe(filepath.Join(m.cfg.RuntimeDir, socketName), probeBudget(ctx))
 	if probeErr != nil {
+		if stateMatchesProcess(state) {
+			return Status{}, ErrUnavailable
+		}
+		if processExists(state.PID) {
+			return Status{}, ErrUnprovenProcess
+		}
 		return Status{}, nil
 	}
 	if pid != state.PID {
@@ -323,6 +366,12 @@ func (m *Manager) Check(ctx context.Context, document []byte, oneShot bool) ([]b
 }
 
 func (m *Manager) checkOneShot(ctx context.Context, document []byte) ([]byte, error) {
+	if _, err := protocol.ParseActionRequest(document); err != nil {
+		bounded, cancel := context.WithTimeout(ctx, maxOneShot)
+		defer cancel()
+		response := socket.ProcessFrame(bounded, document, maxFrameBytes, m.cfg.Handler)
+		return validateResponse(bytes.TrimSuffix(response, []byte{'\n'}))
+	}
 	select {
 	case m.oneShotSlots <- struct{}{}:
 	default:
@@ -330,33 +379,15 @@ func (m *Manager) checkOneShot(ctx context.Context, document []byte) ([]byte, er
 	}
 	bounded, cancel := context.WithTimeout(ctx, maxOneShot)
 	defer cancel()
-	type result struct {
-		response []byte
-		err      error
+	wrapped := func(handlerCtx context.Context, input []byte) ([]byte, error) {
+		defer func() { <-m.oneShotSlots }()
+		return m.cfg.Handler(handlerCtx, input)
 	}
-	completed := make(chan result, 1)
-	go func() {
-		defer func() {
-			<-m.oneShotSlots
-			if recover() != nil {
-				completed <- result{err: ErrUnavailable}
-			}
-		}()
-		response, err := m.cfg.Handler(bounded, append([]byte(nil), document...))
-		completed <- result{response: response, err: err}
-	}()
-	select {
-	case value := <-completed:
-		if value.err != nil {
-			if err := bounded.Err(); err != nil {
-				return nil, err
-			}
-			return nil, ErrUnavailable
-		}
-		return validateResponse(value.response)
-	case <-bounded.Done():
-		return nil, bounded.Err()
+	response := socket.ProcessFrame(bounded, document, maxFrameBytes, wrapped)
+	if err := bounded.Err(); err != nil {
+		return nil, err
 	}
+	return validateResponse(bytes.TrimSuffix(response, []byte{'\n'}))
 }
 
 func validateResponse(response []byte) ([]byte, error) {
@@ -433,13 +464,19 @@ func sendStop(ctx context.Context, path, token string) error {
 func (m *Manager) stateMatchesLaunch(state lifecycleState) bool {
 	return m.cfg.Executable == "" ||
 		state.Executable == m.cfg.Executable &&
-			state.Device == m.launchDevice &&
-			state.Inode == m.launchInode
+			state.Device == m.launch.Device &&
+			state.Inode == m.launch.Inode &&
+			state.Mode == m.launch.Mode &&
+			state.UID == m.launch.UID &&
+			state.BinaryHash == m.launch.Digest &&
+			state.LaunchHash == m.launchHash
 }
 
 func stateMatchesProcess(state lifecycleState) bool {
 	device, inode, err := processIdentity(state.PID)
-	return err == nil && device == state.Device && inode == state.Inode
+	startToken, startErr := processStartToken(state.PID)
+	return err == nil && startErr == nil && device == state.Device &&
+		inode == state.Inode && startToken == state.StartToken
 }
 
 func signalProven(path string, state lifecycleState, signal syscall.Signal) error {
@@ -453,10 +490,7 @@ func signalProven(path string, state lifecycleState, signal syscall.Signal) erro
 	if current != state.PID || !stateMatchesProcess(state) {
 		return ErrUnprovenProcess
 	}
-	if err := syscall.Kill(state.PID, signal); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return ErrUnavailable
-	}
-	return nil
+	return signalStableProcess(state, signal)
 }
 
 func waitStopped(ctx context.Context, path string, pid int, maximum time.Duration) bool {
@@ -505,79 +539,154 @@ func randomToken() (string, error) {
 	return hex.EncodeToString(value[:]), nil
 }
 
-func classifyRuntime(error) error { return ErrUnsafeRuntime }
+func classifyRuntime(err error) error {
+	if errors.Is(err, socket.ErrRecoveryAmbiguous) {
+		return err
+	}
+	return ErrUnsafeRuntime
+}
 
-func currentExecutableIdentity() (string, uint64, uint64, error) {
+type executableIdentity struct {
+	Device uint64
+	Inode  uint64
+	Mode   uint32
+	UID    uint32
+	Digest string
+}
+
+func currentExecutableIdentity() (string, executableIdentity, error) {
 	path, err := os.Executable()
 	if err != nil {
-		return "", 0, 0, err
+		return "", executableIdentity{}, err
 	}
 	path, err = filepath.EvalSymlinks(path)
 	if err != nil {
-		return "", 0, 0, err
+		return "", executableIdentity{}, err
 	}
-	info, err := os.Stat(path)
-	if err != nil {
-		return "", 0, 0, err
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return "", 0, 0, ErrUnsafeExecutable
-	}
-	return path, uint64(stat.Dev), uint64(stat.Ino), nil
+	identity, err := inspectExecutable(path)
+	return path, identity, err
 }
 
-func validateLaunch(executable string, arguments, environment []string) (uint64, uint64, error) {
+func validateLaunch(
+	executable string,
+	arguments, environment []string,
+) (executableIdentity, error) {
 	if !filepath.IsAbs(executable) || filepath.Clean(executable) == string(filepath.Separator) ||
 		strings.ContainsRune(executable, 0) {
-		return 0, 0, ErrUnsafeExecutable
+		return executableIdentity{}, ErrUnsafeExecutable
 	}
 	info, err := os.Lstat(executable)
 	if err != nil || !info.Mode().IsRegular() || info.Mode()&0o022 != 0 ||
 		info.Mode()&(os.ModeSetuid|os.ModeSetgid) != 0 {
-		return 0, 0, ErrUnsafeExecutable
+		return executableIdentity{}, ErrUnsafeExecutable
 	}
 	stat, ok := info.Sys().(*syscall.Stat_t)
 	if !ok || (int(stat.Uid) != os.Geteuid() && stat.Uid != 0) || stat.Nlink != 1 {
-		return 0, 0, ErrUnsafeExecutable
+		return executableIdentity{}, ErrUnsafeExecutable
 	}
 	// Scripts delegate interpretation to a mutable shebang target. The daemon
 	// launcher accepts only native executables.
 	file, err := os.Open(executable)
 	if err != nil {
-		return 0, 0, ErrUnsafeExecutable
+		return executableIdentity{}, ErrUnsafeExecutable
 	}
 	var header [2]byte
 	_, readErr := io.ReadFull(file, header[:])
 	_ = file.Close()
 	if readErr != nil || string(header[:]) == "#!" {
-		return 0, 0, ErrUnsafeExecutable
+		return executableIdentity{}, ErrUnsafeExecutable
 	}
 	if len(arguments) > 128 || len(environment) > 128 {
-		return 0, 0, ErrUnsafeExecutable
+		return executableIdentity{}, ErrUnsafeExecutable
 	}
 	for _, value := range arguments {
 		if value == "" || len(value) > 4096 || strings.ContainsRune(value, 0) ||
 			strings.ContainsAny(value, "\r\n") {
-			return 0, 0, ErrUnsafeExecutable
+			return executableIdentity{}, ErrUnsafeExecutable
 		}
 	}
 	seenEnvironment := make(map[string]struct{}, len(environment))
 	for _, assignment := range environment {
 		if assignment == "" || len(assignment) > 4096 ||
 			strings.ContainsRune(assignment, 0) || strings.ContainsAny(assignment, "\r\n") {
-			return 0, 0, ErrUnsafeExecutable
+			return executableIdentity{}, ErrUnsafeExecutable
 		}
 		name, value, ok := strings.Cut(assignment, "=")
 		if !ok || value == "" || !validChildEnvironmentName(name) {
-			return 0, 0, ErrUnsafeExecutable
+			return executableIdentity{}, ErrUnsafeExecutable
 		}
 		if _, duplicate := seenEnvironment[name]; duplicate {
-			return 0, 0, ErrUnsafeExecutable
+			return executableIdentity{}, ErrUnsafeExecutable
 		}
 		seenEnvironment[name] = struct{}{}
 	}
-	return uint64(stat.Dev), uint64(stat.Ino), nil
+	return inspectExecutable(executable)
+}
+
+func inspectExecutable(path string) (executableIdentity, error) {
+	file, err := os.Open(path)
+	if err != nil {
+		return executableIdentity{}, ErrUnsafeExecutable
+	}
+	defer file.Close()
+	return inspectExecutableFile(file)
+}
+
+func inspectExecutableFile(file *os.File) (executableIdentity, error) {
+	info, err := file.Stat()
+	if err != nil {
+		return executableIdentity{}, ErrUnsafeExecutable
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || !info.Mode().IsRegular() || info.Mode()&0o022 != 0 ||
+		info.Mode()&(os.ModeSetuid|os.ModeSetgid) != 0 ||
+		(int(stat.Uid) != os.Geteuid() && stat.Uid != 0) || stat.Nlink != 1 {
+		return executableIdentity{}, ErrUnsafeExecutable
+	}
+	hasher := sha256.New()
+	if _, err := io.Copy(hasher, file); err != nil {
+		return executableIdentity{}, ErrUnsafeExecutable
+	}
+	return executableIdentity{
+		Device: uint64(stat.Dev), Inode: uint64(stat.Ino),
+		Mode: uint32(stat.Mode), UID: stat.Uid,
+		Digest: hex.EncodeToString(hasher.Sum(nil)),
+	}, nil
+}
+
+func canonicalLaunchHash(
+	binaryDigest string,
+	arguments, environment []string,
+	configurationDigest string,
+) string {
+	hasher := sha256.New()
+	writeHashField(hasher, "palonexus-daemon-launch-v1")
+	writeHashField(hasher, binaryDigest)
+	for _, argument := range arguments {
+		writeHashField(hasher, argument)
+	}
+	sortedEnvironment := append([]string(nil), environment...)
+	sort.Strings(sortedEnvironment)
+	for _, assignment := range sortedEnvironment {
+		writeHashField(hasher, assignment)
+	}
+	writeHashField(hasher, configurationDigest)
+	return hex.EncodeToString(hasher.Sum(nil))
+}
+
+func writeHashField(writer io.Writer, value string) {
+	var length [8]byte
+	binary.BigEndian.PutUint64(length[:], uint64(len(value)))
+	_, _ = writer.Write(length[:])
+	_, _ = io.WriteString(writer, value)
+}
+
+func validHexDigest(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
 }
 
 func validChildEnvironmentName(name string) bool {
@@ -696,7 +805,10 @@ func readState(dir *os.File) (lifecycleState, error) {
 		value.Executable == "" || len(value.Executable) > 4096 ||
 		!filepath.IsAbs(value.Executable) || filepath.Clean(value.Executable) != value.Executable ||
 		strings.ContainsAny(value.Executable, "\x00\r\n") ||
-		value.Device == 0 || value.Inode == 0 {
+		value.Device == 0 || value.Inode == 0 || value.Mode == 0 ||
+		!validHexDigest(value.BinaryHash) || !validHexDigest(value.LaunchHash) ||
+		value.StartToken == "" || len(value.StartToken) > 128 ||
+		strings.ContainsAny(value.StartToken, "\x00\r\n") {
 		return lifecycleState{}, ErrUnsafeRuntime
 	}
 	if _, err := hex.DecodeString(value.Token); err != nil {
@@ -769,4 +881,20 @@ func removeStateIfOwned(dir *os.File, expected lifecycleState) error {
 func existsAt(dir *os.File, name string) bool {
 	var stat unix.Stat_t
 	return unix.Fstatat(int(dir.Fd()), name, &stat, unix.AT_SYMLINK_NOFOLLOW) == nil
+}
+
+func recoverableSocketCandidate(dir *os.File) (bool, error) {
+	var stat unix.Stat_t
+	err := unix.Fstatat(int(dir.Fd()), socketName, &stat, unix.AT_SYMLINK_NOFOLLOW)
+	if errors.Is(err, unix.ENOENT) {
+		return false, nil
+	}
+	if err != nil {
+		return false, ErrUnsafeRuntime
+	}
+	if stat.Mode&unix.S_IFMT != unix.S_IFSOCK || stat.Mode&0o777 != 0o600 ||
+		int(stat.Uid) != os.Geteuid() || stat.Nlink != 1 {
+		return false, ErrUnsafeRuntime
+	}
+	return true, nil
 }

@@ -9,8 +9,10 @@ import (
 	"fmt"
 	"os"
 	"os/exec"
+	"syscall"
 	"time"
 
+	"github.com/rogerchucker/palonexus-sdk/guard/internal/socket"
 	"golang.org/x/sys/unix"
 )
 
@@ -37,11 +39,12 @@ func (m *Manager) Start(ctx context.Context) error {
 	if statusErr == nil && status.Running {
 		return nil
 	}
-	if statusErr != nil && !errors.Is(statusErr, ErrUnprovenProcess) {
+	if errors.Is(statusErr, ErrUnavailable) {
+		if _, readErr := readState(dir); !errors.Is(readErr, os.ErrNotExist) {
+			return statusErr
+		}
+	} else if statusErr != nil && !errors.Is(statusErr, ErrUnprovenProcess) {
 		return fmt.Errorf("daemon: inspect status: %w", statusErr)
-	}
-	if existsAt(dir, socketName) && statusErr != nil {
-		return ErrUnsafeRuntime
 	}
 	if current, readErr := readState(dir); readErr == nil {
 		if !m.stateMatchesLaunch(current) {
@@ -58,26 +61,27 @@ func (m *Manager) Start(ctx context.Context) error {
 	} else if !errors.Is(readErr, os.ErrNotExist) {
 		return readErr
 	}
-	device, inode, err := validateLaunch(
+	identity, err := validateLaunch(
 		m.cfg.Executable, m.cfg.Arguments, m.cfg.ChildEnv,
 	)
-	if err != nil || device != m.launchDevice || inode != m.launchInode {
+	if err != nil || identity != m.launch {
 		return ErrUnsafeExecutable
 	}
 	logFile, err := openLog(dir)
 	if err != nil {
 		return err
 	}
-	command := exec.CommandContext(context.WithoutCancel(ctx), m.cfg.Executable, m.cfg.Arguments...)
-	command.Stdin = nil
-	command.Stdout = logFile
-	command.Stderr = logFile
-	command.Env = append(safeBaseEnvironment(), m.cfg.ChildEnv...)
-	command.SysProcAttr = &unix.SysProcAttr{Setsid: true}
+	command, closeExecutable, err := m.launchCommand(ctx, logFile)
+	if err != nil {
+		_ = logFile.Close()
+		return err
+	}
 	if err := command.Start(); err != nil {
+		closeExecutable()
 		_ = logFile.Close()
 		return ErrUnavailable
 	}
+	closeExecutable()
 	_ = logFile.Close()
 	waitDone := make(chan error, 1)
 	go func() { waitDone <- command.Wait() }()
@@ -91,7 +95,11 @@ func (m *Manager) Start(ctx context.Context) error {
 			return nil
 		}
 		select {
-		case <-waitDone:
+		case waitErr := <-waitDone:
+			var exitError *exec.ExitError
+			if errors.As(waitErr, &exitError) && exitError.ExitCode() == 93 {
+				return socket.ErrRecoveryAmbiguous
+			}
 			return ErrUnavailable
 		default:
 		}
@@ -113,6 +121,7 @@ func stopStartedProcess(process *os.Process, waitDone <-chan error, maximum time
 		return
 	default:
 	}
+	_ = syscall.Kill(-process.Pid, syscall.SIGINT)
 	_ = process.Signal(os.Interrupt)
 	timer := time.NewTimer(maximum)
 	defer timer.Stop()
@@ -120,6 +129,7 @@ func stopStartedProcess(process *os.Process, waitDone <-chan error, maximum time
 	case <-waitDone:
 		return
 	case <-timer.C:
+		_ = syscall.Kill(-process.Pid, syscall.SIGKILL)
 		_ = process.Kill()
 	}
 	select {

@@ -33,6 +33,24 @@ func echoHandler(_ context.Context, request []byte) ([]byte, error) {
 	)), nil
 }
 
+func validActionFrame(t *testing.T) string {
+	t.Helper()
+	document, err := os.ReadFile(filepath.Join(
+		"..", "..", "..", "protocol", "test-vectors", "action", "valid", "file-write.json",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, document); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := protocol.ParseActionRequest(compact.Bytes()); err != nil {
+		t.Fatalf("valid action fixture: %v", err)
+	}
+	return compact.String() + "\n"
+}
+
 func startTestServer(t *testing.T, mutate func(*Config)) (*Server, string) {
 	t.Helper()
 	root, err := os.MkdirTemp("", "pn-sock-")
@@ -136,7 +154,7 @@ func TestHandlerResponseIsOneCompactPhysicalLine(t *testing.T) {
 				"  \"retryable\": false\n}"), nil
 		}
 	})
-	got := exchange(t, path, `{"schemaVersion":"1"}`+"\n")
+	got := exchange(t, path, validActionFrame(t))
 	if string(got) != `{"schemaVersion":"1","code":"invalid_request","safeMessage":"The request is invalid.","retryable":false}`+"\n" {
 		t.Fatalf("response is not compact NDJSON: %q", got)
 	}
@@ -158,7 +176,7 @@ func TestHandlerResponseMustBeAProtocolDecisionOrError(t *testing.T) {
 					return response, nil
 				}
 			})
-			document := exchange(t, path, `{"schemaVersion":"1"}`+"\n")
+			document := exchange(t, path, validActionFrame(t))
 			failure, err := protocol.ParseProtocolError(document)
 			if err != nil || failure.Code != protocol.ProtocolErrorCodeInvalidDecision {
 				t.Fatalf("invalid handler response escaped: %s, %v", document, err)
@@ -171,7 +189,7 @@ func TestHandlerResponseMustBeAProtocolDecisionOrError(t *testing.T) {
 			return validDecision, nil
 		}
 	})
-	document := exchange(t, path, `{"schemaVersion":"1"}`+"\n")
+	document := exchange(t, path, validActionFrame(t))
 	if _, err := protocol.ParseAuthorizationDecision(document); err != nil {
 		t.Fatalf("valid decision was rejected: %s, %v", document, err)
 	}
@@ -215,7 +233,7 @@ func TestHandlerErrorsNeverLeakCredentials(t *testing.T) {
 			return nil, errors.New(secret)
 		}
 	})
-	response := exchange(t, path, `{"schemaVersion":"1"}`+"\n")
+	response := exchange(t, path, validActionFrame(t))
 	if bytes.Contains(response, []byte(secret)) {
 		t.Fatalf("credential leaked in response: %s", response)
 	}
@@ -232,7 +250,7 @@ func TestConcurrentClients(t *testing.T) {
 		wg.Add(1)
 		go func() {
 			defer wg.Done()
-			if got := exchange(t, path, `{"schemaVersion":"1"}`+"\n"); len(got) == 0 {
+			if got := exchange(t, path, validActionFrame(t)); len(got) == 0 {
 				t.Error("empty response")
 			}
 		}()
@@ -251,7 +269,7 @@ func TestPeerUIDMismatchFailsClosedBeforeHandler(t *testing.T) {
 			return []byte(`{"schemaVersion":"1"}`), nil
 		}
 	})
-	response := exchange(t, path, `{"schemaVersion":"1"}`+"\n")
+	response := exchange(t, path, validActionFrame(t))
 	failure, err := protocol.ParseProtocolError(response)
 	if err != nil {
 		t.Fatal(err)
@@ -399,7 +417,7 @@ func TestOwnedStaleModeClassifierRejectsEveryNonSocketInode(t *testing.T) {
 
 func TestCleanupNeverUnlinksReplacement(t *testing.T) {
 	srv, path := startTestServer(t, nil)
-	_ = exchange(t, path, `{"schemaVersion":"1"}`+"\n")
+	_ = exchange(t, path, validActionFrame(t))
 	if err := os.Remove(path); err != nil {
 		t.Fatal(err)
 	}
@@ -611,7 +629,7 @@ func TestCancellationProducesBoundedFailure(t *testing.T) {
 		c.RequestTimeout = 20 * time.Millisecond
 	})
 	start := time.Now()
-	response := exchange(t, path, `{"schemaVersion":"1"}`+"\n")
+	response := exchange(t, path, validActionFrame(t))
 	if time.Since(start) > time.Second {
 		t.Fatal("request did not terminate")
 	}
@@ -632,7 +650,7 @@ func TestRequestDeadlineDoesNotDependOnHandlerCooperation(t *testing.T) {
 		c.RequestTimeout = 20 * time.Millisecond
 	})
 	start := time.Now()
-	response := exchange(t, path, `{"schemaVersion":"1"}`+"\n")
+	response := exchange(t, path, validActionFrame(t))
 	if time.Since(start) > time.Second {
 		t.Fatal("uncooperative handler held the connection")
 	}
@@ -663,7 +681,7 @@ func TestUncooperativeHandlersAreStrictlyBounded(t *testing.T) {
 		}
 	})
 	for i := 0; i < 200; i++ {
-		response := exchange(t, path, `{"schemaVersion":"1"}`+"\n")
+		response := exchange(t, path, validActionFrame(t))
 		failure, err := protocol.ParseProtocolError(response)
 		if err != nil || failure.Code != protocol.ProtocolErrorCodeAuthorizationUnavailable {
 			t.Fatalf("request %d did not fail closed: %s, %v", i, response, err)
@@ -714,7 +732,7 @@ func TestClientAdmissionIsBoundedBeforeReading(t *testing.T) {
 		t.Fatal("held clients were not admitted")
 	}
 	start := time.Now()
-	response := exchange(t, path, `{"schemaVersion":"1"}`+"\n")
+	response := exchange(t, path, validActionFrame(t))
 	if time.Since(start) > 250*time.Millisecond {
 		t.Fatal("client admission waited for a read slot")
 	}
@@ -821,7 +839,7 @@ func TestCrashRestartRecoversOnlyOwnedStaleSocket(t *testing.T) {
 	defer cancel()
 	go func() { _ = restarted.Serve(ctx) }()
 	defer restarted.Close()
-	_ = exchange(t, restarted.Path(), `{"schemaVersion":"1"}`+"\n")
+	_ = exchange(t, restarted.Path(), validActionFrame(t))
 }
 
 func TestActiveSocketAndStaleReplacementAreNeverRemoved(t *testing.T) {
@@ -901,7 +919,7 @@ func TestCopiedLockAndJournalCannotDeleteActiveListener(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 	go func() { _ = active.Serve(ctx) }()
-	_ = exchange(t, active.Path(), `{"schemaVersion":"1"}`+"\n")
+	_ = exchange(t, active.Path(), validActionFrame(t))
 
 	lockPath := filepath.Join(dir, "."+DefaultSocketName+".lock")
 	if err := os.Remove(lockPath); err != nil {
@@ -914,7 +932,7 @@ func TestCopiedLockAndJournalCannotDeleteActiveListener(t *testing.T) {
 		_ = replacement.Close()
 		t.Fatal("copied lock and journal deleted an active listener")
 	}
-	_ = exchange(t, active.Path(), `{"schemaVersion":"1"}`+"\n")
+	_ = exchange(t, active.Path(), validActionFrame(t))
 }
 
 func TestLifecycleChallengeIsPeerBoundAndNeverReachesHandler(t *testing.T) {

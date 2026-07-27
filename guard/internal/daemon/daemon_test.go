@@ -17,10 +17,12 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
 
+	guardsocket "github.com/rogerchucker/palonexus-sdk/guard/internal/socket"
 	"github.com/rogerchucker/palonexus-sdk/guard/pkg/protocol"
 	"golang.org/x/sys/unix"
 )
@@ -37,6 +39,25 @@ func safeHandler(_ context.Context, request []byte) ([]byte, error) {
 		Retryable:     false,
 	}
 	return json.Marshal(value)
+}
+
+func validActionDocument(t *testing.T) []byte {
+	t.Helper()
+	document, err := os.ReadFile(filepath.Join(
+		"..", "..", "..", "protocol", "test-vectors", "action", "valid", "file-write.json",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	document = bytes.TrimSpace(document)
+	if _, err := protocol.ParseActionRequest(document); err != nil {
+		t.Fatalf("valid action fixture: %v", err)
+	}
+	var compact bytes.Buffer
+	if err := json.Compact(&compact, document); err != nil {
+		t.Fatal(err)
+	}
+	return compact.Bytes()
 }
 
 func testConfig(t *testing.T) Config {
@@ -70,6 +91,20 @@ func testConfig(t *testing.T) Config {
 	}
 }
 
+func testConfigForRuntime(t *testing.T, runtimeDir string) Config {
+	t.Helper()
+	cfg := testConfig(t)
+	// testConfig allocates another disposable root; retain its executable and
+	// launch contract but target the crash fixture's existing runtime.
+	cfg.RuntimeDir = runtimeDir
+	for index, value := range cfg.ChildEnv {
+		if strings.HasPrefix(value, "PALONEXUS_RUNTIME_DIR=") {
+			cfg.ChildEnv[index] = "PALONEXUS_RUNTIME_DIR=" + runtimeDir
+		}
+	}
+	return cfg
+}
+
 func TestDaemonProcessHelper(t *testing.T) {
 	if os.Getenv("PALONEXUS_DAEMON_HELPER") != "1" {
 		return
@@ -77,10 +112,21 @@ func TestDaemonProcessHelper(t *testing.T) {
 	cfg := Config{
 		RuntimeDir: os.Getenv("PALONEXUS_RUNTIME_DIR"),
 		Handler:    safeHandler,
+		Arguments:  os.Args[1:],
+		ChildEnv: []string{
+			"PALONEXUS_DAEMON_HELPER=" + os.Getenv("PALONEXUS_DAEMON_HELPER"),
+			"PALONEXUS_RUNTIME_DIR=" + os.Getenv("PALONEXUS_RUNTIME_DIR"),
+		},
+	}
+	if value := os.Getenv("PALONEXUS_DAEMON_HELPER_MODE"); value != "" {
+		cfg.ChildEnv = append(cfg.ChildEnv, "PALONEXUS_DAEMON_HELPER_MODE="+value)
 	}
 	mode := os.Getenv("PALONEXUS_DAEMON_HELPER_MODE")
 	if mode == "hang" {
 		select {}
+	}
+	if mode == "crash-after-socket" {
+		cfg.afterSocketPublished = func() { os.Exit(88) }
 	}
 	if mode == "caller" {
 		executable, _ := os.Executable()
@@ -105,6 +151,9 @@ func TestDaemonProcessHelper(t *testing.T) {
 	}
 	if err != nil {
 		fmt.Fprintln(os.Stderr, err)
+		if errors.Is(err, guardsocket.ErrRecoveryAmbiguous) {
+			os.Exit(93)
+		}
 		os.Exit(92)
 	}
 	os.Exit(0)
@@ -161,7 +210,13 @@ func TestConcurrentAutoStartAcrossProcessesStartsOneDaemon(t *testing.T) {
 			t.Fatalf("concurrent Start: %v: %s", err, outputs[index].Bytes())
 		}
 	}
-	manager, _ := New(cfg)
+	observerConfig := cfg
+	observerConfig.ChildEnv = []string{
+		"PALONEXUS_DAEMON_HELPER=1",
+		"PALONEXUS_DAEMON_HELPER_MODE=server",
+		"PALONEXUS_RUNTIME_DIR=" + cfg.RuntimeDir,
+	}
+	manager, _ := New(observerConfig)
 	t.Cleanup(func() { _ = manager.Stop(context.Background()) })
 	first, err := manager.Status(context.Background())
 	if err != nil || !first.Running {
@@ -181,7 +236,7 @@ func TestUnavailableDaemonFailsClosedAndExplicitOneShotUsesSameHandler(t *testin
 		t.Fatal(err)
 	}
 	manager.cfg.Executable = filepath.Join(t.TempDir(), "missing")
-	request := []byte(`{"schemaVersion":"1"}`)
+	request := validActionDocument(t)
 	if _, err := manager.Check(context.Background(), request, false); !errors.Is(err, ErrUnavailable) {
 		t.Fatalf("Check with failed start = %v, want ErrUnavailable", err)
 	}
@@ -204,12 +259,16 @@ func TestOneShotNeverConvertsPipelineFailureToAllow(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response, err := manager.Check(context.Background(), []byte(`{"schemaVersion":"1"}`), true)
-	if !errors.Is(err, ErrUnavailable) || response != nil {
+	response, err := manager.Check(context.Background(), validActionDocument(t), true)
+	if err != nil {
 		t.Fatalf("one-shot failure = %q, %v", response, err)
 	}
-	if strings.Contains(err.Error(), "Bearer-secret") {
-		t.Fatalf("secret reflected in error: %v", err)
+	failure, parseErr := protocol.ParseProtocolError(response)
+	if parseErr != nil || failure.Code != protocol.ProtocolErrorCodeAuthorizationUnavailable {
+		t.Fatalf("one-shot failure = %q, %v", response, parseErr)
+	}
+	if bytes.Contains(response, []byte("Bearer-secret")) {
+		t.Fatal("handler error leaked")
 	}
 }
 
@@ -222,12 +281,59 @@ func TestOneShotPanicFailsClosed(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	response, err := manager.Check(context.Background(), []byte(`{"schemaVersion":"1"}`), true)
-	if response != nil || !errors.Is(err, ErrUnavailable) {
+	response, err := manager.Check(context.Background(), validActionDocument(t), true)
+	if err != nil {
 		t.Fatalf("panic response = %q, %v", response, err)
 	}
-	if strings.Contains(err.Error(), "panic-secret") {
-		t.Fatalf("panic value leaked: %v", err)
+	failure, parseErr := protocol.ParseProtocolError(response)
+	if parseErr != nil || failure.Code != protocol.ProtocolErrorCodeAuthorizationUnavailable {
+		t.Fatalf("panic response = %q, %v", response, parseErr)
+	}
+	if bytes.Contains(response, []byte("panic-secret")) {
+		t.Fatal("panic value leaked")
+	}
+}
+
+func TestDaemonAndOneShotRejectMalformedActionBeforePipeline(t *testing.T) {
+	invalid := [][]byte{
+		[]byte(`{}`),
+		[]byte(`{"schemaVersion":"2"}`),
+		[]byte(`{"schemaVersion":"1","schemaVersion":"1"}`),
+		[]byte(`{"schemaVersion":"1"}`),
+	}
+	for _, oneShot := range []bool{true, false} {
+		t.Run(strconv.FormatBool(oneShot), func(t *testing.T) {
+			var calls atomic.Int32
+			cfg := testConfig(t)
+			cfg.Handler = func(context.Context, []byte) ([]byte, error) {
+				calls.Add(1)
+				return marshalFailure(), nil
+			}
+			manager, err := New(cfg)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !oneShot {
+				t.Cleanup(func() { _ = manager.Stop(context.Background()) })
+			}
+			for _, document := range invalid {
+				response, err := manager.Check(context.Background(), document, oneShot)
+				if err != nil {
+					t.Fatalf("Check(%s): %v", document, err)
+				}
+				failure, parseErr := protocol.ParseProtocolError(response)
+				wantCode := protocol.ProtocolErrorCodeInvalidRequest
+				if bytes.Contains(document, []byte(`"schemaVersion":"2"`)) {
+					wantCode = protocol.ProtocolErrorCodeUnsupportedProtocol
+				}
+				if parseErr != nil || failure.Code != wantCode {
+					t.Fatalf("response = %s, %v", response, parseErr)
+				}
+			}
+			if calls.Load() != 0 {
+				t.Fatalf("pipeline called %d times", calls.Load())
+			}
+		})
 	}
 }
 
@@ -245,7 +351,7 @@ func TestCancelledUncooperativeOneShotIsBounded(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
 	defer cancel()
 	started := time.Now()
-	if _, err := manager.Check(ctx, []byte(`{"schemaVersion":"1"}`), true); !errors.Is(err, context.DeadlineExceeded) {
+	if _, err := manager.Check(ctx, validActionDocument(t), true); !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("uncooperative one-shot = %v", err)
 	}
 	close(block)
@@ -451,6 +557,28 @@ func TestExecutableReplacementAfterValidationIsRejected(t *testing.T) {
 	}
 }
 
+func TestExecutableContentMutationAfterValidationIsRejected(t *testing.T) {
+	cfg := testConfig(t)
+	copyPath := filepath.Join(t.TempDir(), "palonexus-copy")
+	copyExecutable(t, cfg.Executable, copyPath)
+	cfg.Executable = copyPath
+	manager, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file, err := os.OpenFile(copyPath, os.O_WRONLY, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := file.WriteAt([]byte{0}, 16); err != nil {
+		t.Fatal(err)
+	}
+	_ = file.Close()
+	if err := manager.Start(context.Background()); !errors.Is(err, ErrUnsafeExecutable) {
+		t.Fatalf("Start after executable content mutation = %v", err)
+	}
+}
+
 func TestArgumentMetacharactersArePassedLiterally(t *testing.T) {
 	cfg := testConfig(t)
 	marker := filepath.Join(t.TempDir(), "PWNED")
@@ -481,7 +609,7 @@ func TestContextCancellationBoundsStartupAndOneShot(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
 	start := time.Now()
-	if _, err := manager.Check(ctx, []byte(`{"schemaVersion":"1"}`), true); !errors.Is(err, context.Canceled) {
+	if _, err := manager.Check(ctx, validActionDocument(t), true); !errors.Is(err, context.Canceled) {
 		t.Fatalf("one-shot cancellation = %v", err)
 	}
 	if elapsed := time.Since(start); elapsed > 500*time.Millisecond {
@@ -538,6 +666,67 @@ func TestCrashCleanupAndRestart(t *testing.T) {
 	}
 }
 
+func TestSIGKILLAfterSocketPublicationBeforeStateRecovers(t *testing.T) {
+	cfg := testConfig(t)
+	cfg.ChildEnv = append(cfg.ChildEnv, "PALONEXUS_DAEMON_HELPER_MODE=crash-after-socket")
+	crashing, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := crashing.Start(context.Background()); !errors.Is(err, ErrUnavailable) {
+		t.Fatalf("crashing Start = %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(cfg.RuntimeDir, socketName)); err != nil {
+		t.Fatalf("crash did not leave published socket: %v", err)
+	}
+	recoveryConfig := testConfigForRuntime(t, cfg.RuntimeDir)
+	restarted, err := New(recoveryConfig)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := restarted.Start(context.Background()); err != nil {
+		t.Fatalf("restart after publication crash: %v", err)
+	}
+	t.Cleanup(func() { _ = restarted.Stop(context.Background()) })
+}
+
+func TestAmbiguousSocketRecoveryErrorIsPreserved(t *testing.T) {
+	cfg := testConfig(t)
+	if _, err := New(cfg); err != nil {
+		t.Fatal(err)
+	}
+	stageName := ".sambiguous"
+	stagePath := filepath.Join(cfg.RuntimeDir, stageName)
+	listener, err := net.ListenUnix("unix", &net.UnixAddr{Name: stagePath, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	listener.SetUnlinkOnClose(false)
+	if err := os.Chmod(stagePath, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := listener.Close(); err != nil {
+		t.Fatal(err)
+	}
+	record := fmt.Sprintf(
+		`{"version":1,"phase":"preparing","generation":"%s","stageName":"%s","finalName":"%s"}`,
+		strings.Repeat("a", 32), stageName, socketName,
+	)
+	if err := os.WriteFile(
+		filepath.Join(cfg.RuntimeDir, "."+socketName+".lifecycle"),
+		[]byte(record), 0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	manager, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := manager.Start(context.Background()); !errors.Is(err, guardsocket.ErrRecoveryAmbiguous) {
+		t.Fatalf("Start ambiguous socket = %v", err)
+	}
+}
+
 func TestTerminationSignalCleansUpAndAllowsRestart(t *testing.T) {
 	cfg := testConfig(t)
 	manager, _ := New(cfg)
@@ -563,6 +752,37 @@ func TestTerminationSignalCleansUpAndAllowsRestart(t *testing.T) {
 	t.Cleanup(func() { _ = manager.Stop(context.Background()) })
 }
 
+func TestStatusDoesNotReportStoppedWhenMatchingProcessIsUnresponsive(t *testing.T) {
+	cfg := testConfig(t)
+	manager, _ := New(cfg)
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	status, err := manager.Status(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Kill(status.PID, syscall.SIGSTOP); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		_ = syscall.Kill(status.PID, syscall.SIGCONT)
+		_ = manager.Stop(context.Background())
+	})
+	ctx, cancel := context.WithTimeout(context.Background(), 50*time.Millisecond)
+	defer cancel()
+	got, err := manager.Status(ctx)
+	if err == nil || got.Running {
+		t.Fatalf("Status of live unresponsive daemon = %#v, %v", got, err)
+	}
+	if !errors.Is(err, ErrUnavailable) && !errors.Is(err, ErrUnprovenProcess) {
+		t.Fatalf("wrong unresponsive status error: %v", err)
+	}
+	if err := syscall.Kill(status.PID, syscall.SIGCONT); err != nil {
+		t.Fatal(err)
+	}
+}
+
 func TestStopDoesNotKillUnrelatedOrReusedPID(t *testing.T) {
 	cfg := testConfig(t)
 	manager, _ := New(cfg)
@@ -578,10 +798,15 @@ func TestStopDoesNotKillUnrelatedOrReusedPID(t *testing.T) {
 		Version:    lifecycleVersion,
 		PID:        sleeper.Process.Pid,
 		Token:      strings.Repeat("a", 64),
-		Executable: cfg.Executable,
-		Device:     1,
-		Inode:      1,
+		Executable: manager.cfg.Executable,
+		Device:     manager.launch.Device,
+		Inode:      manager.launch.Inode,
+		Mode:       manager.launch.Mode,
+		UID:        manager.launch.UID,
+		BinaryHash: manager.launch.Digest,
+		LaunchHash: manager.launchHash,
 	}
+	fake.StartToken, _ = processStartToken(sleeper.Process.Pid)
 	if err := writeTestState(cfg.RuntimeDir, fake); err != nil {
 		t.Fatal(err)
 	}
@@ -593,7 +818,7 @@ func TestStopDoesNotKillUnrelatedOrReusedPID(t *testing.T) {
 	}
 }
 
-func TestStopRequiresExecutableIdentityInLifecycleState(t *testing.T) {
+func TestStopRequiresCompleteProcessIdentityInLifecycleState(t *testing.T) {
 	cfg := testConfig(t)
 	manager, _ := New(cfg)
 	if err := manager.Start(context.Background()); err != nil {
@@ -608,23 +833,56 @@ func TestStopRequiresExecutableIdentityInLifecycleState(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	tampered := original
-	tampered.Inode++
-	document, _ := json.Marshal(tampered)
-	if err := os.WriteFile(filepath.Join(cfg.RuntimeDir, stateName), document, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := manager.Stop(context.Background()); !errors.Is(err, ErrUnprovenProcess) {
-		t.Fatalf("Stop with tampered executable identity = %v", err)
-	}
-	if err := syscall.Kill(original.PID, 0); err != nil {
-		t.Fatalf("daemon was killed from tampered state: %v", err)
-	}
 	originalDocument, _ := json.Marshal(original)
-	if err := os.WriteFile(filepath.Join(cfg.RuntimeDir, stateName), originalDocument, 0o600); err != nil {
-		t.Fatal(err)
+	for name, mutate := range map[string]func(*lifecycleState){
+		"executable identity": func(state *lifecycleState) { state.Inode++ },
+		"process start token": func(state *lifecycleState) { state.StartToken += "-reused" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			tampered := original
+			mutate(&tampered)
+			document, _ := json.Marshal(tampered)
+			if err := os.WriteFile(filepath.Join(cfg.RuntimeDir, stateName), document, 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := manager.Stop(context.Background()); !errors.Is(err, ErrUnprovenProcess) {
+				t.Fatalf("Stop with tampered %s = %v", name, err)
+			}
+			if err := syscall.Kill(original.PID, 0); err != nil {
+				t.Fatalf("daemon was killed from tampered %s: %v", name, err)
+			}
+			if err := os.WriteFile(filepath.Join(cfg.RuntimeDir, stateName), originalDocument, 0o600); err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 	_ = dir.Close()
+}
+
+func TestStatusBindsCanonicalArgumentsAndEnvironment(t *testing.T) {
+	cfg := testConfig(t)
+	manager, _ := New(cfg)
+	if err := manager.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = manager.Stop(context.Background()) })
+	for _, mutate := range []func(*Config){
+		func(value *Config) { value.Arguments = append(value.Arguments, "--changed") },
+		func(value *Config) {
+			value.ChildEnv = append(value.ChildEnv, "PALONEXUS_CHANGED=1")
+		},
+		func(value *Config) { value.ConfigurationDigest = strings.Repeat("b", 64) },
+	} {
+		changed := cfg
+		mutate(&changed)
+		other, err := New(changed)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, err := other.Status(context.Background()); !errors.Is(err, ErrUnprovenProcess) {
+			t.Fatalf("Status with changed launch identity = %v", err)
+		}
+	}
 }
 
 func TestStatusRejectsCorruptOversizedAndTrailingState(t *testing.T) {
@@ -653,7 +911,7 @@ func TestCheckUsesDaemonTransportAfterAutoStart(t *testing.T) {
 	cfg := testConfig(t)
 	manager, _ := New(cfg)
 	t.Cleanup(func() { _ = manager.Stop(context.Background()) })
-	response, err := manager.Check(context.Background(), []byte(`{"schemaVersion":"1"}`), false)
+	response, err := manager.Check(context.Background(), validActionDocument(t), false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -688,7 +946,7 @@ func TestClientRejectsUnterminatedAndOversizedDaemonResponse(t *testing.T) {
 			}()
 			// This is deliberately not a PaloNexus readiness peer, so the
 			// manager must fail before trusting its response.
-			if _, err := manager.Check(context.Background(), []byte(`{"schemaVersion":"1"}`), false); err == nil {
+			if _, err := manager.Check(context.Background(), validActionDocument(t), false); err == nil {
 				t.Fatal("untrusted daemon response was accepted")
 			}
 		})
@@ -704,7 +962,7 @@ func TestRepeatedStatusAndOneShotChecksDoNotLeakDescriptors(t *testing.T) {
 			t.Fatal(err)
 		}
 		if _, err := manager.Check(
-			context.Background(), []byte(`{"schemaVersion":"1"}`), true,
+			context.Background(), validActionDocument(t), true,
 		); err != nil {
 			t.Fatal(err)
 		}

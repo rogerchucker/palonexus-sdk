@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"os"
+	"strconv"
 	"syscall"
 
 	"golang.org/x/sys/unix"
@@ -36,4 +37,28 @@ func processIdentity(pid int) (uint64, uint64, error) {
 		return 0, 0, errors.New("daemon: unsupported process identity")
 	}
 	return uint64(stat.Dev), uint64(stat.Ino), nil
+}
+
+func processStartToken(pid int) (string, error) {
+	info, err := unix.SysctlKinfoProc("kern.proc.pid", pid)
+	if err != nil || info == nil || info.Proc.P_pid != int32(pid) {
+		return "", ErrUnprovenProcess
+	}
+	start := info.Proc.P_starttime
+	if start.Sec <= 0 {
+		return "", ErrUnprovenProcess
+	}
+	return strconv.FormatInt(start.Sec, 10) + ":" + strconv.FormatInt(int64(start.Usec), 10), nil
+}
+
+func signalStableProcess(state lifecycleState, signal syscall.Signal) error {
+	// Darwin lacks pidfd. Re-read both executable identity and kernel start
+	// time immediately before signaling; any uncertainty fails closed.
+	if !stateMatchesProcess(state) {
+		return ErrUnprovenProcess
+	}
+	if err := syscall.Kill(-state.PID, signal); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return ErrUnavailable
+	}
+	return nil
 }

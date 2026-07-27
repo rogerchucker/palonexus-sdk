@@ -175,6 +175,7 @@ python/tests/test_examples.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/t
 python/tests/test_package_metadata.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/test_package_metadata.py,PaloNexus,yes,new,MIT,rogerchucker
 scripts/verify_python_artifacts.py,rogerchucker/palonexus-sdk,WORKTREE,scripts/verify_python_artifacts.py,PaloNexus,yes,new,MIT,rogerchucker
 guard/cmd/palonexus/main.go,rogerchucker/palonexus-sdk,WORKTREE,guard/cmd/palonexus/main.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/cmd/palonexus/main_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/cmd/palonexus/main_test.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/cli/cli.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/cli/cli.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/cli/cli_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/cli/cli_test.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/config/config.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/config/config.go,PaloNexus,yes,new,MIT,rogerchucker
@@ -237,5 +238,7 @@ guard/internal/socket/server_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/i
 guard/internal/daemon/autostart.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/autostart.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/daemon/daemon.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/daemon.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/daemon/daemon_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/daemon_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/daemon/launch_darwin.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/launch_darwin.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/daemon/launch_linux.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/launch_linux.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/daemon/process_darwin.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/process_darwin.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/daemon/process_linux.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/process_linux.go,PaloNexus,yes,new,MIT,rogerchucker

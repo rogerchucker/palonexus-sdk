@@ -4,9 +4,14 @@
 package daemon
 
 import (
+	"bytes"
+	"errors"
 	"os"
 	"strconv"
+	"strings"
 	"syscall"
+
+	"golang.org/x/sys/unix"
 )
 
 func processIdentity(pid int) (uint64, uint64, error) {
@@ -19,4 +24,46 @@ func processIdentity(pid int) (uint64, uint64, error) {
 		return 0, 0, ErrUnprovenProcess
 	}
 	return uint64(stat.Dev), uint64(stat.Ino), nil
+}
+
+func signalStableProcess(state lifecycleState, signal syscall.Signal) error {
+	pidfd, err := unix.PidfdOpen(state.PID, 0)
+	if err != nil {
+		return ErrUnprovenProcess
+	}
+	defer unix.Close(pidfd)
+	if !stateMatchesProcess(state) {
+		return ErrUnprovenProcess
+	}
+	if err := unix.PidfdSendSignal(pidfd, unix.Signal(signal), nil, 0); err != nil &&
+		!errors.Is(err, unix.ESRCH) {
+		return ErrUnavailable
+	}
+	// The daemon starts a new session whose process-group ID equals its PID.
+	// While the pidfd pins the leader, this group cannot be confused with an
+	// unrelated reused PID; signal descendants within the bounded shutdown.
+	if err := syscall.Kill(-state.PID, signal); err != nil && !errors.Is(err, syscall.ESRCH) {
+		return ErrUnavailable
+	}
+	return nil
+}
+
+func processStartToken(pid int) (string, error) {
+	document, err := os.ReadFile("/proc/" + strconv.Itoa(pid) + "/stat")
+	if err != nil {
+		return "", err
+	}
+	closeParen := bytes.LastIndexByte(document, ')')
+	if closeParen < 0 || closeParen+2 >= len(document) {
+		return "", ErrUnprovenProcess
+	}
+	fields := strings.Fields(string(document[closeParen+2:]))
+	// Fields after comm begin with field 3 (state); starttime is field 22.
+	if len(fields) < 20 || fields[19] == "" {
+		return "", ErrUnprovenProcess
+	}
+	if _, err := strconv.ParseUint(fields[19], 10, 64); err != nil {
+		return "", ErrUnprovenProcess
+	}
+	return fields[19], nil
 }

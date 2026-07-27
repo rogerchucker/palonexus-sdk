@@ -3,6 +3,7 @@ package config
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"crypto/x509"
 	"encoding/json"
 	"encoding/pem"
@@ -49,12 +50,14 @@ type Config struct {
 	trustedCAPEM     []byte
 	localTestMode    bool
 	routes           []Route
+	digest           string
 }
 
 func (c *Config) DecisionEndpoint() string { return c.decisionEndpoint }
 func (c *Config) OIDCIssuer() string       { return c.oidcIssuer }
 func (c *Config) LocalTestMode() bool      { return c.localTestMode }
 func (c *Config) Routes() []Route          { return append([]Route(nil), c.routes...) }
+func (c *Config) Digest() string           { return c.digest }
 
 // TrustedCAPEM returns a defensive copy of CA certificates read from the
 // securely validated descriptor. TLS consumers must use this retained material
@@ -128,6 +131,7 @@ func Load(path string, options Options) (*Config, error) {
 		trustedCAPEM:     append([]byte(nil), trustedCAPEM...),
 		localTestMode:    localAllowed,
 		routes:           append([]Route(nil), raw.Routes...),
+		digest:           fmt.Sprintf("%x", sha256.Sum256(data)),
 	}, nil
 }
 

@@ -46,6 +46,17 @@ type Prepared struct {
 	execution any
 }
 
+// FromSafeResource reconstructs a prepared, non-executable resource received
+// over the local guard protocol. It validates the same safe-display boundary
+// and never creates executor-bound data.
+func FromSafeResource(resource protocol.SafeText) (Prepared, error) {
+	result := Prepared{Resource: resource}
+	if err := validateResource(resource); err != nil {
+		return Prepared{}, err
+	}
+	return result, nil
+}
+
 // MCPExecution is a detached executor-bound MCP invocation.
 type MCPExecution struct {
 	Server string

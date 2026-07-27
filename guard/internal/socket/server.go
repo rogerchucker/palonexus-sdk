@@ -35,6 +35,7 @@ const (
 // Handler must honor context cancellation. The server bounds detached handlers
 // that ignore cancellation, but cannot forcibly terminate Go code.
 type Handler func(context.Context, []byte) ([]byte, error)
+type ControlHandler func(context.Context, []byte) ([]byte, bool)
 
 type CloseError struct {
 	Operation string
@@ -69,6 +70,7 @@ type Config struct {
 	IOTimeout             time.Duration
 	RequestTimeout        time.Duration
 	Handler               Handler
+	ControlHandler        ControlHandler
 	// beforeBind is a test seam for exercising pathname replacement races.
 	beforeBind func()
 	// afterValidationBeforeBind exercises the final pathname race window.
@@ -809,6 +811,12 @@ func (s *Server) handle(parent context.Context, conn *net.UnixConn) {
 	}
 	ctx, cancel := context.WithTimeout(parent, s.cfg.RequestTimeout)
 	defer cancel()
+	if s.cfg.ControlHandler != nil {
+		if response, handled := s.cfg.ControlHandler(ctx, frame[:len(frame)-1]); handled {
+			s.write(conn, normalizeHandlerResponse(response, s.cfg.MaxRequestBytes))
+			return
+		}
+	}
 	response := processFrameLimited(
 		ctx, frame, s.cfg.MaxRequestBytes, s.cfg.Handler, s.handlerSlots,
 	)
@@ -878,6 +886,9 @@ func processFrameLimited(
 	if version != "1" {
 		return failure(protocol.ProtocolErrorCodeUnsupportedProtocol, false)
 	}
+	if _, err := protocol.ParseActionRequest(document); err != nil {
+		return failure(protocol.ProtocolErrorCodeInvalidRequest, false)
+	}
 	type handlerResult struct {
 		response []byte
 		err      error
@@ -913,7 +924,10 @@ func processFrameLimited(
 	if result.err != nil {
 		return failure(protocol.ProtocolErrorCodeAuthorizationUnavailable, true)
 	}
-	response := result.response
+	return normalizeHandlerResponse(result.response, maximum)
+}
+
+func normalizeHandlerResponse(response []byte, maximum int) []byte {
 	response = bytes.TrimSpace(response)
 	if len(response) == 0 || len(response) > maximum || !json.Valid(response) {
 		return failure(protocol.ProtocolErrorCodeInvalidDecision, false)
@@ -928,6 +942,24 @@ func processFrameLimited(
 		return failure(protocol.ProtocolErrorCodeInvalidDecision, false)
 	}
 	return append(compact.Bytes(), '\n')
+}
+
+// ProcessFrame applies the exact production socket framing, protocol, handler,
+// timeout, and response-validation boundary without opening a socket.
+func ProcessFrame(
+	ctx context.Context,
+	document []byte,
+	maximum int,
+	handler Handler,
+) []byte {
+	if maximum == 0 {
+		maximum = defaultMaxRequest
+	}
+	if ctx == nil || handler == nil || maximum < 1 || maximum > defaultMaxRequest {
+		return failure(protocol.ProtocolErrorCodeAuthorizationUnavailable, true)
+	}
+	frame := append(append([]byte(nil), document...), '\n')
+	return processFrameLimited(ctx, frame, maximum, handler, nil)
 }
 
 func decodeTopLevelObject(document []byte) (map[string]json.RawMessage, error) {
