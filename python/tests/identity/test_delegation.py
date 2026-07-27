@@ -107,7 +107,8 @@ def test_delegation_chain_verifies_links_and_monotonic_narrowing() -> None:
     assert result.resources == ("runbooks/*",)
     assert result.remaining_depth == 1
     assert copy.deepcopy(result) is result
-    assert pickle.loads(pickle.dumps(result)) == result
+    with pytest.raises(TypeError):
+        pickle.dumps(result)
 
 
 @pytest.mark.parametrize(

@@ -143,3 +143,4 @@ python/src/palonexus/identity/did.py,rogerchucker/palonexus-sdk,WORKTREE,python/
 python/src/palonexus/identity/vc.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/identity/vc.py,PaloNexus,yes,new,MIT,rogerchucker
 python/tests/identity/test_did_vc.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/identity/test_did_vc.py,PaloNexus,yes,new,MIT,rogerchucker
 python/tests/identity/test_delegation.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/identity/test_delegation.py,PaloNexus,yes,new,MIT,rogerchucker
+python/tests/identity/test_identity_hardening.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/identity/test_identity_hardening.py,PaloNexus,yes,new,MIT,rogerchucker

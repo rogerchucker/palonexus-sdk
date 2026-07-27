@@ -4,8 +4,10 @@
 from __future__ import annotations
 
 import math
+from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Self
+from functools import partial
+from typing import NoReturn, Self, cast
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives import serialization
@@ -23,6 +25,7 @@ _PUBLIC_KEY_BYTES = 32
 _SIGNATURE_BYTES = 64
 _MAX_MESSAGE_BYTES = 1_048_576
 _MAX_DID_BYTES = 256
+_FAILED = object()
 
 
 class IdentityVerificationFailed(Exception):
@@ -61,6 +64,23 @@ class IdentityVerificationFailed(Exception):
         }:
             raise AttributeError("Identity errors are immutable.")
         Exception.__setattr__(self, name, value)
+
+
+def _capture[T](operation: Callable[[], T]) -> T | object:
+    """Discard an entire unsafe exception graph and return only a sentinel."""
+
+    try:
+        return operation()
+    except (KeyboardInterrupt, SystemExit):
+        raise
+    except BaseException:
+        return _FAILED
+
+
+def _raise_identity_failure() -> NoReturn:
+    """Create the public error in a frame that has never held caller input."""
+
+    raise IdentityVerificationFailed() from None
 
 
 def _base58btc_encode(value: bytes) -> str:
@@ -107,7 +127,7 @@ def _did_from_public_bytes(value: bytes) -> tuple[str, str]:
     return did, f"{did}#{fingerprint}"
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class DidKey:
     """Immutable public Ed25519 DID material; it never owns a private key."""
 
@@ -115,13 +135,19 @@ class DidKey:
     key_id: str
     public_key: bytes
 
-    def __post_init__(self) -> None:
-        try:
-            resolved = resolve_did_key(self.did)
-            if resolved.key_id != self.key_id or resolved.public_key != self.public_key:
-                raise ValueError
-        except Exception:
-            raise IdentityVerificationFailed() from None
+    def __init__(self, *, did: str, key_id: str, public_key: bytes) -> None:
+        operation = partial(_validated_did_key_parts, did, key_id, public_key)
+        result = _capture(operation)
+        del operation, did, key_id, public_key
+        if result is _FAILED:
+            _raise_identity_failure()
+        resolved_did, resolved_key_id, resolved_public_key = cast(
+            tuple[str, str, bytes],
+            result,
+        )
+        object.__setattr__(self, "did", resolved_did)
+        object.__setattr__(self, "key_id", resolved_key_id)
+        object.__setattr__(self, "public_key", resolved_public_key)
 
     def sign(
         self,
@@ -133,13 +159,19 @@ class DidKey:
     ) -> bytes:
         """Sign with the named key-store lease and bind it to this public DID."""
 
-        return sign_ed25519(
+        operation = partial(
+            sign_ed25519,
             message,
             key_store=key_store,
             tenant_id=tenant_id,
             key_id=key_id,
             expected_did=self.did,
         )
+        result = _capture(operation)
+        del operation, message, key_store, tenant_id, key_id
+        if result is _FAILED:
+            _raise_identity_failure()
+        return cast(bytes, result)
 
     def __copy__(self) -> Self:
         return self
@@ -149,7 +181,23 @@ class DidKey:
         return self
 
 
-def resolve_did_key(did: object) -> DidKey:
+def _validated_did_key_parts(
+    did: object,
+    key_id: object,
+    public_key: object,
+) -> tuple[str, str, bytes]:
+    resolved = _resolve_did_key(did)
+    if (
+        type(key_id) is not str
+        or type(public_key) is not bytes
+        or resolved.key_id != key_id
+        or resolved.public_key != public_key
+    ):
+        raise IdentityVerificationFailed() from None
+    return resolved.did, resolved.key_id, resolved.public_key
+
+
+def _resolve_did_key(did: object) -> DidKey:
     """Resolve one canonical, fragment-free Ed25519 ``did:key`` value."""
 
     try:
@@ -184,7 +232,18 @@ def resolve_did_key(did: object) -> DidKey:
         raise IdentityVerificationFailed() from None
 
 
-def generate_ed25519_key(
+def resolve_did_key(did: object) -> DidKey:
+    """Resolve without retaining caller input on a public failure traceback."""
+
+    operation = partial(_resolve_did_key, did)
+    result = _capture(operation)
+    del operation, did
+    if result is _FAILED:
+        _raise_identity_failure()
+    return cast(DidKey, result)
+
+
+def _generate_ed25519_key(
     *,
     key_store: KeyStore,
     tenant_id: str,
@@ -222,9 +281,34 @@ def generate_ed25519_key(
         if private_buffer is not None:
             for index in range(len(private_buffer)):
                 private_buffer[index] = 0
+        try:
+            del private_key
+        except UnboundLocalError:
+            pass
 
 
-def sign_ed25519(
+def generate_ed25519_key(
+    *,
+    key_store: KeyStore,
+    tenant_id: str,
+    key_id: str,
+) -> DidKey:
+    """Generate without connecting key-store failures to the public error."""
+
+    operation = partial(
+        _generate_ed25519_key,
+        key_store=key_store,
+        tenant_id=tenant_id,
+        key_id=key_id,
+    )
+    result = _capture(operation)
+    del operation, key_store, tenant_id, key_id
+    if result is _FAILED:
+        _raise_identity_failure()
+    return cast(DidKey, result)
+
+
+def _sign_ed25519(
     message: bytes,
     *,
     key_store: KeyStore,
@@ -251,14 +335,43 @@ def sign_ed25519(
     except Exception:
         raise IdentityVerificationFailed() from None
     finally:
+        try:
+            del private_key
+        except UnboundLocalError:
+            pass
         del private_bytes
+
+
+def sign_ed25519(
+    message: bytes,
+    *,
+    key_store: KeyStore,
+    tenant_id: str,
+    key_id: str,
+    expected_did: str | None = None,
+) -> bytes:
+    """Sign without retaining message, identifiers, lease, or key on failure."""
+
+    operation = partial(
+        _sign_ed25519,
+        message,
+        key_store=key_store,
+        tenant_id=tenant_id,
+        key_id=key_id,
+        expected_did=expected_did,
+    )
+    result = _capture(operation)
+    del operation, message, key_store, tenant_id, key_id, expected_did
+    if result is _FAILED:
+        _raise_identity_failure()
+    return cast(bytes, result)
 
 
 def verify_ed25519(did: str, message: bytes, signature: bytes) -> bool:
     """Return whether a bounded signature matches a canonical Ed25519 DID."""
 
     try:
-        key = resolve_did_key(did)
+        key = _resolve_did_key(did)
         validated_message = _validate_message(message)
         if type(signature) is not bytes or len(signature) != _SIGNATURE_BYTES:
             return False

@@ -11,12 +11,16 @@ import threading
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
-from typing import Protocol, Self, cast
+from functools import partial
+from typing import Protocol, Self, SupportsIndex, cast
 
 from .._canonicalize import canonical_json
 from ..keystore import KeyStore
 from .did import (
+    _FAILED,
     IdentityVerificationFailed,
+    _capture,
+    _raise_identity_failure,
     resolve_did_key,
     sign_ed25519,
     verify_ed25519,
@@ -53,18 +57,33 @@ class RevocationLookup(Protocol):
 class ReplayStore(Protocol):
     """Atomic presentation replay boundary."""
 
-    def check_and_record(self, replay_id: str, *, expires_at: datetime) -> bool:
+    def check_and_record(
+        self,
+        replay_id: str,
+        *,
+        expires_at: datetime,
+        now: datetime,
+    ) -> bool:
         """Atomically return true only when a fresh ID was recorded."""
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class StaticRevocationLookup:
     """Immutable offline lookup useful for deterministic tests and examples."""
 
-    revoked_ids: tuple[str, ...] = ()
+    revoked_ids: tuple[str, ...]
 
-    def __post_init__(self) -> None:
-        values = _validated_string_tuple(self.revoked_ids, allow_empty=True)
+    def __init__(self, revoked_ids: tuple[str, ...] = ()) -> None:
+        operation = partial(
+            _validated_string_tuple,
+            revoked_ids,
+            allow_empty=True,
+        )
+        result = _capture(operation)
+        del operation, revoked_ids
+        if result is _FAILED:
+            _raise_identity_failure()
+        values = cast(tuple[str, ...], result)
         object.__setattr__(self, "revoked_ids", values)
 
     def is_revoked(self, credential_id: str) -> bool:
@@ -74,23 +93,66 @@ class StaticRevocationLookup:
 class MemoryReplayStore:
     """Thread-safe process-local replay store; never selected implicitly."""
 
-    __slots__ = ("_entries", "_lock")
+    __slots__ = ("_entries", "_lock", "_max_entries")
 
-    def __init__(self) -> None:
+    def __init__(
+        self,
+        *,
+        testing_only: bool | None = None,
+        max_entries: int = 10_000,
+    ) -> None:
+        if (
+            testing_only is not True
+            or type(testing_only) is not bool
+            or type(max_entries) is not int
+            or not 1 <= max_entries <= 100_000
+        ):
+            del testing_only, max_entries
+            _raise_identity_failure()
         self._entries: dict[str, datetime] = {}
         self._lock = threading.Lock()
+        self._max_entries = max_entries
 
-    def check_and_record(self, replay_id: str, *, expires_at: datetime) -> bool:
-        if (
-            type(replay_id) is not str
-            or type(expires_at) is not datetime
-            or expires_at.tzinfo is None
-        ):
+    def check_and_record(
+        self,
+        replay_id: str,
+        *,
+        expires_at: datetime,
+        now: datetime,
+    ) -> bool:
+        try:
+            valid_id = (
+                type(replay_id) is str
+                and 0 < len(replay_id) <= 256
+                and all(0x21 <= ord(character) <= 0x7E for character in replay_id)
+            )
+            valid_times = (
+                type(expires_at) is datetime
+                and expires_at.tzinfo is not None
+                and type(now) is datetime
+                and now.tzinfo is not None
+            )
+        except Exception:
+            return False
+        if not valid_id or not valid_times:
+            return False
+        normalized_expiry = expires_at.astimezone(UTC)
+        normalized_now = now.astimezone(UTC)
+        if normalized_expiry <= normalized_now:
             return False
         with self._lock:
+            expired = tuple(
+                identifier
+                for identifier, expiry in self._entries.items()
+                if expiry <= normalized_now
+            )
+            for identifier in expired:
+                del self._entries[identifier]
             if replay_id in self._entries:
                 return False
-            self._entries[replay_id] = expires_at.astimezone(UTC)
+            if len(self._entries) >= self._max_entries:
+                return False
+            self._entries[replay_id] = normalized_expiry
             return True
 
     def __repr__(self) -> str:
@@ -107,27 +169,38 @@ class MemoryReplayStore:
         raise TypeError("Replay stores cannot be serialized.")
 
 
+@dataclass(frozen=True, slots=True)
+class _FrozenObject:
+    items: tuple[tuple[str, object], ...]
+
+
+@dataclass(frozen=True, slots=True)
+class _FrozenArray:
+    items: tuple[object, ...]
+
+
 def _freeze_json(value: object) -> object:
     if type(value) is dict:
         mapping = cast(dict[str, object], value)
-        return tuple((key, _freeze_json(item)) for key, item in sorted(mapping.items()))
+        return _FrozenObject(
+            tuple((key, _freeze_json(item)) for key, item in sorted(mapping.items()))
+        )
     if type(value) is list:
-        return tuple(_freeze_json(item) for item in cast(list[object], value))
+        return _FrozenArray(
+            tuple(_freeze_json(item) for item in cast(list[object], value))
+        )
     return value
 
 
 def _thaw_json(value: object) -> object:
-    if type(value) is tuple:
-        if all(
-            type(item) is tuple and len(item) == 2 and type(item[0]) is str
-            for item in value
-        ):
-            return {item[0]: _thaw_json(item[1]) for item in value}
-        return [_thaw_json(item) for item in value]
+    if type(value) is _FrozenObject:
+        return {key: _thaw_json(item) for key, item in value.items}
+    if type(value) is _FrozenArray:
+        return [_thaw_json(item) for item in value.items]
     return value
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, init=False)
 class VerifiedCredential:
     """Immutable verified VC projection with copy-on-read custom claims."""
 
@@ -138,6 +211,9 @@ class VerifiedCredential:
     issued_at: datetime
     expires_at: datetime
     _claims: object
+
+    def __init__(self) -> None:
+        raise TypeError("Verified credentials are package-controlled.")
 
     @property
     def claims(self) -> dict[str, object]:
@@ -153,8 +229,25 @@ class VerifiedCredential:
         del memo
         return self
 
+    def __repr__(self) -> str:
+        return "VerifiedCredential([VERIFIED])"
 
-@dataclass(frozen=True, slots=True)
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del cls, kwargs
+        raise TypeError("Verified credentials cannot be subclassed.")
+
+    def __reduce__(self) -> str:
+        raise TypeError("Verified credentials cannot be serialized.")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str:
+        del protocol
+        raise TypeError("Verified credentials cannot be serialized.")
+
+    def __getstate__(self) -> object:
+        raise TypeError("Verified credentials cannot be serialized.")
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class VerifiedPresentation:
     """Immutable verified VP projection."""
 
@@ -166,6 +259,9 @@ class VerifiedPresentation:
     expires_at: datetime
     credentials: tuple[VerifiedCredential, ...]
 
+    def __init__(self) -> None:
+        raise TypeError("Verified presentations are package-controlled.")
+
     def __copy__(self) -> Self:
         return self
 
@@ -173,8 +269,25 @@ class VerifiedPresentation:
         del memo
         return self
 
+    def __repr__(self) -> str:
+        return "VerifiedPresentation([VERIFIED])"
 
-@dataclass(frozen=True, slots=True)
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del cls, kwargs
+        raise TypeError("Verified presentations cannot be subclassed.")
+
+    def __reduce__(self) -> str:
+        raise TypeError("Verified presentations cannot be serialized.")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str:
+        del protocol
+        raise TypeError("Verified presentations cannot be serialized.")
+
+    def __getstate__(self) -> object:
+        raise TypeError("Verified presentations cannot be serialized.")
+
+
+@dataclass(frozen=True, slots=True, init=False)
 class VerifiedDelegation:
     """Effective authority after verifying an entire delegation chain."""
 
@@ -189,12 +302,101 @@ class VerifiedDelegation:
     expires_at: datetime
     credential_ids: tuple[str, ...]
 
+    def __init__(self) -> None:
+        raise TypeError("Verified delegations are package-controlled.")
+
     def __copy__(self) -> Self:
         return self
 
     def __deepcopy__(self, memo: dict[int, object] | None = None) -> Self:
         del memo
         return self
+
+    def __repr__(self) -> str:
+        return "VerifiedDelegation([VERIFIED])"
+
+    def __init_subclass__(cls, **kwargs: object) -> None:
+        del cls, kwargs
+        raise TypeError("Verified delegations cannot be subclassed.")
+
+    def __reduce__(self) -> str:
+        raise TypeError("Verified delegations cannot be serialized.")
+
+    def __reduce_ex__(self, protocol: SupportsIndex) -> str:
+        del protocol
+        raise TypeError("Verified delegations cannot be serialized.")
+
+    def __getstate__(self) -> object:
+        raise TypeError("Verified delegations cannot be serialized.")
+
+
+def _new_verified_credential(
+    *,
+    issuer: str,
+    subject: str,
+    audience: str,
+    credential_id: str,
+    issued_at: datetime,
+    expires_at: datetime,
+    claims: object,
+) -> VerifiedCredential:
+    value = object.__new__(VerifiedCredential)
+    object.__setattr__(value, "issuer", issuer)
+    object.__setattr__(value, "subject", subject)
+    object.__setattr__(value, "audience", audience)
+    object.__setattr__(value, "credential_id", credential_id)
+    object.__setattr__(value, "issued_at", issued_at)
+    object.__setattr__(value, "expires_at", expires_at)
+    object.__setattr__(value, "_claims", claims)
+    return value
+
+
+def _new_verified_presentation(
+    *,
+    holder: str,
+    audience: str,
+    challenge: str,
+    presentation_id: str,
+    issued_at: datetime,
+    expires_at: datetime,
+    credentials: tuple[VerifiedCredential, ...],
+) -> VerifiedPresentation:
+    value = object.__new__(VerifiedPresentation)
+    object.__setattr__(value, "holder", holder)
+    object.__setattr__(value, "audience", audience)
+    object.__setattr__(value, "challenge", challenge)
+    object.__setattr__(value, "presentation_id", presentation_id)
+    object.__setattr__(value, "issued_at", issued_at)
+    object.__setattr__(value, "expires_at", expires_at)
+    object.__setattr__(value, "credentials", credentials)
+    return value
+
+
+def _new_verified_delegation(
+    *,
+    issuer: str,
+    subject: str,
+    actor: str,
+    agent: str,
+    audience: str,
+    capabilities: tuple[str, ...],
+    resources: tuple[str, ...],
+    remaining_depth: int,
+    expires_at: datetime,
+    credential_ids: tuple[str, ...],
+) -> VerifiedDelegation:
+    value = object.__new__(VerifiedDelegation)
+    object.__setattr__(value, "issuer", issuer)
+    object.__setattr__(value, "subject", subject)
+    object.__setattr__(value, "actor", actor)
+    object.__setattr__(value, "agent", agent)
+    object.__setattr__(value, "audience", audience)
+    object.__setattr__(value, "capabilities", capabilities)
+    object.__setattr__(value, "resources", resources)
+    object.__setattr__(value, "remaining_depth", remaining_depth)
+    object.__setattr__(value, "expires_at", expires_at)
+    object.__setattr__(value, "credential_ids", credential_ids)
+    return value
 
 
 def _valid_string(value: object, *, allow_empty: bool = False) -> str:
@@ -457,7 +659,7 @@ def _registered_claims(
     )
 
 
-def create_verifiable_credential(
+def _unsafe_create_verifiable_credential(
     *,
     key_store: KeyStore,
     tenant_id: str,
@@ -552,7 +754,7 @@ def _check_revocation(
         raise IdentityVerificationFailed() from None
 
 
-def verify_verifiable_credential(
+def _unsafe_verify_verifiable_credential(
     token: str,
     *,
     expected_audience: str,
@@ -585,14 +787,14 @@ def verify_verifiable_credential(
         if credential_subject.pop("id", None) != subject:
             raise ValueError
         _check_revocation(credential_id, revocation_lookup)
-        return VerifiedCredential(
+        return _new_verified_credential(
             issuer=issuer,
             subject=subject,
             audience=_valid_string(payload["aud"]),
             credential_id=credential_id,
             issued_at=issued,
             expires_at=expires,
-            _claims=_freeze_json(credential_subject),
+            claims=_freeze_json(credential_subject),
         )
     except (KeyboardInterrupt, SystemExit):
         raise
@@ -600,7 +802,7 @@ def verify_verifiable_credential(
         raise IdentityVerificationFailed() from None
 
 
-def create_verifiable_presentation(
+def _unsafe_create_verifiable_presentation(
     *,
     key_store: KeyStore,
     tenant_id: str,
@@ -653,7 +855,7 @@ def create_verifiable_presentation(
         raise IdentityVerificationFailed() from None
 
 
-def verify_verifiable_presentation(
+def _unsafe_verify_verifiable_presentation(
     token: str,
     *,
     expected_audience: str,
@@ -697,13 +899,16 @@ def verify_verifiable_presentation(
             )
             for item in vp["verifiableCredential"]
         )
+        if expires > min(credential.expires_at for credential in credentials):
+            raise ValueError
         recorded = replay_store.check_and_record(
             presentation_id,
             expires_at=expires,
+            now=_trusted_now(now),
         )
         if recorded is not True:
             raise ValueError
-        return VerifiedPresentation(
+        return _new_verified_presentation(
             holder=holder,
             audience=_valid_string(payload["aud"]),
             challenge=challenge,
@@ -718,7 +923,7 @@ def verify_verifiable_presentation(
         raise IdentityVerificationFailed() from None
 
 
-def create_delegation(
+def _unsafe_create_delegation(
     *,
     key_store: KeyStore,
     tenant_id: str,
@@ -765,7 +970,7 @@ def create_delegation(
         raise IdentityVerificationFailed() from None
 
 
-def verify_delegation_chain(
+def _unsafe_verify_delegation_chain(
     chain: Sequence[str],
     *,
     root_issuer: str,
@@ -861,7 +1066,7 @@ def verify_delegation_chain(
             or resource_required not in effective_resources
         ):
             raise ValueError
-        return VerifiedDelegation(
+        return _new_verified_delegation(
             issuer=root,
             subject=final.subject,
             actor=actor_expected,
@@ -877,3 +1082,261 @@ def verify_delegation_chain(
         raise
     except Exception:
         raise IdentityVerificationFailed() from None
+
+
+def create_verifiable_credential(
+    *,
+    key_store: KeyStore,
+    tenant_id: str,
+    key_id: str,
+    issuer: str,
+    subject: str,
+    audience: str,
+    credential_id: str,
+    issued_at: datetime | int | float | str,
+    expires_at: datetime | int | float | str,
+    claims: Mapping[str, object],
+) -> str:
+    """Create a VC without retaining claims or identifiers on failure."""
+
+    operation = partial(
+        _unsafe_create_verifiable_credential,
+        key_store=key_store,
+        tenant_id=tenant_id,
+        key_id=key_id,
+        issuer=issuer,
+        subject=subject,
+        audience=audience,
+        credential_id=credential_id,
+        issued_at=issued_at,
+        expires_at=expires_at,
+        claims=claims,
+    )
+    result = _capture(operation)
+    del (
+        operation,
+        key_store,
+        tenant_id,
+        key_id,
+        issuer,
+        subject,
+        audience,
+        credential_id,
+        issued_at,
+        expires_at,
+        claims,
+    )
+    if result is _FAILED:
+        _raise_identity_failure()
+    return cast(str, result)
+
+
+def verify_verifiable_credential(
+    token: str,
+    *,
+    expected_audience: str,
+    now: datetime | int | float | str,
+    revocation_lookup: RevocationLookup,
+) -> VerifiedCredential:
+    """Verify a VC through a callback- and token-sanitizing boundary."""
+
+    operation = partial(
+        _unsafe_verify_verifiable_credential,
+        token,
+        expected_audience=expected_audience,
+        now=now,
+        revocation_lookup=revocation_lookup,
+    )
+    result = _capture(operation)
+    del operation, token, expected_audience, now, revocation_lookup
+    if result is _FAILED:
+        _raise_identity_failure()
+    return cast(VerifiedCredential, result)
+
+
+def create_verifiable_presentation(
+    *,
+    key_store: KeyStore,
+    tenant_id: str,
+    key_id: str,
+    holder: str,
+    credentials: Sequence[str],
+    audience: str,
+    challenge: str,
+    presentation_id: str,
+    issued_at: datetime | int | float | str,
+    expires_at: datetime | int | float | str,
+) -> str:
+    """Create a VP without retaining credentials or challenge on failure."""
+
+    operation = partial(
+        _unsafe_create_verifiable_presentation,
+        key_store=key_store,
+        tenant_id=tenant_id,
+        key_id=key_id,
+        holder=holder,
+        credentials=credentials,
+        audience=audience,
+        challenge=challenge,
+        presentation_id=presentation_id,
+        issued_at=issued_at,
+        expires_at=expires_at,
+    )
+    result = _capture(operation)
+    del (
+        operation,
+        key_store,
+        tenant_id,
+        key_id,
+        holder,
+        credentials,
+        audience,
+        challenge,
+        presentation_id,
+        issued_at,
+        expires_at,
+    )
+    if result is _FAILED:
+        _raise_identity_failure()
+    return cast(str, result)
+
+
+def verify_verifiable_presentation(
+    token: str,
+    *,
+    expected_audience: str,
+    expected_challenge: str,
+    now: datetime | int | float | str,
+    revocation_lookup: RevocationLookup,
+    replay_store: ReplayStore,
+) -> VerifiedPresentation:
+    """Verify a VP through callback-, challenge-, and token-safe failure paths."""
+
+    operation = partial(
+        _unsafe_verify_verifiable_presentation,
+        token,
+        expected_audience=expected_audience,
+        expected_challenge=expected_challenge,
+        now=now,
+        revocation_lookup=revocation_lookup,
+        replay_store=replay_store,
+    )
+    result = _capture(operation)
+    del (
+        operation,
+        token,
+        expected_audience,
+        expected_challenge,
+        now,
+        revocation_lookup,
+        replay_store,
+    )
+    if result is _FAILED:
+        _raise_identity_failure()
+    return cast(VerifiedPresentation, result)
+
+
+def create_delegation(
+    *,
+    key_store: KeyStore,
+    tenant_id: str,
+    key_id: str,
+    issuer: str,
+    subject: str,
+    audience: str,
+    credential_id: str,
+    actor: str,
+    agent: str,
+    capabilities: Sequence[str],
+    resources: Sequence[str],
+    remaining_depth: int,
+    issued_at: datetime | int | float | str,
+    expires_at: datetime | int | float | str,
+) -> str:
+    """Create a delegation through a scope-sanitizing public boundary."""
+
+    operation = partial(
+        _unsafe_create_delegation,
+        key_store=key_store,
+        tenant_id=tenant_id,
+        key_id=key_id,
+        issuer=issuer,
+        subject=subject,
+        audience=audience,
+        credential_id=credential_id,
+        actor=actor,
+        agent=agent,
+        capabilities=capabilities,
+        resources=resources,
+        remaining_depth=remaining_depth,
+        issued_at=issued_at,
+        expires_at=expires_at,
+    )
+    result = _capture(operation)
+    del (
+        operation,
+        key_store,
+        tenant_id,
+        key_id,
+        issuer,
+        subject,
+        audience,
+        credential_id,
+        actor,
+        agent,
+        capabilities,
+        resources,
+        remaining_depth,
+        issued_at,
+        expires_at,
+    )
+    if result is _FAILED:
+        _raise_identity_failure()
+    return cast(str, result)
+
+
+def verify_delegation_chain(
+    chain: Sequence[str],
+    *,
+    root_issuer: str,
+    expected_subject: str,
+    expected_actor: str,
+    expected_agent: str,
+    expected_audience: str,
+    required_capability: str,
+    required_resource: str,
+    now: datetime | int | float | str,
+    revocation_lookup: RevocationLookup,
+) -> VerifiedDelegation:
+    """Verify a delegation chain without retaining authority on failure."""
+
+    operation = partial(
+        _unsafe_verify_delegation_chain,
+        chain,
+        root_issuer=root_issuer,
+        expected_subject=expected_subject,
+        expected_actor=expected_actor,
+        expected_agent=expected_agent,
+        expected_audience=expected_audience,
+        required_capability=required_capability,
+        required_resource=required_resource,
+        now=now,
+        revocation_lookup=revocation_lookup,
+    )
+    result = _capture(operation)
+    del (
+        operation,
+        chain,
+        root_issuer,
+        expected_subject,
+        expected_actor,
+        expected_agent,
+        expected_audience,
+        required_capability,
+        required_resource,
+        now,
+        revocation_lookup,
+    )
+    if result is _FAILED:
+        _raise_identity_failure()
+    return cast(VerifiedDelegation, result)

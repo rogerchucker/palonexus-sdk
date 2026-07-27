@@ -180,7 +180,8 @@ def test_vc_round_trip_binds_all_registered_claims() -> None:
     assert document["jti"] == document["vc"]["id"]
     assert document["iss"] == document["vc"]["issuer"]
     assert copy.deepcopy(credential) is credential
-    assert pickle.loads(pickle.dumps(credential)) == credential
+    with pytest.raises(TypeError):
+        pickle.dumps(credential)
 
 
 def test_vc_rejects_tamper_wrong_audience_expiry_and_revocation() -> None:
@@ -344,7 +345,7 @@ def test_vp_binds_audience_challenge_and_replay_atomically() -> None:
             expires_at=NOW + timedelta(minutes=2),
         )
 
-    replay = MemoryReplayStore()
+    replay = MemoryReplayStore(testing_only=True)
     verified = verify_verifiable_presentation(
         presentation,
         expected_audience="palonexus-control-plane",
@@ -356,7 +357,8 @@ def test_vp_binds_audience_challenge_and_replay_atomically() -> None:
     assert verified.holder == key.did
     assert verified.credentials[0].credential_id == "urn:uuid:credential-7"
     assert copy.copy(verified) is verified
-    assert pickle.loads(pickle.dumps(verified)) == verified
+    with pytest.raises(TypeError):
+        pickle.dumps(verified)
 
     for audience, challenge in (
         ("other", "challenge-0123456789"),
@@ -375,7 +377,7 @@ def test_vp_binds_audience_challenge_and_replay_atomically() -> None:
 
 
 def test_memory_replay_store_records_once_under_concurrency() -> None:
-    replay = MemoryReplayStore()
+    replay = MemoryReplayStore(testing_only=True)
     barrier = threading.Barrier(16)
     results: list[bool] = []
     lock = threading.Lock()
@@ -385,6 +387,7 @@ def test_memory_replay_store_records_once_under_concurrency() -> None:
         result = replay.check_and_record(
             "urn:uuid:single-use",
             expires_at=NOW + timedelta(minutes=1),
+            now=NOW,
         )
         with lock:
             results.append(result)
