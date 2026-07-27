@@ -26,6 +26,7 @@ import (
 
 const (
 	installName       = "palonexus"
+	marketplaceName   = "palonexus-sdk"
 	markerName        = ".palonexus-install.json"
 	lockName          = ".palonexus-install.lock"
 	journalName       = ".palonexus-install.journal"
@@ -52,23 +53,27 @@ type Options struct {
 	Home      string
 	SourceDir string
 	GuardPath string
+	HostPath  string
 	Version   string
+	Runner    NativeRunner
 }
 
 // Result reports whether the requested operation changed the installation.
 type Result struct {
-	Changed bool
-	Path    string
-	Version string
+	Changed              bool
+	Path                 string
+	Version              string
+	AuthenticationStatus string
 }
 
 type ownershipMarker struct {
-	Schema    int    `json:"schema"`
-	Owner     string `json:"owner"`
-	Target    Target `json:"target"`
-	Version   string `json:"version"`
-	GuardPath string `json:"guardPath"`
-	Digest    string `json:"digest"`
+	Schema       int    `json:"schema"`
+	Owner        string `json:"owner"`
+	Target       Target `json:"target"`
+	Version      string `json:"version"`
+	GuardPath    string `json:"guardPath"`
+	SourceDigest string `json:"sourceDigest"`
+	Digest       string `json:"digest"`
 }
 
 type transactionJournal struct {
@@ -96,31 +101,45 @@ func Install(ctx context.Context, target Target, options Options) (Result, error
 	if err := validateOptions(target, options, true); err != nil {
 		return Result{}, err
 	}
+	if err := ensureNativeHome(options.Home, target); err != nil {
+		return Result{}, err
+	}
 	sourceFD, err := openAbsoluteSourceDirectory(options.SourceDir)
 	if err != nil {
 		return Result{}, fmt.Errorf("validate plugin artifact: %w", err)
 	}
 	defer unix.Close(sourceFD)
-	if err := requireManifest(sourceFD, target); err != nil {
+	if err := requireManifest(sourceFD, target, options.Version); err != nil {
 		return Result{}, err
 	}
 	if err := validateGuard(options.GuardPath); err != nil {
 		return Result{}, err
 	}
-	digest, err := digestTree(sourceFD)
+	if err := probeGuard(ctx, target, options); err != nil {
+		return Result{}, err
+	}
+	authenticationStatus := guardAuthenticationStatus(ctx, target, options)
+	if err := probeNative(ctx, target, options); err != nil {
+		return Result{}, err
+	}
+	if err := nativeValidate(ctx, target, options, options.SourceDir); err != nil {
+		return Result{}, err
+	}
+	sourceDigest, err := digestTree(sourceFD)
 	if err != nil {
 		return Result{}, fmt.Errorf("validate plugin artifact: %w", err)
 	}
 	marker := ownershipMarker{
 		Schema: 1, Owner: "github.com/rogerchucker/palonexus-sdk",
-		Target: target, Version: options.Version, GuardPath: options.GuardPath, Digest: digest,
+		Target: target, Version: options.Version, GuardPath: options.GuardPath,
+		SourceDigest: sourceDigest,
 	}
 	parentFD, destination, err := openPluginParent(options.Home, target)
 	if err != nil {
 		return Result{}, err
 	}
 	defer unix.Close(parentFD)
-	path := filepath.Join(options.Home, hostDirectory(target), "plugins", installName)
+	path := marketplaceInstallPath(options.Home, target)
 	changed, err := withTransactionLock(ctx, parentFD, func() (bool, error) {
 		if err := recoverTransaction(parentFD, target); err != nil {
 			return false, err
@@ -128,7 +147,12 @@ func Install(ctx context.Context, target Target, options Options) (Result, error
 		existing, markerErr := readOwnedMarkerAt(parentFD, destination, target)
 		switch {
 		case markerErr == nil:
-			if existing == marker {
+			if sameInstallIntent(existing, marker) {
+				if err := verifyNativeInstalled(ctx, target, options, path, existing.Version, true); err != nil {
+					if err := nativeReplace(ctx, target, options, path, existing.Version); err != nil {
+						return false, err
+					}
+				}
 				return false, nil
 			}
 		case errors.Is(markerErr, os.ErrNotExist):
@@ -148,13 +172,14 @@ func Install(ctx context.Context, target Target, options Options) (Result, error
 		}
 		copyErr := copyTree(sourceFD, stageFD)
 		if copyErr == nil {
-			copyErr = writeFileAt(stageFD, markerName, mustJSON(marker), 0o600)
+			copyErr = writeGuardConfigAt(stageFD, options.GuardPath)
 		}
 		if copyErr == nil {
 			var stagedDigest string
 			stagedDigest, copyErr = digestTreeContent(stageFD, true)
-			if copyErr == nil && stagedDigest != digest {
-				copyErr = errors.New("plugin artifact changed during installation")
+			if copyErr == nil {
+				marker.Digest = stagedDigest
+				copyErr = writeFileAt(stageFD, markerName, mustJSON(marker), 0o600)
 			}
 		}
 		if syncErr := unix.Fsync(stageFD); copyErr == nil {
@@ -197,6 +222,17 @@ func Install(ctx context.Context, target Target, options Options) (Result, error
 				return false, rollbackInstall(parentFD, hadExisting, err)
 			}
 		}
+		if err := nativeReplace(ctx, target, options, path, options.Version); err != nil {
+			rollbackErr := rollbackInstall(parentFD, hadExisting, err)
+			if hadExisting {
+				if restoreErr := nativeReplace(ctx, target, options, path, existing.Version); restoreErr != nil {
+					return false, errors.Join(rollbackErr, errors.New("native plugin rollback failed"))
+				}
+			} else {
+				_ = nativeRemove(ctx, target, options, false)
+			}
+			return false, rollbackErr
+		}
 		if hadExisting {
 			if installFaults.beforeDelete != nil {
 				if err := installFaults.beforeDelete(); err != nil {
@@ -212,7 +248,16 @@ func Install(ctx context.Context, target Target, options Options) (Result, error
 		}
 		return true, nil
 	})
-	return Result{Changed: changed, Path: path, Version: options.Version}, err
+	return Result{
+		Changed: changed, Path: path, Version: options.Version,
+		AuthenticationStatus: authenticationStatus,
+	}, err
+}
+
+func sameInstallIntent(existing, wanted ownershipMarker) bool {
+	return existing.Schema == wanted.Schema && existing.Owner == wanted.Owner &&
+		existing.Target == wanted.Target && existing.Version == wanted.Version &&
+		existing.GuardPath == wanted.GuardPath && existing.SourceDigest == wanted.SourceDigest
 }
 
 // Uninstall removes only an installation carrying this project's exact
@@ -221,18 +266,28 @@ func Uninstall(ctx context.Context, target Target, options Options) (Result, err
 	if err := validateOptions(target, options, false); err != nil {
 		return Result{}, err
 	}
+	if err := ensureNativeHome(options.Home, target); err != nil {
+		return Result{}, err
+	}
 	parentFD, destination, err := openPluginParent(options.Home, target)
 	if err != nil {
 		return Result{}, err
 	}
 	defer unix.Close(parentFD)
-	path := filepath.Join(options.Home, hostDirectory(target), "plugins", installName)
+	path := marketplaceInstallPath(options.Home, target)
+	if err := probeNative(ctx, target, options); err != nil {
+		return Result{}, err
+	}
 	changed, err := withTransactionLock(ctx, parentFD, func() (bool, error) {
 		if err := recoverTransaction(parentFD, target); err != nil {
 			return false, err
 		}
-		if _, err := readOwnedMarkerAt(parentFD, destination, target); err != nil {
+		existing, err := readOwnedMarkerAt(parentFD, destination, target)
+		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
+				if err := nativeRemove(ctx, target, options, true); err != nil {
+					return false, err
+				}
 				return false, nil
 			}
 			return false, err
@@ -265,6 +320,13 @@ func Uninstall(ctx context.Context, target Target, options Options) (Result, err
 				return false, rollbackUninstall(parentFD, err)
 			}
 		}
+		if err := nativeRemove(ctx, target, options, true); err != nil {
+			rollbackErr := rollbackUninstall(parentFD, err)
+			if restoreErr := nativeReplace(ctx, target, options, path, existing.Version); restoreErr != nil {
+				return false, errors.Join(rollbackErr, errors.New("native plugin rollback failed"))
+			}
+			return false, rollbackErr
+		}
 		if err := removeTreeAt(parentFD, backupName); err != nil {
 			return false, rollbackUninstall(parentFD, err)
 		}
@@ -283,6 +345,9 @@ func validateOptions(target Target, options Options, installing bool) error {
 	if !safeAbsolute(options.Home) {
 		return errors.New("invalid home path")
 	}
+	if !safeAbsolute(options.HostPath) {
+		return errors.New("native host path must be absolute")
+	}
 	if installing {
 		if !safeAbsolute(options.SourceDir) || !safeAbsolute(options.GuardPath) {
 			return errors.New("plugin and guard paths must be absolute")
@@ -290,6 +355,9 @@ func validateOptions(target Target, options Options, installing bool) error {
 		if !versionPattern.MatchString(options.Version) {
 			return errors.New("invalid plugin version")
 		}
+	}
+	if err := validateGuard(options.HostPath); err != nil {
+		return errors.New("invalid native host binary")
 	}
 	return nil
 }
@@ -305,22 +373,44 @@ func hostDirectory(target Target) string {
 	return ".codex"
 }
 
+func marketplaceInstallPath(home string, target Target) string {
+	return filepath.Join(home, ".palonexus", "marketplaces", string(target), "palonexus-sdk")
+}
+
 func openPluginParent(home string, target Target) (int, string, error) {
 	homeFD, err := openAbsoluteDirectory(home)
 	if err != nil {
 		return -1, "", errors.New("unsafe home directory")
 	}
 	defer unix.Close(homeFD)
+	appFD, err := ensurePrivateDirectoryAt(homeFD, ".palonexus")
+	if err != nil {
+		return -1, "", err
+	}
+	defer unix.Close(appFD)
+	marketplacesFD, err := ensurePrivateDirectoryAt(appFD, "marketplaces")
+	if err != nil {
+		return -1, "", err
+	}
+	defer unix.Close(marketplacesFD)
+	parentFD, err := ensurePrivateDirectoryAt(marketplacesFD, string(target))
+	if err != nil {
+		return -1, "", err
+	}
+	return parentFD, marketplaceName, nil
+}
+
+func ensureNativeHome(home string, target Target) error {
+	homeFD, err := openAbsoluteDirectory(home)
+	if err != nil {
+		return errors.New("unsafe home directory")
+	}
+	defer unix.Close(homeFD)
 	hostFD, err := ensureDirectoryAt(homeFD, hostDirectory(target))
 	if err != nil {
-		return -1, "", err
+		return err
 	}
-	defer unix.Close(hostFD)
-	parentFD, err := ensureDirectoryAt(hostFD, "plugins")
-	if err != nil {
-		return -1, "", err
-	}
-	return parentFD, installName, nil
+	return unix.Close(hostFD)
 }
 
 func openAbsoluteDirectory(path string) (int, error) {
@@ -370,6 +460,19 @@ func ensureDirectoryAt(parentFD int, name string) (int, error) {
 	return fd, nil
 }
 
+func ensurePrivateDirectoryAt(parentFD int, name string) (int, error) {
+	fd, err := ensureDirectoryAt(parentFD, name)
+	if err != nil {
+		return -1, err
+	}
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&0o077 != 0 {
+		unix.Close(fd)
+		return -1, errors.New("installer-owned directory is not private")
+	}
+	return fd, nil
+}
+
 func openDirectoryAt(parentFD int, name string) (int, error) {
 	fd, err := unix.Openat(parentFD, name, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
@@ -397,7 +500,7 @@ func openSourceDirectoryAt(parentFD int, name string) (int, error) {
 func validateDirectoryFD(fd int) error {
 	var stat unix.Stat_t
 	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFDIR ||
-		int(stat.Uid) != os.Geteuid() || stat.Mode&0o077 != 0 || stat.Nlink < 1 {
+		int(stat.Uid) != os.Geteuid() || stat.Mode&0o022 != 0 || stat.Nlink < 1 {
 		return errors.New("unsafe directory")
 	}
 	return nil
@@ -448,18 +551,31 @@ func validateGuard(path string) error {
 		return errors.New("invalid guard binary")
 	}
 	defer unix.Close(fd)
-	if _, err := validateSourceRegularFD(fd, true); err != nil {
+	var stat unix.Stat_t
+	if err := unix.Fstat(fd, &stat); err != nil || stat.Mode&unix.S_IFMT != unix.S_IFREG ||
+		(int(stat.Uid) != 0 && int(stat.Uid) != os.Geteuid()) || stat.Mode&0o022 != 0 ||
+		stat.Nlink != 1 || stat.Mode&0o111 == 0 || stat.Size <= 0 || stat.Size > 512<<20 {
 		return errors.New("invalid guard binary")
 	}
 	return nil
 }
 
-func requireManifest(sourceFD int, target Target) error {
+func requireManifest(sourceFD int, target Target, version string) error {
+	pluginRoot, err := openSourceDirectoryAt(sourceFD, "plugins")
+	if err != nil {
+		return errors.New("plugin directory missing")
+	}
+	defer unix.Close(pluginRoot)
+	palonexusRoot, err := openSourceDirectoryAt(pluginRoot, installName)
+	if err != nil {
+		return errors.New("PaloNexus plugin missing")
+	}
+	defer unix.Close(palonexusRoot)
 	directory := ".claude-plugin"
 	if target == Codex {
 		directory = ".codex-plugin"
 	}
-	fd, err := openSourceDirectoryAt(sourceFD, directory)
+	fd, err := openSourceDirectoryAt(palonexusRoot, directory)
 	if err != nil {
 		return errors.New("plugin manifest directory missing")
 	}
@@ -472,7 +588,272 @@ func requireManifest(sourceFD int, target Target) error {
 	if _, err := validateSourceRegularFD(fileFD, false); err != nil {
 		return errors.New("plugin manifest unsafe")
 	}
+	pluginData, err := readBoundedFD(fileFD, 64*1024)
+	if err != nil {
+		return errors.New("plugin manifest unreadable")
+	}
+	var pluginManifest struct {
+		Name        string `json:"name"`
+		Version     string `json:"version"`
+		Description string `json:"description"`
+		License     string `json:"license"`
+		Hooks       string `json:"hooks"`
+		Skills      string `json:"skills"`
+		Author      struct {
+			Name string `json:"name"`
+		} `json:"author"`
+	}
+	if decodeStrictDocument(pluginData, &pluginManifest) != nil ||
+		pluginManifest.Name != installName || pluginManifest.Version != version ||
+		pluginManifest.Description == "" || len(pluginManifest.Description) > 512 ||
+		pluginManifest.License != "MIT" ||
+		pluginManifest.Author.Name != "PaloNexus" ||
+		pluginManifest.Hooks != "./hooks/hooks.json" || pluginManifest.Skills != "./skills/" {
+		return errors.New("invalid plugin manifest")
+	}
+	if err := requireRelativeFile(palonexusRoot, pluginManifest.Hooks); err != nil {
+		return errors.New("invalid plugin hook path")
+	}
+	if err := requireRelativeDirectory(palonexusRoot, pluginManifest.Skills); err != nil {
+		return errors.New("invalid plugin skill path")
+	}
+	hooksFD, err := openSourceDirectoryAt(palonexusRoot, "hooks")
+	if err != nil {
+		return errors.New("plugin hooks directory missing")
+	}
+	defer unix.Close(hooksFD)
+	hooksManifestFD, err := unix.Openat(
+		hooksFD, "hooks.json", unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0,
+	)
+	if err != nil {
+		return errors.New("plugin hooks manifest missing")
+	}
+	hooksData, hooksErr := readBoundedFD(hooksManifestFD, 64*1024)
+	unix.Close(hooksManifestFD)
+	var hooksManifest struct {
+		Version     int    `json:"version"`
+		GuardConfig string `json:"guardConfig"`
+	}
+	if hooksErr != nil || decodeStrictDocument(hooksData, &hooksManifest) != nil ||
+		hooksManifest.Version != 1 || hooksManifest.GuardConfig != "./guard.json" {
+		return errors.New("invalid plugin hooks manifest")
+	}
+	guardConfigFD, err := unix.Openat(
+		hooksFD, "guard.json", unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0,
+	)
+	if err != nil {
+		return errors.New("plugin guard configuration missing")
+	}
+	guardConfigData, guardConfigErr := readBoundedFD(guardConfigFD, 4096)
+	unix.Close(guardConfigFD)
+	var guardConfig struct {
+		GuardPath string   `json:"guardPath"`
+		Argv      []string `json:"argv"`
+	}
+	if guardConfigErr != nil || decodeStrictDocument(guardConfigData, &guardConfig) != nil ||
+		guardConfig.GuardPath != "__PALONEXUS_GUARD__" ||
+		len(guardConfig.Argv) != 2 || guardConfig.Argv[0] != "guard" || guardConfig.Argv[1] != "check" {
+		return errors.New("invalid plugin guard configuration")
+	}
+	protocolFD, err := unix.Openat(
+		palonexusRoot, "palonexus.json", unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0,
+	)
+	if err != nil {
+		return errors.New("plugin protocol manifest missing")
+	}
+	protocolData, protocolErr := readBoundedFD(protocolFD, 4096)
+	unix.Close(protocolFD)
+	var protocolManifest struct {
+		ProtocolVersion string `json:"protocolVersion"`
+	}
+	if protocolErr != nil || decodeStrictDocument(protocolData, &protocolManifest) != nil ||
+		protocolManifest.ProtocolVersion != "1.0" {
+		return errors.New("invalid plugin protocol manifest")
+	}
+	marketplaceRoot := sourceFD
+	var closeMarketplace func()
+	if target == Codex {
+		agents, err := openSourceDirectoryAt(sourceFD, ".agents")
+		if err != nil {
+			return errors.New("Codex marketplace missing")
+		}
+		plugins, err := openSourceDirectoryAt(agents, "plugins")
+		unix.Close(agents)
+		if err != nil {
+			return errors.New("Codex marketplace missing")
+		}
+		marketplaceRoot = plugins
+		closeMarketplace = func() { unix.Close(plugins) }
+	} else {
+		claude, err := openSourceDirectoryAt(sourceFD, ".claude-plugin")
+		if err != nil {
+			return errors.New("Claude marketplace missing")
+		}
+		marketplaceRoot = claude
+		closeMarketplace = func() { unix.Close(claude) }
+	}
+	defer closeMarketplace()
+	marketplaceFD, err := unix.Openat(
+		marketplaceRoot, "marketplace.json", unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0,
+	)
+	if err != nil {
+		return errors.New("marketplace manifest missing")
+	}
+	defer unix.Close(marketplaceFD)
+	if _, err := validateSourceRegularFD(marketplaceFD, false); err != nil {
+		return errors.New("marketplace manifest unsafe")
+	}
+	marketplaceData, err := readBoundedFD(marketplaceFD, 64*1024)
+	if err != nil {
+		return errors.New("marketplace manifest unreadable")
+	}
+	if err := validateMarketplaceManifest(target, marketplaceData); err != nil {
+		return err
+	}
 	return nil
+}
+
+func readBoundedFD(fd int, limit int64) ([]byte, error) {
+	duplicate, err := unix.Dup(fd)
+	if err != nil {
+		return nil, err
+	}
+	file := os.NewFile(uintptr(duplicate), "bounded-plugin-file")
+	defer file.Close()
+	if _, err := file.Seek(0, io.SeekStart); err != nil {
+		return nil, err
+	}
+	data, err := io.ReadAll(io.LimitReader(file, limit+1))
+	if err != nil || int64(len(data)) > limit {
+		return nil, errors.New("file exceeds limit")
+	}
+	return data, nil
+}
+
+func decodeStrictDocument(data []byte, destination any) error {
+	if len(data) == 0 || rejectDuplicateJSONKeys(data) != nil {
+		return errors.New("invalid JSON")
+	}
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(destination); err != nil {
+		return err
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return errors.New("trailing JSON")
+	}
+	return nil
+}
+
+func validateMarketplaceManifest(target Target, data []byte) error {
+	if target == ClaudeCode {
+		var document struct {
+			Name        string `json:"name"`
+			Description string `json:"description"`
+			Owner       struct {
+				Name string `json:"name"`
+			} `json:"owner"`
+			Plugins []struct {
+				Name   string `json:"name"`
+				Source string `json:"source"`
+			} `json:"plugins"`
+		}
+		if decodeStrictDocument(data, &document) != nil || document.Name != "palonexus-sdk" ||
+			document.Description != "PaloNexus governed actions" ||
+			document.Owner.Name != "PaloNexus" || len(document.Plugins) != 1 ||
+			document.Plugins[0].Name != installName ||
+			document.Plugins[0].Source != "./plugins/palonexus" {
+			return errors.New("invalid Claude marketplace manifest")
+		}
+		return nil
+	}
+	var document struct {
+		Name    string `json:"name"`
+		Plugins []struct {
+			Name   string `json:"name"`
+			Source struct {
+				Source string `json:"source"`
+				Path   string `json:"path"`
+			} `json:"source"`
+		} `json:"plugins"`
+	}
+	if decodeStrictDocument(data, &document) != nil || document.Name != "palonexus-sdk" ||
+		len(document.Plugins) != 1 || document.Plugins[0].Name != installName ||
+		document.Plugins[0].Source.Source != "local" ||
+		document.Plugins[0].Source.Path != "./plugins/palonexus" {
+		return errors.New("invalid Codex marketplace manifest")
+	}
+	return nil
+}
+
+func requireRelativeFile(rootFD int, path string) error {
+	parts, err := safeRelativeParts(path)
+	if err != nil || len(parts) == 0 {
+		return errors.New("unsafe relative path")
+	}
+	parent := rootFD
+	opened := make([]int, 0, len(parts))
+	defer func() {
+		for _, fd := range opened {
+			unix.Close(fd)
+		}
+	}()
+	for _, part := range parts[:len(parts)-1] {
+		fd, err := openSourceDirectoryAt(parent, part)
+		if err != nil {
+			return err
+		}
+		opened = append(opened, fd)
+		parent = fd
+	}
+	fd, err := unix.Openat(parent, parts[len(parts)-1], unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
+	if err != nil {
+		return err
+	}
+	defer unix.Close(fd)
+	_, err = validateSourceRegularFD(fd, false)
+	return err
+}
+
+func requireRelativeDirectory(rootFD int, path string) error {
+	parts, err := safeRelativeParts(path)
+	if err != nil || len(parts) == 0 {
+		return errors.New("unsafe relative path")
+	}
+	parent := rootFD
+	opened := make([]int, 0, len(parts))
+	defer func() {
+		for _, fd := range opened {
+			unix.Close(fd)
+		}
+	}()
+	for _, part := range parts {
+		fd, err := openSourceDirectoryAt(parent, part)
+		if err != nil {
+			return err
+		}
+		opened = append(opened, fd)
+		parent = fd
+	}
+	return nil
+}
+
+func safeRelativeParts(path string) ([]string, error) {
+	if path == "" || filepath.IsAbs(path) || strings.ContainsRune(path, '\x00') {
+		return nil, errors.New("unsafe relative path")
+	}
+	clean := filepath.Clean(strings.TrimPrefix(path, "./"))
+	if clean == "." || clean == ".." || strings.HasPrefix(clean, ".."+string(filepath.Separator)) {
+		return nil, errors.New("unsafe relative path")
+	}
+	parts := strings.Split(strings.TrimSuffix(clean, string(filepath.Separator)), string(filepath.Separator))
+	for _, part := range parts {
+		if part == "" || part == "." || part == ".." {
+			return nil, errors.New("unsafe relative path")
+		}
+	}
+	return parts, nil
 }
 
 func withTransactionLock(ctx context.Context, parentFD int, operation func() (bool, error)) (bool, error) {
@@ -755,6 +1136,46 @@ func writeFileAt(parentFD int, name string, data []byte, mode uint32) error {
 	return file.Close()
 }
 
+func writeGuardConfigAt(marketplaceFD int, guardPath string) error {
+	pluginsFD, err := openDirectoryAt(marketplaceFD, "plugins")
+	if err != nil {
+		return errors.New("open installed plugin directory")
+	}
+	defer unix.Close(pluginsFD)
+	pluginFD, err := openDirectoryAt(pluginsFD, installName)
+	if err != nil {
+		return errors.New("open installed plugin")
+	}
+	defer unix.Close(pluginFD)
+	hooksFD, err := openDirectoryAt(pluginFD, "hooks")
+	if err != nil {
+		return errors.New("open installed hooks")
+	}
+	defer unix.Close(hooksFD)
+	existingFD, err := unix.Openat(
+		hooksFD, "guard.json", unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0,
+	)
+	if err != nil {
+		return errors.New("guard configuration placeholder missing")
+	}
+	if _, err := validateRegularFD(existingFD, false); err != nil {
+		unix.Close(existingFD)
+		return errors.New("unsafe guard configuration placeholder")
+	}
+	unix.Close(existingFD)
+	if err := unix.Unlinkat(hooksFD, "guard.json", 0); err != nil {
+		return errors.New("replace guard configuration")
+	}
+	document := struct {
+		GuardPath string   `json:"guardPath"`
+		Argv      []string `json:"argv"`
+	}{GuardPath: guardPath, Argv: []string{"guard", "check"}}
+	if err := writeFileAt(hooksFD, "guard.json", mustJSON(document), 0o600); err != nil {
+		return errors.New("write guard configuration")
+	}
+	return unix.Fsync(hooksFD)
+}
+
 func readOwnedMarker(path string, target Target) (ownershipMarker, error) {
 	parent, name := filepath.Split(filepath.Clean(path))
 	fd, err := openAbsoluteDirectory(strings.TrimSuffix(parent, string(filepath.Separator)))
@@ -804,7 +1225,10 @@ func readOwnedMarkerAt(parentFD int, directory string, target Target) (ownership
 	if err := decoder.Decode(&marker); err != nil || marker.Schema != 1 ||
 		marker.Owner != "github.com/rogerchucker/palonexus-sdk" || marker.Target != target ||
 		!versionPattern.MatchString(marker.Version) || !safeAbsolute(marker.GuardPath) ||
-		len(marker.Digest) != sha256.Size*2 {
+		len(marker.SourceDigest) != sha256.Size*2 || len(marker.Digest) != sha256.Size*2 {
+		return ownershipMarker{}, errors.New("invalid ownership marker")
+	}
+	if _, err := hex.DecodeString(marker.SourceDigest); err != nil {
 		return ownershipMarker{}, errors.New("invalid ownership marker")
 	}
 	if _, err := hex.DecodeString(marker.Digest); err != nil {
@@ -904,11 +1328,15 @@ func recoverTransaction(parentFD int, target Target) error {
 	var journal transactionJournal
 	decoder := json.NewDecoder(bytes.NewReader(data))
 	decoder.DisallowUnknownFields()
-	if decoder.Decode(&journal) != nil || journal.Schema != 1 ||
+	if rejectDuplicateJSONKeys(data) != nil || decoder.Decode(&journal) != nil || journal.Schema != 1 ||
 		(journal.Operation != "install" && journal.Operation != "uninstall") {
 		return errors.New("invalid plugin transaction journal")
 	}
-	_, destinationErr := readOwnedMarkerAt(parentFD, installName, target)
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return errors.New("invalid plugin transaction journal")
+	}
+	_, destinationErr := readOwnedMarkerAt(parentFD, marketplaceName, target)
 	_, backupErr := readOwnedMarkerAt(parentFD, backupName, target)
 	if destinationErr != nil && !errors.Is(destinationErr, os.ErrNotExist) {
 		return destinationErr
@@ -918,7 +1346,7 @@ func recoverTransaction(parentFD int, target Target) error {
 	}
 	if journal.Operation == "install" {
 		if errors.Is(destinationErr, os.ErrNotExist) && backupErr == nil {
-			if err := unix.Renameat(parentFD, backupName, parentFD, installName); err != nil {
+			if err := unix.Renameat(parentFD, backupName, parentFD, marketplaceName); err != nil {
 				return errors.New("recover plugin upgrade")
 			}
 		} else if destinationErr == nil && backupErr == nil {
@@ -985,11 +1413,11 @@ func rollbackBeforeBackup(parentFD int, cause error) error {
 }
 
 func rollbackInstall(parentFD int, hadBackup bool, cause error) error {
-	if err := removeTreeAt(parentFD, installName); err != nil && !errors.Is(err, os.ErrNotExist) {
+	if err := removeTreeAt(parentFD, marketplaceName); err != nil && !errors.Is(err, os.ErrNotExist) {
 		return errors.Join(cause, errors.New("plugin rollback failed"))
 	}
 	if hadBackup {
-		if err := unix.Renameat(parentFD, backupName, parentFD, installName); err != nil {
+		if err := unix.Renameat(parentFD, backupName, parentFD, marketplaceName); err != nil {
 			return errors.Join(cause, errors.New("plugin rollback failed"))
 		}
 	}
@@ -1003,7 +1431,7 @@ func rollbackInstall(parentFD int, hadBackup bool, cause error) error {
 }
 
 func rollbackUninstall(parentFD int, cause error) error {
-	if err := unix.Renameat(parentFD, backupName, parentFD, installName); err != nil {
+	if err := unix.Renameat(parentFD, backupName, parentFD, marketplaceName); err != nil {
 		return errors.Join(cause, errors.New("plugin rollback failed"))
 	}
 	if err := removeJournal(parentFD); err != nil {

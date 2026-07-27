@@ -50,6 +50,11 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		return 0
 	}
 	if args[0] == "--version" {
+		if len(args) == 2 && args[1] == "--json" {
+			_, _ = fmt.Fprintf(stdout,
+				"{\"name\":\"palonexus\",\"version\":%q,\"protocolVersion\":\"1.0\"}\n", Version)
+			return 0
+		}
 		if len(args) != 1 {
 			return invalidArguments(stderr, "")
 		}
@@ -62,12 +67,12 @@ func Run(args []string, stdout, stderr io.Writer) int {
 		_, _ = io.WriteString(stderr, "palonexus: unknown command\n")
 		return 2
 	}
+	if command == "plugin" && len(args) > 1 {
+		return runPluginCommand(args[1:], stdout, stderr)
+	}
 	if len(args) == 2 && (args[1] == "-h" || args[1] == "--help") {
 		_, _ = fmt.Fprintf(stdout, "Usage: palonexus %s\n", command)
 		return 0
-	}
-	if command == "plugin" && len(args) > 1 {
-		return runPluginCommand(args[1:], stdout, stderr)
 	}
 	if len(args) != 1 {
 		return invalidArguments(stderr, command)
