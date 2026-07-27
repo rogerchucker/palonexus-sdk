@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync"
 	"testing"
@@ -432,7 +433,7 @@ func TestQueueRejectsUnsafeRootsAndRecordInodes(t *testing.T) {
 
 func TestQueueBoundsCancellationAndAuthorizedDiscard(t *testing.T) {
 	ctx := context.Background()
-	q, err := Open(Config{Root: queueRoot(t), MaxRecords: 1, MaxBytes: 1 << 20, Authority: testAuthority{subject: b1.Subject}})
+	q, err := Open(Config{Root: queueRoot(t), MaxRecords: 3, MaxBytes: 1 << 20, Authority: testAuthority{subject: b1.Subject}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1358,7 +1359,7 @@ func TestVerifiedDoneReplacementSurvivesWithoutPathnameUnlink(t *testing.T) {
 
 func TestRetainedDoneTombstonesAreCountedAndBounded(t *testing.T) {
 	root := queueRoot(t)
-	q, err := Open(Config{Root: root, MaxRecords: 4, MaxBytes: 1 << 20})
+	q, err := Open(Config{Root: root, MaxRecords: 6, MaxBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1372,13 +1373,66 @@ func TestRetainedDoneTombstonesAreCountedAndBounded(t *testing.T) {
 	if err = q.Enqueue(context.Background(), b1, batchRecord(2, '2')); !errors.Is(err, ErrQueueFull) {
 		t.Fatalf("retained tombstones were not included in capacity: %v", err)
 	}
-	count, used, err := q.impl.(*unixQueue).usage()
+	count, used, err := q.impl.(*unixQueue).reservedUsage()
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 4 || used <= 0 {
+	if count != 6 || used <= 0 {
 		t.Fatalf("unexpected bounded usage: count=%d bytes=%d", count, used)
 	}
+}
+
+func TestCapacityAdmissionReservesEveryFutureAcknowledgement(t *testing.T) {
+	root := queueRoot(t)
+	config := Config{Root: root, MaxRecords: 6, MaxBytes: 1 << 20}
+	q, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	records := []p.ReconciliationRecord{batchRecord(0, '0'), batchRecord(1, '1')}
+	for _, record := range records {
+		if err = q.Enqueue(context.Background(), b1, record); err != nil {
+			t.Fatal(err)
+		}
+	}
+	logicalCount, exactLimit, err := q.impl.(*unixQueue).reservedUsage()
+	if err != nil || logicalCount != config.MaxRecords {
+		t.Fatalf("bad admitted reservation: count=%d bytes=%d err=%v", logicalCount, exactLimit, err)
+	}
+	if err = q.Close(); err != nil {
+		t.Fatal(err)
+	}
+	config.MaxBytes = exactLimit
+	for index, record := range records {
+		q, err = Open(config)
+		if err != nil {
+			t.Fatalf("restart %d at exact capacity: %v", index, err)
+		}
+		sending, claimErr := q.Claim(context.Background(), b1, t0.Add(time.Duration(index+1)*time.Second))
+		if claimErr != nil || sending.ReconciliationID != record.ReconciliationID {
+			t.Fatalf("claim %d: %#v %v", index, sending, claimErr)
+		}
+		receipt, receiptErr := testReceipt(sending,
+			p.ReceiptID("receipt_01J5ABCDEFGHJKMNPQRSTVWXY"+strconv.Itoa(index)), t0.Add(time.Duration(index+2)*time.Second))
+		if receiptErr != nil {
+			t.Fatal(receiptErr)
+		}
+		if _, err = q.Acknowledge(context.Background(), b1, sending.ReconciliationID, receipt); err != nil {
+			t.Fatalf("ack %d at exact reserved capacity: %v", index, err)
+		}
+		count, used, usageErr := q.impl.(*unixQueue).reservedUsage()
+		if usageErr != nil || count > config.MaxRecords || used > config.MaxBytes {
+			t.Fatalf("capacity exceeded after ack %d: count=%d bytes=%d err=%v", index, count, used, usageErr)
+		}
+		if err = q.Close(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	q, err = Open(config)
+	if err != nil {
+		t.Fatalf("final restart: %v", err)
+	}
+	defer q.Close()
 }
 
 func TestQueueRejectsHardlinkFIFOAndUnsafeControlFiles(t *testing.T) {

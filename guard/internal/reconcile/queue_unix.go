@@ -379,18 +379,11 @@ func (q *unixQueue) enqueue(ctx context.Context, b Binding, record p.Reconciliat
 		if !errors.Is(e, ErrNotFound) {
 			return e
 		}
-		count, _, e := q.usage()
-		if e != nil {
-			return e
-		}
-		if count >= q.config.MaxRecords {
-			return ErrQueueFull
-		}
 		checkpoint, createCheckpoint, err := q.validateEnqueueSequence(b, record)
 		if err != nil {
 			return err
 		}
-		count, used, e := q.usage()
+		count, used, e := q.reservedUsage()
 		if e != nil {
 			return e
 		}
@@ -405,11 +398,11 @@ func (q *unixQueue) enqueue(ctx context.Context, b Binding, record p.Reconciliat
 			transaction.OldCheckpointDigest = hex.EncodeToString(checkpoint.digest[:])
 		}
 		transactionWire, _ := json.Marshal(transaction)
-		required := int64(len(document)+len(transactionWire)) + transitionReserveBytes
+		required := int64(q.config.MaxRecordBytes+len(transactionWire)) + maxTransactionBytes
 		if createCheckpoint {
 			required += int64(len(checkpointWire))
 		}
-		if len(document) > q.config.MaxRecordBytes || len(wire) > q.config.MaxRecordBytes || count >= q.config.MaxRecords ||
+		if len(document) > q.config.MaxRecordBytes || len(wire) > q.config.MaxRecordBytes || count > q.config.MaxRecords-3 ||
 			required > q.config.MaxBytes || used > q.config.MaxBytes-required {
 			return ErrQueueFull
 		}
@@ -1156,6 +1149,45 @@ func (q *unixQueue) usage() (int, int64, error) {
 	}
 	return count, total, nil
 }
+
+// reservedUsage includes every immutable acknowledgement journal still owed
+// by an admitted record and one global maximum record rewrite used by
+// claim/fail/manual-retry/ack atomic replacement.
+func (q *unixQueue) reservedUsage() (int, int64, error) {
+	count, used, err := q.usage()
+	if err != nil {
+		return 0, 0, err
+	}
+	names, err := q.names()
+	if err != nil {
+		return 0, 0, err
+	}
+	missingAcknowledgements := 0
+	var recordGrowthReserve int64
+	for _, name := range names {
+		var recordStat unix.Stat_t
+		if unix.Fstatat(q.rootFD, name, &recordStat, unix.AT_SYMLINK_NOFOLLOW) != nil ||
+			recordStat.Mode&unix.S_IFMT != unix.S_IFREG || recordStat.Nlink != 1 ||
+			recordStat.Size <= 0 || recordStat.Size > int64(q.config.MaxRecordBytes) {
+			return 0, 0, ErrUnsafePath
+		}
+		recordGrowthReserve += int64(q.config.MaxRecordBytes) - recordStat.Size
+		transaction := batchTransaction{Operation: "ack", RecordName: name}
+		doneName := transactionControlName(".done-", transaction)
+		var st unix.Stat_t
+		statErr := unix.Fstatat(q.rootFD, doneName, &st, unix.AT_SYMLINK_NOFOLLOW)
+		if errors.Is(statErr, unix.ENOENT) {
+			missingAcknowledgements++
+			continue
+		}
+		if statErr != nil || st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 {
+			return 0, 0, ErrUnsafePath
+		}
+	}
+	return count + missingAcknowledgements,
+		used + recordGrowthReserve + int64(missingAcknowledgements)*maxTransactionBytes +
+			int64(q.config.MaxRecordBytes), nil
+}
 func (q *unixQueue) validateAll() error {
 	entries, err := q.entries()
 	if err != nil {
@@ -1209,11 +1241,11 @@ func (q *unixQueue) validateAll() error {
 			return err
 		}
 	}
-	_, used, err := q.usage()
+	count, used, err := q.reservedUsage()
 	if err != nil {
 		return err
 	}
-	if used > q.config.MaxBytes {
+	if count > q.config.MaxRecords || used > q.config.MaxBytes {
 		return ErrQueueFull
 	}
 	return nil
