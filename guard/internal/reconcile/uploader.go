@@ -131,22 +131,22 @@ func newHTTPTransport(config HTTPConfig, controls networkControls) (*HTTPTranspo
 		binding: config.Binding, clientID: config.ClientID, clock: clock}, nil
 }
 
-func (t *HTTPTransport) Send(ctx context.Context, record p.ReconciliationRecord) (Receipt, error) {
+func (t *HTTPTransport) Send(ctx context.Context, record p.ReconciliationRecord) (VerifiedReceipt, error) {
 	if t == nil || record.ClientID != t.clientID {
-		return Receipt{}, ErrRejected
+		return VerifiedReceipt{}, &DeliveryError{Class: DeliveryRejected}
 	}
 	body, err := validateRecord(record, maxRecordBytesDefault)
 	if err != nil {
-		return Receipt{}, err
+		return VerifiedReceipt{}, &DeliveryError{Class: DeliveryRejected}
 	}
 	token, err := t.token(ctx)
 	if err != nil || len(token) == 0 || bytes.ContainsAny(token, "\r\n") || len(token) > 8192 {
 		wipe(token)
-		return Receipt{}, ErrTransport
+		return VerifiedReceipt{}, &DeliveryError{Class: DeliveryAuthentication}
 	}
 	request, err := http.NewRequestWithContext(ctx, http.MethodPost, t.endpoint, bytes.NewReader(body))
 	if err != nil {
-		return Receipt{}, ErrTransport
+		return VerifiedReceipt{}, &DeliveryError{Class: DeliveryRejected}
 	}
 	request.GetBody = nil
 	request.Header.Set("Authorization", "Bearer "+string(token))
@@ -157,56 +157,59 @@ func (t *HTTPTransport) Send(ctx context.Context, record p.ReconciliationRecord)
 		return t.client.Do(request)
 	}()
 	if err != nil {
-		return Receipt{}, &DeliveryError{Class: DeliveryTransient}
+		return VerifiedReceipt{}, &DeliveryError{Class: classifyNetworkError(err)}
 	}
 	defer response.Body.Close()
 	if response.StatusCode < 200 || response.StatusCode >= 300 {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBytes))
 		switch response.StatusCode {
 		case http.StatusUnauthorized, http.StatusForbidden:
-			return Receipt{}, &DeliveryError{Class: DeliveryAuthentication}
+			return VerifiedReceipt{}, &DeliveryError{Class: DeliveryAuthentication}
 		case http.StatusConflict:
-			return Receipt{}, &DeliveryError{Class: DeliveryConflict}
+			return VerifiedReceipt{}, &DeliveryError{Class: DeliveryConflict}
 		case http.StatusTooManyRequests:
-			return Receipt{}, &DeliveryError{Class: DeliveryRateLimit, RetryAfter: parseRetryAfter(response.Header.Get("Retry-After"))}
+			return VerifiedReceipt{}, &DeliveryError{Class: DeliveryRateLimit, RetryAfter: parseRetryAfter(response.Header.Get("Retry-After"))}
 		default:
 			if response.StatusCode >= 500 {
-				return Receipt{}, &DeliveryError{Class: DeliveryTransient}
+				return VerifiedReceipt{}, &DeliveryError{Class: DeliveryTransient}
 			}
-			return Receipt{}, &DeliveryError{Class: DeliveryRejected}
+			return VerifiedReceipt{}, &DeliveryError{Class: DeliveryRejected}
 		}
 	}
 	if !strings.HasPrefix(strings.ToLower(response.Header.Get("Content-Type")), "application/json") {
 		_, _ = io.Copy(io.Discard, io.LimitReader(response.Body, maxResponseBytes))
-		return Receipt{}, &DeliveryError{Class: DeliveryRejected}
+		return VerifiedReceipt{}, &DeliveryError{Class: DeliveryRejected}
 	}
 	document, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
 	if err != nil || len(document) > maxResponseBytes {
-		return Receipt{}, ErrRejected
+		return VerifiedReceipt{}, &DeliveryError{Class: DeliveryRejected}
 	}
 	var public p.ReconciliationAcknowledgement
 	decoder := json.NewDecoder(bytes.NewReader(document))
 	decoder.DisallowUnknownFields()
 	if decoder.Decode(&public) != nil || decoder.Decode(&struct{}{}) != io.EOF {
-		return Receipt{}, ErrRejected
+		return VerifiedReceipt{}, &DeliveryError{Class: DeliveryRejected}
 	}
 	hash, err := evidenceHash(record)
 	if err != nil || public.ReconciliationID != record.ReconciliationID || public.EvidenceHash != hash {
-		return Receipt{}, ErrRejected
+		return VerifiedReceipt{}, &DeliveryError{Class: DeliveryConflict}
 	}
 	at, err := parseTime(public.AcknowledgedAt)
 	if err != nil {
-		return Receipt{}, ErrRejected
+		return VerifiedReceipt{}, &DeliveryError{Class: DeliveryRejected}
 	}
-	receipt, err := NewReceipt(record, public.ReceiptID, at, t.binding, t.clientID)
-	if err != nil {
-		return Receipt{}, err
+	return mintVerifiedReceipt(record, public.ReceiptID, at, t.clock().UTC(), t.binding, t.clientID)
+}
+
+func classifyNetworkError(err error) DeliveryErrorClass {
+	var unknown x509.UnknownAuthorityError
+	var hostname x509.HostnameError
+	var invalid x509.CertificateInvalidError
+	var record tls.RecordHeaderError
+	if errors.As(err, &unknown) || errors.As(err, &hostname) || errors.As(err, &invalid) || errors.As(err, &record) {
+		return DeliveryAuthentication
 	}
-	receipt.VerifiedAt = t.clock().UTC()
-	if at.After(receipt.VerifiedAt) {
-		return Receipt{}, ErrRejected
-	}
-	return receipt, nil
+	return DeliveryTransient
 }
 
 func validEndpointPath(path string) bool {
@@ -324,7 +327,7 @@ type Uploader struct {
 	Queue   *Queue
 	Binding Binding
 	Clock   func() time.Time
-	Send    func(context.Context, p.ReconciliationRecord) (Receipt, error)
+	Send    func(context.Context, p.ReconciliationRecord) (VerifiedReceipt, error)
 }
 
 func (u Uploader) Attempt(ctx context.Context) error {

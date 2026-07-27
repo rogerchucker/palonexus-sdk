@@ -3,6 +3,7 @@
 package reconcile
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"encoding/pem"
@@ -19,6 +20,7 @@ import (
 	"time"
 
 	p "github.com/rogerchucker/palonexus-sdk/guard/pkg/protocol"
+	"golang.org/x/sys/unix"
 )
 
 func queueRoot(t *testing.T) string {
@@ -87,6 +89,10 @@ func batchRecord(sequence int, suffix byte) p.ReconciliationRecord {
 	record.AuthorizationIdempotencyKey = p.AuthorizationIdempotencyKey("authz_01J5ABCDEFGHJKMNPQRSTVWXY" + last)
 	record.BatchSequence = p.JSONInteger(sequence)
 	return record
+}
+
+func testReceipt(record p.ReconciliationRecord, id p.ReceiptID, at time.Time) (VerifiedReceipt, error) {
+	return mintVerifiedReceipt(record, id, at, at, b1, record.ClientID)
 }
 
 func TestQueueLifecycleDedupeCrashRecoveryAndConflict(t *testing.T) {
@@ -162,7 +168,7 @@ func TestRetryWaitAndAcknowledgementAreDurable(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := NewReceipt(sending, "receipt_01J5ABCDEFGHJKMNPQRSTVWXY0", t0.Add(9*time.Second), b1, "registered-codex")
+	receipt, err := testReceipt(sending, "receipt_01J5ABCDEFGHJKMNPQRSTVWXY0", t0.Add(9*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -190,9 +196,9 @@ func TestUploaderMakesExactlyOneExplicitAttempt(t *testing.T) {
 		t.Fatal(err)
 	}
 	calls := 0
-	u := Uploader{Queue: q, Binding: b1, Clock: func() time.Time { return t0.Add(time.Second) }, Send: func(context.Context, p.ReconciliationRecord) (Receipt, error) {
+	u := Uploader{Queue: q, Binding: b1, Clock: func() time.Time { return t0.Add(time.Second) }, Send: func(context.Context, p.ReconciliationRecord) (VerifiedReceipt, error) {
 		calls++
-		return Receipt{}, ErrTransport
+		return VerifiedReceipt{}, ErrTransport
 	}}
 	if err := u.Attempt(ctx); !errors.Is(err, ErrTransport) {
 		t.Fatalf("want transport error, got %v", err)
@@ -226,7 +232,7 @@ func TestHTTPTransportIsStrictBoundedAndRedactsAuthorization(t *testing.T) {
 		t.Fatal(err)
 	}
 	receipt, err := transport.Send(context.Background(), record)
-	if err != nil || receipt.EvidenceHash != "sha256:ef28a07d036d06a118e72c15fe30347821a29f4e845769fee1f8e18c3ef11238" {
+	if err != nil || receipt.ack.EvidenceHash != "sha256:ef28a07d036d06a118e72c15fe30347821a29f4e845769fee1f8e18c3ef11238" {
 		t.Fatalf("protocol receipt rejected: %v %+v", err, receipt)
 	}
 	if gotAuth != "Bearer super-secret-bearer" {
@@ -253,6 +259,66 @@ func TestDialResolvedRejectsEntireMixedDNSAnswerBeforeDial(t *testing.T) {
 	if !errors.Is(err, ErrTransport) || called {
 		t.Fatalf("mixed answer was dialed: %v called=%v", err, called)
 	}
+}
+
+func TestUploaderStatusRedirectBodyAndProxyMatrix(t *testing.T) {
+	cases := []struct {
+		name   string
+		status int
+		class  DeliveryErrorClass
+	}{
+		{"auth", http.StatusUnauthorized, DeliveryAuthentication}, {"conflict", http.StatusConflict, DeliveryConflict},
+		{"rate", http.StatusTooManyRequests, DeliveryRateLimit}, {"server", http.StatusServiceUnavailable, DeliveryTransient},
+		{"rejected", http.StatusBadRequest, DeliveryRejected}, {"redirect", http.StatusFound, DeliveryRejected},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			calls := 0
+			server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) { calls++; w.WriteHeader(tc.status) }))
+			defer server.Close()
+			ca := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
+			transport, err := newHTTPTransportWithNetwork(HTTPConfig{Endpoint: server.URL, TrustedCAPEM: ca,
+				Token: func(context.Context) ([]byte, error) { return []byte("owned-token"), nil }, Binding: b1, ClientID: "registered-codex"},
+				networkControls{resolver: fixedResolver{{IP: net.ParseIP("93.184.216.34")}}, dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+					return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
+				}})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = transport.Send(context.Background(), pending())
+			var delivery *DeliveryError
+			if !errors.As(err, &delivery) || delivery.Class != tc.class {
+				t.Fatalf("class: %v", err)
+			}
+			if calls != 1 {
+				t.Fatalf("ambient replay/redirect: %d", calls)
+			}
+			httpTransport := transport.client.Transport.(*http.Transport)
+			if httpTransport.Proxy != nil || !httpTransport.DisableKeepAlives || httpTransport.TLSClientConfig.MinVersion < 0x0303 {
+				t.Fatal("unsafe transport")
+			}
+		})
+	}
+	t.Run("oversize success", func(t *testing.T) {
+		server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			_, _ = w.Write(bytes.Repeat([]byte("x"), maxResponseBytes+1))
+		}))
+		defer server.Close()
+		ca := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
+		transport, err := newHTTPTransportWithNetwork(HTTPConfig{Endpoint: server.URL, TrustedCAPEM: ca, Token: func(context.Context) ([]byte, error) { return []byte("token"), nil }, Binding: b1, ClientID: "registered-codex"},
+			networkControls{resolver: fixedResolver{{IP: net.ParseIP("93.184.216.34")}}, dial: func(ctx context.Context, network, _ string) (net.Conn, error) {
+				return (&net.Dialer{}).DialContext(ctx, network, server.Listener.Addr().String())
+			}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, err = transport.Send(context.Background(), pending())
+		var delivery *DeliveryError
+		if !errors.As(err, &delivery) || delivery.Class != DeliveryRejected {
+			t.Fatalf("oversize: %v", err)
+		}
+	})
 }
 
 func TestQueueRejectsUnsafeRootsAndRecordInodes(t *testing.T) {
@@ -376,15 +442,17 @@ func TestAcknowledgementIdempotencyRequiresExactFullReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := NewReceipt(sending, "receipt_01J5ABCDEFGHJKMNPQRSTVWXY0", t0.Add(2*time.Second), b1, sending.ClientID)
+	receipt, err := testReceipt(sending, "receipt_01J5ABCDEFGHJKMNPQRSTVWXY0", t0.Add(2*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
 	if _, err = q.Acknowledge(context.Background(), b1, sending.ReconciliationID, receipt); err != nil {
 		t.Fatal(err)
 	}
-	changed := receipt
-	changed.AcknowledgedAt = p.RFC3339Timestamp(t0.Add(3 * time.Second).Format(time.RFC3339))
+	changed, err := mintVerifiedReceipt(sending, "receipt_01J5ABCDEFGHJKMNPQRSTVWXY0", t0.Add(3*time.Second), t0.Add(3*time.Second), b1, sending.ClientID)
+	if err != nil {
+		t.Fatal(err)
+	}
 	if _, err = q.Acknowledge(context.Background(), b1, sending.ReconciliationID, changed); !errors.Is(err, ErrConflict) {
 		t.Fatalf("nonidentical receipt accepted: %v", err)
 	}
@@ -527,6 +595,23 @@ func FuzzReconciliationRecordValidation(f *testing.F) {
 	})
 }
 
+func FuzzBatchTransactionValidation(f *testing.F) {
+	f.Add([]byte(`{}`))
+	f.Add([]byte(`{"version":1,"oldRecordDigest":"secret","newEnvelope":{"holdClass":"token"}}`))
+	f.Fuzz(func(t *testing.T, document []byte) {
+		if len(document) > int(maxTransactionBytes) {
+			return
+		}
+		var transaction batchTransaction
+		decoder := json.NewDecoder(bytes.NewReader(document))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&transaction) != nil {
+			return
+		}
+		_ = validateTransactionShape(transaction, 128, maxRecordBytesDefault)
+	})
+}
+
 func TestOrderedBatchCheckpointRejectsGapsAndResumesPrunedPrefix(t *testing.T) {
 	root := queueRoot(t)
 	config := Config{Root: root, MaxRecords: 8, MaxBytes: 1 << 20}
@@ -556,7 +641,7 @@ func TestOrderedBatchCheckpointRejectsGapsAndResumesPrunedPrefix(t *testing.T) {
 	if sending.ReconciliationID != first.ReconciliationID {
 		t.Fatalf("reordered batch: %s", sending.ReconciliationID)
 	}
-	receipt, err := NewReceipt(sending, "receipt_01J5ABCDEFGHJKMNPQRSTVWXY0", t0.Add(2*time.Second), b1, sending.ClientID)
+	receipt, err := testReceipt(sending, "receipt_01J5ABCDEFGHJKMNPQRSTVWXY0", t0.Add(2*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -598,7 +683,7 @@ func TestAckTransactionRecoversCrashBetweenRecordAndCheckpoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	receipt, err := NewReceipt(sending, "receipt_01J5ABCDEFGHJKMNPQRSTVWXY0", t0.Add(2*time.Second), b1, sending.ClientID)
+	receipt, err := testReceipt(sending, "receipt_01J5ABCDEFGHJKMNPQRSTVWXY0", t0.Add(2*time.Second))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -632,8 +717,8 @@ func TestPermanentDeliveryErrorIsHeldUntilAuthorizedManualRetry(t *testing.T) {
 		t.Fatal(err)
 	}
 	uploader := Uploader{Queue: q, Binding: b1, Clock: func() time.Time { return t0.Add(time.Second) },
-		Send: func(context.Context, p.ReconciliationRecord) (Receipt, error) {
-			return Receipt{}, &DeliveryError{Class: DeliveryAuthentication}
+		Send: func(context.Context, p.ReconciliationRecord) (VerifiedReceipt, error) {
+			return VerifiedReceipt{}, &DeliveryError{Class: DeliveryAuthentication}
 		}}
 	if err := uploader.Attempt(context.Background()); !errors.Is(err, ErrRejected) {
 		t.Fatalf("typed permanent error lost: %v", err)
@@ -647,6 +732,87 @@ func TestPermanentDeliveryErrorIsHeldUntilAuthorizedManualRetry(t *testing.T) {
 	}
 	if _, err := q.ManualRetry(context.Background(), b1, record.ReconciliationID, t0.Add(2*time.Second)); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestInvalidSuccessfulReceiptIsDurablyHeld(t *testing.T) {
+	q, err := Open(Config{Root: queueRoot(t), MaxRecords: 8, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	record := pending()
+	if err = q.Enqueue(context.Background(), b1, record); err != nil {
+		t.Fatal(err)
+	}
+	sending, err := q.Claim(context.Background(), b1, t0.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = q.Acknowledge(context.Background(), b1, sending.ReconciliationID, VerifiedReceipt{}); !errors.Is(err, ErrRejected) {
+		t.Fatalf("invalid receipt error: %v", err)
+	}
+	if class, holdErr := q.HeldError(context.Background(), b1, record.ReconciliationID); holdErr != nil || class != DeliveryRejected {
+		t.Fatalf("not held: %v %s", holdErr, class)
+	}
+	if _, err = q.Claim(context.Background(), b1, t0.Add(2*time.Second)); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("invalid ack retried: %v", err)
+	}
+}
+
+func TestNonRetryableFailureIsDurablyHeld(t *testing.T) {
+	q, err := Open(Config{Root: queueRoot(t), MaxRecords: 8, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	record := pending()
+	if err = q.Enqueue(context.Background(), b1, record); err != nil {
+		t.Fatal(err)
+	}
+	sending, err := q.Claim(context.Background(), b1, t0.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = q.Fail(context.Background(), b1, sending.ReconciliationID, t0.Add(2*time.Second), false); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = q.Claim(context.Background(), b1, t0.Add(3*time.Second)); !errors.Is(err, ErrNotReady) {
+		t.Fatalf("nonretryable failure retried: %v", err)
+	}
+}
+
+func TestDiscardRejectsNonFinalBatchItemAndLastSurvivesRestart(t *testing.T) {
+	root := queueRoot(t)
+	config := Config{Root: root, MaxRecords: 8, MaxBytes: 1 << 20, Authority: testAuthority{subject: b1.Subject}}
+	q, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, second := batchRecord(0, '0'), batchRecord(1, '1')
+	if err = q.Enqueue(context.Background(), b1, first); err != nil {
+		t.Fatal(err)
+	}
+	if err = q.Enqueue(context.Background(), b1, second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = q.Discard(context.Background(), b1, first.ReconciliationID, t0.Add(time.Minute), p.DiscardAuthorityTypeAuthenticatedUser, "user_retention_request"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("non-final discard: %v", err)
+	}
+	if _, err = q.Discard(context.Background(), b1, second.ReconciliationID, t0.Add(time.Minute), p.DiscardAuthorityTypeAuthenticatedUser, "user_retention_request"); err != nil {
+		t.Fatal(err)
+	}
+	if err = q.Close(); err != nil {
+		t.Fatal(err)
+	}
+	q, err = Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	next, err := q.Claim(context.Background(), b1, t0.Add(2*time.Minute))
+	if err != nil || next.ReconciliationID != first.ReconciliationID {
+		t.Fatalf("restart ordering: %v %s", err, next.ReconciliationID)
 	}
 }
 
@@ -737,4 +903,126 @@ func TestCloseWaitsForActiveOperationsWithoutFDReuse(t *testing.T) {
 		go func() { defer wg.Done(); _ = q.Close() }()
 		wg.Wait()
 	}
+}
+
+func TestRootReplacementPreventsOldAndNewHandlesBothCommitting(t *testing.T) {
+	parent := queueRoot(t)
+	root := filepath.Join(parent, "queue")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	config := Config{Root: root, MaxRecords: 8, MaxBytes: 1 << 20}
+	old, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer old.Close()
+	displaced := filepath.Join(parent, "displaced")
+	if err = os.Rename(root, displaced); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	fresh, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer fresh.Close()
+	if err = old.Enqueue(context.Background(), b1, pending()); !errors.Is(err, ErrUnsafePath) {
+		t.Fatalf("old root committed: %v", err)
+	}
+	if err = fresh.Enqueue(context.Background(), b1, pending()); err != nil {
+		t.Fatalf("fresh root failed: %v", err)
+	}
+}
+
+func TestEnqueueCapacityAndFaultLeaveNoOrphanCheckpoint(t *testing.T) {
+	root := queueRoot(t)
+	tooSmall := Config{Root: root, MaxRecords: 8, MaxBytes: transitionReserveBytes + 128}
+	q, err := Open(tooSmall)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err = q.Enqueue(context.Background(), b1, pending()); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("near-cap accepted: %v", err)
+	}
+	if _, err = os.Stat(filepath.Join(root, checkpointName(pending().BatchID))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("orphan checkpoint: %v", err)
+	}
+	_ = q.Close()
+
+	root = queueRoot(t)
+	config := Config{Root: root, MaxRecords: 8, MaxBytes: 1 << 20}
+	q, err = Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q.impl.(*unixQueue).afterCheckpointCreate = func() error { return errors.New("fault") }
+	if err = q.Enqueue(context.Background(), b1, pending()); err == nil {
+		t.Fatal("fault ignored")
+	}
+	if _, err = os.Stat(filepath.Join(root, checkpointName(pending().BatchID))); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("fault orphan checkpoint: %v", err)
+	}
+	_ = q.Close()
+}
+
+func TestQueueRejectsHardlinkFIFOAndUnsafeControlFiles(t *testing.T) {
+	t.Run("hardlink record", func(t *testing.T) {
+		root := queueRoot(t)
+		q, err := Open(Config{Root: root, MaxRecords: 8, MaxBytes: 1 << 20})
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err = q.Enqueue(context.Background(), b1, pending()); err != nil {
+			t.Fatal(err)
+		}
+		_ = q.Close()
+		path := filepath.Join(root, recordName(pending().ReconciliationID))
+		if err = os.Link(path, filepath.Join(root, "outside-link")); err != nil {
+			t.Fatal(err)
+		}
+		if _, err = Open(Config{Root: root, MaxRecords: 8, MaxBytes: 1 << 20}); err == nil {
+			t.Fatal("hardlink accepted")
+		}
+	})
+	t.Run("fifo record", func(t *testing.T) {
+		root := queueRoot(t)
+		path := filepath.Join(root, recordName(pending().ReconciliationID))
+		if err := unix.Mkfifo(path, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Open(Config{Root: root, MaxRecords: 8, MaxBytes: 1 << 20}); err == nil {
+			t.Fatal("fifo accepted")
+		}
+	})
+	t.Run("fifo lock", func(t *testing.T) {
+		root := queueRoot(t)
+		if err := unix.Mkfifo(filepath.Join(root, ".queue.lock"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Open(Config{Root: root, MaxRecords: 8, MaxBytes: 1 << 20}); err == nil {
+			t.Fatal("fifo lock accepted")
+		}
+	})
+	t.Run("unsafe temp permissions", func(t *testing.T) {
+		root := queueRoot(t)
+		if err := os.WriteFile(filepath.Join(root, ".tmp-0123456789abcdef0123456789abcdef"), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Open(Config{Root: root, MaxRecords: 8, MaxBytes: 1 << 20}); err == nil {
+			t.Fatal("unsafe temp accepted")
+		}
+	})
+	t.Run("unsafe quarantine permissions", func(t *testing.T) {
+		root := queueRoot(t)
+		name := ".quarantine-" + strings.Repeat("a", 64) + "-" + strings.Repeat("b", 32)
+		if err := os.WriteFile(filepath.Join(root, name), []byte("x"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if _, err := Open(Config{Root: root, MaxRecords: 8, MaxBytes: 1 << 20}); err == nil {
+			t.Fatal("unsafe quarantine accepted")
+		}
+	})
 }

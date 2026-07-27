@@ -92,14 +92,18 @@ type Queue struct {
 	root string
 }
 
-type Receipt struct {
-	ReceiptID        p.ReceiptID
-	ReconciliationID p.ReconciliationID
-	EvidenceHash     p.SHA256Digest
-	AcknowledgedAt   p.RFC3339Timestamp
-	Tenant           string
-	ClientID         string
-	VerifiedAt       time.Time
+type receiptSeal struct{}
+
+var hardenedReceiptSeal = &receiptSeal{}
+
+// VerifiedReceipt is opaque outside this package. Only the hardened transport
+// (or a trusted in-package verifier seam) can mint a value accepted by Queue.
+type VerifiedReceipt struct {
+	ack        p.ReconciliationAcknowledgement
+	tenant     string
+	clientID   string
+	verifiedAt time.Time
+	seal       *receiptSeal
 }
 
 type queueImpl interface {
@@ -107,7 +111,7 @@ type queueImpl interface {
 	claim(context.Context, Binding, time.Time) (p.ReconciliationRecord, error)
 	recover(context.Context, Binding, time.Time) (p.ReconciliationRecord, error)
 	fail(context.Context, Binding, p.ReconciliationID, time.Time, bool, time.Duration) (p.ReconciliationRecord, error)
-	ack(context.Context, Binding, p.ReconciliationID, Receipt) (p.ReconciliationRecord, error)
+	ack(context.Context, Binding, p.ReconciliationID, VerifiedReceipt) (p.ReconciliationRecord, error)
 	discard(context.Context, Binding, p.ReconciliationID, time.Time, p.DiscardAuthorityType, string, bool) (p.ReconciliationRecord, error)
 	manualRetry(context.Context, Binding, p.ReconciliationID, time.Time) (p.ReconciliationRecord, error)
 	hold(context.Context, Binding, p.ReconciliationID, DeliveryErrorClass) error
@@ -172,11 +176,20 @@ func (q *Queue) Fail(ctx context.Context, b Binding, id p.ReconciliationID, now 
 	}
 	return q.impl.fail(ctx, b, id, now, retryable, 0)
 }
-func (q *Queue) Acknowledge(ctx context.Context, b Binding, id p.ReconciliationID, receipt Receipt) (p.ReconciliationRecord, error) {
+func (q *Queue) Acknowledge(ctx context.Context, b Binding, id p.ReconciliationID, receipt VerifiedReceipt) (p.ReconciliationRecord, error) {
 	if q == nil || q.impl == nil {
 		return p.ReconciliationRecord{}, ErrClosed
 	}
-	return q.impl.ack(ctx, b, id, receipt)
+	result, err := q.impl.ack(ctx, b, id, receipt)
+	if err != nil && (errors.Is(err, ErrRejected) || errors.Is(err, ErrConflict)) {
+		class := DeliveryRejected
+		if errors.Is(err, ErrConflict) {
+			class = DeliveryConflict
+		}
+		_ = q.impl.hold(ctx, b, id, class)
+		return result, &DeliveryError{Class: class}
+	}
+	return result, err
 }
 func (q *Queue) Discard(ctx context.Context, b Binding, id p.ReconciliationID, now time.Time, authority p.DiscardAuthorityType, reason string) (p.ReconciliationRecord, error) {
 	if q == nil || q.impl == nil {
@@ -351,18 +364,18 @@ func evidenceHashUnchecked(record p.ReconciliationRecord) (p.SHA256Digest, error
 	return p.SHA256Digest("sha256:" + hex.EncodeToString(sum[:])), nil
 }
 
-func NewReceipt(record p.ReconciliationRecord, id p.ReceiptID, at time.Time, binding Binding, clientID string) (Receipt, error) {
+func mintVerifiedReceipt(record p.ReconciliationRecord, id p.ReceiptID, at, verifiedAt time.Time, binding Binding, clientID string) (VerifiedReceipt, error) {
 	if !validBinding(binding) || !receiptID.MatchString(string(id)) || clientID != record.ClientID ||
-		at.IsZero() || at.Before(timeMust(record.LastAttemptAt)) {
-		return Receipt{}, ErrRejected
+		at.IsZero() || verifiedAt.IsZero() || at.After(verifiedAt) || at.Before(timeMust(record.LastAttemptAt)) {
+		return VerifiedReceipt{}, &DeliveryError{Class: DeliveryRejected}
 	}
 	hash, err := evidenceHash(record)
 	if err != nil {
-		return Receipt{}, err
+		return VerifiedReceipt{}, &DeliveryError{Class: DeliveryRejected}
 	}
-	return Receipt{ReceiptID: id, ReconciliationID: record.ReconciliationID, EvidenceHash: hash,
-		AcknowledgedAt: p.RFC3339Timestamp(at.UTC().Format(time.RFC3339Nano)), Tenant: binding.Tenant,
-		ClientID: clientID, VerifiedAt: at.UTC()}, nil
+	return VerifiedReceipt{ack: p.ReconciliationAcknowledgement{ReceiptID: id, ReconciliationID: record.ReconciliationID,
+		EvidenceHash: hash, AcknowledgedAt: p.RFC3339Timestamp(at.UTC().Format(time.RFC3339Nano))},
+		tenant: binding.Tenant, clientID: clientID, verifiedAt: verifiedAt.UTC(), seal: hardenedReceiptSeal}, nil
 }
 
 func timeMust(value *p.RFC3339Timestamp) time.Time {
