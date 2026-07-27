@@ -63,7 +63,9 @@ locked distribution without contacting the network.
 | ast-serialize | 0.6.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | attrs | 26.1.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | certifi | 2026.7.22 | MPL-2.0 | reviewed | Retain notices; disclose modifications to covered files | None identified | PyPI |
+| cffi | 2.1.0 | MIT-0 | reviewed | Retain supplied license | None supplied | PyPI |
 | colorama | 0.4.6 | BSD-3-Clause | reviewed | Retain notices | None identified | PyPI |
+| cryptography | 46.0.7 | Apache-2.0 OR BSD-3-Clause | reviewed | Retain supplied licenses | None supplied | PyPI |
 | hatch-vcs | 0.5.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | hatchling | 1.31.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | h11 | 0.16.0 | MIT | reviewed | Retain notices | None identified | PyPI |
@@ -81,6 +83,7 @@ locked distribution without contacting the network.
 | pluggy | 1.6.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | pydantic | 2.13.4 | MIT | reviewed | Retain notices | None identified | PyPI |
 | pydantic-core | 2.46.4 | MIT | reviewed | Retain notices | None identified | PyPI |
+| pycparser | 3.0 | BSD-3-Clause | reviewed | Retain supplied license | None supplied | PyPI |
 | pygments | 2.20.0 | BSD-2-Clause | reviewed | Retain notices | None identified | PyPI |
 | pytest | 9.1.1 | MIT | reviewed | Retain notices | None identified | PyPI |
 | pyyaml | 6.0.3 | MIT | reviewed | Retain notices | None identified | PyPI |

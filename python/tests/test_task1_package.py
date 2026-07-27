@@ -17,6 +17,7 @@ def test_runtime_dependency_has_a_reviewed_compatible_range() -> None:
     project = tomllib.loads((PACKAGE / "pyproject.toml").read_text())["project"]
 
     assert project["dependencies"] == [
+        "cryptography>=46.0.5,<47",
         "httpx>=0.28.1,<0.29",
         "idna==3.18",
         "pydantic>=2.13.4,<3",
