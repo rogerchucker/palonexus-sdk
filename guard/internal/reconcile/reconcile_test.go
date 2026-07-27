@@ -1288,12 +1288,84 @@ func TestOpenRecoversDoneTransactionAtEveryRemovalCrashBoundary(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
+			done = 0
 			for _, entry := range entries {
-				if isDoneTransactionName(entry.Name()) || isTransactionName(entry.Name()) {
-					t.Fatalf("transaction artifact survived recovery: %s", entry.Name())
+				if isTransactionName(entry.Name()) {
+					t.Fatalf("active transaction artifact survived recovery: %s", entry.Name())
+				}
+				if isDoneTransactionName(entry.Name()) {
+					done++
 				}
 			}
+			if done != 1 {
+				t.Fatalf("want one retained bounded tombstone, got %d", done)
+			}
 		})
+	}
+}
+
+func TestVerifiedDoneReplacementSurvivesWithoutPathnameUnlink(t *testing.T) {
+	root := queueRoot(t)
+	q, err := Open(Config{Root: root, MaxRecords: 8, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	record := pending()
+	hash, err := evidenceHash(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	transaction := batchTransaction{
+		Operation:   "enqueue",
+		RecordName:  recordName(record.ReconciliationID),
+		NewEnvelope: diskEnvelope{Record: record, EvidenceHash: hash},
+	}
+	doneName := transactionControlName(".done-", transaction)
+	replacement := []byte(`{"replacement":"survives"}`)
+	impl := q.impl.(*unixQueue)
+	impl.afterTransactionVerify = func() error {
+		impl.afterTransactionVerify = nil
+		path := filepath.Join(root, doneName)
+		if err := os.Rename(path, filepath.Join(root, ".verified-original")); err != nil {
+			return err
+		}
+		return os.WriteFile(path, replacement, 0o600)
+	}
+	if err = q.Enqueue(context.Background(), b1, record); !errors.Is(err, ErrDurabilityIndeterminate) {
+		t.Fatalf("replacement did not produce durability ambiguity: %v", err)
+	}
+	document, err := os.ReadFile(filepath.Join(root, doneName))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(document, replacement) {
+		t.Fatalf("replacement was changed or removed: %q", document)
+	}
+}
+
+func TestRetainedDoneTombstonesAreCountedAndBounded(t *testing.T) {
+	root := queueRoot(t)
+	q, err := Open(Config{Root: root, MaxRecords: 4, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if err = q.Enqueue(context.Background(), b1, batchRecord(0, '0')); err != nil {
+		t.Fatal(err)
+	}
+	if err = q.Enqueue(context.Background(), b1, batchRecord(1, '1')); err != nil {
+		t.Fatal(err)
+	}
+	if err = q.Enqueue(context.Background(), b1, batchRecord(2, '2')); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("retained tombstones were not included in capacity: %v", err)
+	}
+	count, used, err := q.impl.(*unixQueue).usage()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if count != 4 || used <= 0 {
+		t.Fatalf("unexpected bounded usage: count=%d bytes=%d", count, used)
 	}
 }
 

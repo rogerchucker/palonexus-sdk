@@ -71,6 +71,13 @@ type fileSnapshot struct {
 	digest [32]byte
 }
 
+type doneTombstone struct {
+	Version       int    `json:"version"`
+	Operation     string `json:"operation"`
+	RecordName    string `json:"recordName"`
+	JournalDigest string `json:"journalDigest"`
+}
+
 type unixQueue struct {
 	rootFD                  int
 	root                    string
@@ -1118,7 +1125,9 @@ func (q *unixQueue) entries() ([]string, error) {
 	}
 	file := os.NewFile(uintptr(dup), "queue")
 	defer file.Close()
-	limit := q.config.MaxRecords*2 + 67
+	// One record, one checkpoint in the worst case, and at most two retained
+	// operation tombstones (enqueue and acknowledgement) per record.
+	limit := q.config.MaxRecords*4 + 67
 	names, err := file.Readdirnames(limit)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, ErrUnsafePath
@@ -1148,7 +1157,7 @@ func (q *unixQueue) usage() (int, int64, error) {
 			return 0, 0, ErrUnsafePath
 		}
 		total += st.Size
-		if isRecordName(n) {
+		if isRecordName(n) || isDoneTransactionName(n) {
 			count++
 		}
 	}
@@ -1182,8 +1191,11 @@ func (q *unixQueue) validateAll() error {
 			}
 			continue
 		}
-		if isTransactionName(n) || isDoneTransactionName(n) {
+		if isTransactionName(n) {
 			return ErrCorrupt
+		}
+		if isDoneTransactionName(n) {
+			continue
 		}
 		if isCheckpointName(n) {
 			if _, err := q.readCheckpointByName(n); err != nil {
@@ -1364,11 +1376,6 @@ func (q *unixQueue) writeCheckpoint(ctx context.Context, checkpoint batchCheckpo
 }
 
 func (q *unixQueue) commitBatchTransaction(ctx context.Context, env diskEnvelope, checkpoint batchCheckpoint) error {
-	var token [16]byte
-	if _, err := rand.Read(token[:]); err != nil {
-		return ErrUnsafePath
-	}
-	name := ".txn-" + hex.EncodeToString(token[:])
 	transaction := batchTransaction{
 		Version: envelopeVersion, Operation: "ack", RecordName: recordName(env.Record.ReconciliationID),
 		CheckpointName:      checkpointName(checkpoint.BatchID),
@@ -1376,6 +1383,7 @@ func (q *unixQueue) commitBatchTransaction(ctx context.Context, env diskEnvelope
 		OldCheckpointDigest: hex.EncodeToString(checkpoint.digest[:]),
 		NewEnvelope:         env, NewCheckpoint: checkpoint,
 	}
+	name := transactionControlName(".txn-", transaction)
 	document, err := json.Marshal(transaction)
 	if err != nil || int64(len(document)) > maxTransactionBytes {
 		return ErrQueueFull
@@ -1400,11 +1408,7 @@ func (q *unixQueue) commitBatchTransaction(ctx context.Context, env diskEnvelope
 }
 
 func (q *unixQueue) commitEnqueueTransaction(ctx context.Context, transaction batchTransaction) error {
-	var token [16]byte
-	if _, err := rand.Read(token[:]); err != nil {
-		return ErrUnsafePath
-	}
-	name := ".txn-" + hex.EncodeToString(token[:])
+	name := transactionControlName(".txn-", transaction)
 	document, err := json.Marshal(transaction)
 	if err != nil || int64(len(document)) > maxTransactionBytes {
 		return ErrQueueFull
@@ -1426,6 +1430,11 @@ func (q *unixQueue) commitEnqueueTransaction(ctx context.Context, transaction ba
 	}
 	q.clearRecoveryNeeded()
 	return nil
+}
+
+func transactionControlName(prefix string, transaction batchTransaction) string {
+	sum := sha256.Sum256([]byte(transaction.Operation + "\x00" + transaction.RecordName))
+	return prefix + hex.EncodeToString(sum[:16])
 }
 
 func (q *unixQueue) markRecoveryNeeded() {
@@ -1462,7 +1471,7 @@ func (q *unixQueue) recoverTransactions(ctx context.Context) error {
 			continue
 		}
 		count++
-		if count > 32 {
+		if count > q.config.MaxRecords*2 {
 			return ErrQueueFull
 		}
 		document, snapshot, readErr := q.readSafeFile(name, maxTransactionBytes)
@@ -1480,6 +1489,11 @@ func (q *unixQueue) recoverTransactions(ctx context.Context) error {
 		}
 		transaction, decodeErr := decodeBatchTransaction(document)
 		if decodeErr != nil {
+			if isDoneTransactionName(name) {
+				if tombstoneErr := validateDoneTombstone(name, document); tombstoneErr == nil {
+					continue
+				}
+			}
 			if quarantineErr := q.quarantine(name); quarantineErr != nil {
 				return errors.Join(ErrCorrupt, quarantineErr)
 			}
@@ -1495,8 +1509,11 @@ func (q *unixQueue) recoverTransactions(ctx context.Context) error {
 				}
 				return errors.Join(ErrCorrupt, verifyErr)
 			}
-			if removeErr := q.finishTransaction(name, snapshot); removeErr != nil {
-				return removeErr
+			if name != transactionControlName(".done-", transaction) {
+				return ErrCorrupt
+			}
+			if retainErr := q.compactRetainedTransaction(name, snapshot, transaction); retainErr != nil {
+				return retainErr
 			}
 			continue
 		}
@@ -1509,6 +1526,24 @@ func (q *unixQueue) recoverTransactions(ctx context.Context) error {
 			}
 			return err
 		}
+	}
+	return nil
+}
+
+func validateDoneTombstone(name string, document []byte) error {
+	var tombstone doneTombstone
+	decoder := json.NewDecoder(bytes.NewReader(document))
+	decoder.DisallowUnknownFields()
+	if decoder.Decode(&tombstone) != nil || decoder.Decode(&struct{}{}) != io.EOF ||
+		tombstone.Version != envelopeVersion ||
+		(tombstone.Operation != "enqueue" && tombstone.Operation != "ack") ||
+		!isRecordName(tombstone.RecordName) ||
+		!validHex(tombstone.JournalDigest) || len(tombstone.JournalDigest) != 64 {
+		return ErrCorrupt
+	}
+	transaction := batchTransaction{Operation: tombstone.Operation, RecordName: tombstone.RecordName}
+	if name != transactionControlName(".done-", transaction) {
+		return ErrCorrupt
 	}
 	return nil
 }
@@ -1666,7 +1701,7 @@ func (q *unixQueue) applyTransaction(ctx context.Context, name string, transacti
 			return err
 		}
 	}
-	return q.finishTransaction(name, transactionSnapshot)
+	return q.finishTransaction(name, transactionSnapshot, transaction)
 }
 
 func (q *unixQueue) applyEnqueueTransaction(ctx context.Context, name string, transaction batchTransaction, snapshot fileSnapshot) error {
@@ -1740,7 +1775,7 @@ func (q *unixQueue) applyEnqueueTransaction(ctx context.Context, name string, tr
 	} else if current.digest != sha256.Sum256(recordWire) {
 		return ErrConflict
 	}
-	return q.finishTransaction(name, snapshot)
+	return q.finishTransaction(name, snapshot, transaction)
 }
 
 // validateEnqueueTransactionAuthority fences a syntactically valid journal
@@ -1836,7 +1871,7 @@ func (q *unixQueue) validateEnqueueTransactionAuthority(transaction batchTransac
 	return nil
 }
 
-func (q *unixQueue) finishTransaction(name string, snapshot fileSnapshot) error {
+func (q *unixQueue) finishTransaction(name string, snapshot fileSnapshot, transaction batchTransaction) error {
 	_, currentSnapshot, readErr := q.readSafeFile(name, maxTransactionBytes)
 	if readErr != nil || currentSnapshot != snapshot {
 		return ErrDurabilityIndeterminate
@@ -1846,11 +1881,7 @@ func (q *unixQueue) finishTransaction(name string, snapshot fileSnapshot) error 
 			return err
 		}
 	}
-	var token [16]byte
-	if _, err := rand.Read(token[:]); err != nil {
-		return ErrUnsafePath
-	}
-	quarantined := ".done-" + hex.EncodeToString(token[:])
+	quarantined := transactionControlName(".done-", transaction)
 	if err := quarantineAtomicNoReplace(q.rootFD, name, quarantined); err != nil {
 		return err
 	}
@@ -1876,10 +1907,45 @@ func (q *unixQueue) finishTransaction(name string, snapshot fileSnapshot) error 
 			return err
 		}
 	}
-	if unix.Unlinkat(q.rootFD, quarantined, 0) != nil {
-		return ErrUnsafePath
+	return q.compactRetainedTransaction(quarantined, snapshot, transaction)
+}
+
+func (q *unixQueue) compactRetainedTransaction(name string, snapshot fileSnapshot, transaction batchTransaction) error {
+	fd, err := unix.Openat(q.rootFD, name, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return ErrDurabilityIndeterminate
 	}
-	if unix.Fsync(q.rootFD) != nil {
+	defer unix.Close(fd)
+	if err := validateRegular(fd, 0o600); err != nil {
+		return err
+	}
+	var st unix.Stat_t
+	if unix.Fstat(fd, &st) != nil || uint64(st.Dev) != snapshot.dev || uint64(st.Ino) != snapshot.ino {
+		return ErrDurabilityIndeterminate
+	}
+	tombstone := doneTombstone{Version: envelopeVersion, Operation: transaction.Operation,
+		RecordName: transaction.RecordName, JournalDigest: hex.EncodeToString(snapshot.digest[:])}
+	document, err := json.Marshal(tombstone)
+	if err != nil || int64(len(document)) > maxTransactionBytes {
+		return ErrCorrupt
+	}
+	if unix.Ftruncate(fd, int64(len(document))) != nil {
+		return ErrDurabilityIndeterminate
+	}
+	written := 0
+	for written < len(document) {
+		n, writeErr := unix.Pwrite(fd, document[written:], int64(written))
+		if writeErr != nil || n == 0 {
+			return ErrDurabilityIndeterminate
+		}
+		written += n
+	}
+	if unix.Fsync(fd) != nil {
+		return ErrDurabilityIndeterminate
+	}
+	var pathStat unix.Stat_t
+	if unix.Fstatat(q.rootFD, name, &pathStat, unix.AT_SYMLINK_NOFOLLOW) != nil ||
+		uint64(pathStat.Dev) != snapshot.dev || uint64(pathStat.Ino) != snapshot.ino {
 		return ErrDurabilityIndeterminate
 	}
 	return nil
