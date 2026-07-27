@@ -184,7 +184,6 @@ def test_structural_invalid_vectors_fail_closed() -> None:
     (
         ("action", "actionId", "act_01J5ABCDEFGHJKMNPQRSTVWXY0\n"),
         ("action", "target.service", "../admin"),
-        ("action", "target.resource", "workspace:/deploy/../secret"),
         ("action", "adapter.version", "1.0.0-01"),
         ("action", "context.safeDisplay", "safe\u202ehidden"),
         ("action", "context.safeDisplay", "safe\u2028hidden"),

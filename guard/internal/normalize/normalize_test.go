@@ -520,6 +520,135 @@ func TestPreparedStructuredRepresentationsNeverExposeExecution(t *testing.T) {
 	}
 }
 
+func TestMCPExecutionAccessIsDeeplyIsolatedFromMutation(t *testing.T) {
+	t.Parallel()
+	prepared, err := MCPJSON(
+		"github",
+		"issues.create",
+		[]byte(`{"nested":{"token":"original"},"items":[{"value":1},2]}`),
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	authorizedResource := prepared.Resource
+	first, ok := prepared.SensitiveExecution().(MCPExecution)
+	if !ok {
+		t.Fatalf("MCP execution does not use the typed boundary: %T", prepared.SensitiveExecution())
+	}
+	first.Server = "attacker"
+	first.Tool = "delete"
+	firstInput := first.Input.(map[string]any)
+	firstInput["nested"].(map[string]any)["token"] = "mutated"
+	firstInput["items"].([]any)[0].(map[string]any)["value"] = json.Number("999")
+	firstInput["items"] = append(firstInput["items"].([]any), "extra")
+
+	second := prepared.SensitiveExecution().(MCPExecution)
+	if second.Server != "github" || second.Tool != "issues.create" {
+		t.Fatal("MCP execution identity aliased caller mutation")
+	}
+	secondInput := second.Input.(map[string]any)
+	if secondInput["nested"].(map[string]any)["token"] != "original" ||
+		len(secondInput["items"].([]any)) != 2 ||
+		secondInput["items"].([]any)[0].(map[string]any)["value"] != json.Number("1") {
+		t.Fatal("nested MCP execution graph aliased caller mutation")
+	}
+	if prepared.Resource != authorizedResource {
+		t.Fatal("execution mutation changed authorized resource")
+	}
+	reencoded, err := canonicalNative(second.Input)
+	if err != nil {
+		t.Fatal(err)
+	}
+	reprepared, err := MCPJSON(second.Server, second.Tool, reencoded)
+	if err != nil || reprepared.Resource != authorizedResource {
+		t.Fatal("executor-bound MCP value no longer corresponds to authorized resource")
+	}
+}
+
+func TestScalarExecutionAccessCannotAliasMutableState(t *testing.T) {
+	t.Parallel()
+	for _, prepare := range []func() (Prepared, error){
+		func() (Prepared, error) { return URL("https://example.com/", nil) },
+		func() (Prepared, error) { return Shell("echo ok", nil) },
+	} {
+		prepared, err := prepare()
+		if err != nil {
+			t.Fatal(err)
+		}
+		if _, ok := prepared.SensitiveExecution().(string); !ok {
+			t.Fatalf("scalar execution is unexpectedly mutable: %T", prepared.SensitiveExecution())
+		}
+	}
+}
+
+func TestPublicShellResourceMatchesPythonAndGeneratedSchema(t *testing.T) {
+	commands := []string{
+		`echo "a\q"`,
+		`printf '' ""`,
+		`echo \`,
+		`echo "unterminated`,
+	}
+	input, _ := json.Marshal(commands)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	const script = `import json,sys
+from protocol.reference.canonicalize import prepare_shell_resource
+print(json.dumps([prepare_shell_resource(x).resource for x in json.load(sys.stdin)]))`
+	command := exec.CommandContext(
+		ctx, "uv", "run", "--frozen", "--offline", "--no-sync",
+		"python", "-c", script,
+	)
+	command.Dir = filepath.Join("..", "..", "..")
+	command.Stdin = bytes.NewReader(input)
+	output, err := command.Output()
+	if err != nil || len(output) > 64*1024 {
+		t.Fatalf("bounded Python shell resource oracle failed: %v", err)
+	}
+	var expected []string
+	if err := json.Unmarshal(output, &expected); err != nil {
+		t.Fatal(err)
+	}
+	for index, shellCommand := range commands {
+		prepared, err := Shell(shellCommand, nil)
+		if err != nil {
+			t.Fatalf("public Shell rejected parity-valid input: %v", err)
+		}
+		if string(prepared.Resource) != expected[index] {
+			t.Fatalf("public Shell resource differs from Python at %d", index)
+		}
+		assertTargetParses(t, prepared, protocol.TargetKindLocalAction, "workspace")
+	}
+}
+
+func assertTargetParses(
+	t *testing.T,
+	prepared Prepared,
+	kind protocol.TargetKind,
+	service string,
+) {
+	t.Helper()
+	target, err := prepared.Target(kind, service)
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture, err := os.ReadFile(filepath.Join(
+		"..", "..", "..", "protocol", "test-vectors", "action", "valid", "file-write.json",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	_ = json.Unmarshal(fixture, &document)
+	targetJSON, _ := json.Marshal(target)
+	var targetValue any
+	_ = json.Unmarshal(targetJSON, &targetValue)
+	document["target"] = targetValue
+	encoded, _ := json.Marshal(document)
+	if _, err := protocol.ParseActionRequest(encoded); err != nil {
+		t.Fatalf("prepared target violates generated schema: %v", err)
+	}
+}
+
 func TestTargetEnforcesGeneratedSchemaConstraints(t *testing.T) {
 	t.Parallel()
 	prepared, err := Path("file", "/workspace")
@@ -547,8 +676,7 @@ func TestTargetEnforcesGeneratedSchemaConstraints(t *testing.T) {
 		}
 	}
 	for _, resource := range []protocol.SafeText{
-		"", `path:/workspace\file`, "path:/workspace/../secret",
-		"resource:\x00unsafe", protocol.SafeText(strings.Repeat("x", 2049)),
+		"", "resource:\x00unsafe", protocol.SafeText(strings.Repeat("x", 2049)),
 	} {
 		unsafe := Prepared{Resource: resource, execution: "private"}
 		if _, err := unsafe.Target(protocol.TargetKindLocalAction, "workspace"); err == nil {
@@ -573,30 +701,7 @@ func TestTargetRoundTripsThroughGeneratedActionParser(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	target, err := prepared.Target(protocol.TargetKindLocalAction, "workspace")
-	if err != nil {
-		t.Fatal(err)
-	}
-	fixture, err := os.ReadFile(filepath.Join(
-		"..", "..", "..", "protocol", "test-vectors", "action", "valid", "file-write.json",
-	))
-	if err != nil {
-		t.Fatal(err)
-	}
-	var document map[string]any
-	if err := json.Unmarshal(fixture, &document); err != nil {
-		t.Fatal(err)
-	}
-	targetJSON, _ := json.Marshal(target)
-	var targetValue any
-	if err := json.Unmarshal(targetJSON, &targetValue); err != nil {
-		t.Fatal(err)
-	}
-	document["target"] = targetValue
-	encoded, _ := json.Marshal(document)
-	if _, err := protocol.ParseActionRequest(encoded); err != nil {
-		t.Fatalf("prepared target violates generated ActionTarget schema: %v", err)
-	}
+	assertTargetParses(t, prepared, protocol.TargetKindLocalAction, "workspace")
 }
 
 func TestCommittedCanonicalizationVectorsRemainReadable(t *testing.T) {

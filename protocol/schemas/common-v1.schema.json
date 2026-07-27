@@ -252,19 +252,7 @@
         "resource": {
           "$ref": "#/$defs/safeText",
           "minLength": 1,
-          "maxLength": 2048,
-          "allOf": [
-            {
-              "not": {
-                "pattern": "[\\\\]"
-              }
-            },
-            {
-              "not": {
-                "pattern": "(^|/)\\.{1,2}(/|$)"
-              }
-            }
-          ]
+          "maxLength": 2048
         },
         "resourceHash": {
           "$ref": "#/$defs/sha256"

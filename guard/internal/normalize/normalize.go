@@ -46,10 +46,48 @@ type Prepared struct {
 	execution any
 }
 
+// MCPExecution is a detached executor-bound MCP invocation.
+type MCPExecution struct {
+	Server string
+	Tool   string
+	Input  any
+}
+
 // SensitiveExecution returns the exact normalized value the host must execute.
 // It may contain credentials or raw tool input and MUST NOT be logged,
 // serialized, reflected, or included in errors.
-func (p Prepared) SensitiveExecution() any { return p.execution }
+func (p Prepared) SensitiveExecution() any {
+	if execution, ok := p.execution.(MCPExecution); ok {
+		return MCPExecution{
+			Server: execution.Server,
+			Tool:   execution.Tool,
+			Input:  copyJSONValue(execution.Input),
+		}
+	}
+	return p.execution
+}
+
+func copyJSONValue(value any) any {
+	switch item := value.(type) {
+	case map[string]any:
+		result := make(map[string]any, len(item))
+		for key, child := range item {
+			result[key] = copyJSONValue(child)
+		}
+		return result
+	case []any:
+		result := make([]any, len(item))
+		for index, child := range item {
+			result[index] = copyJSONValue(child)
+		}
+		return result
+	case string, json.Number, bool, nil:
+		return item
+	default:
+		// MCPJSON creates only the closed JSON value set above.
+		return nil
+	}
+}
 
 // String is intentionally diagnostic-only and never renders Execution.
 func (p Prepared) String() string {
@@ -123,14 +161,8 @@ func hasUnsafeText(value string) bool {
 func validateResource(resource protocol.SafeText) error {
 	value := string(resource)
 	if !utf8.ValidString(value) || value == "" ||
-		utf8.RuneCountInString(value) > 2048 || hasUnsafeText(value) ||
-		strings.Contains(value, "\\") {
+		utf8.RuneCountInString(value) > 2048 || hasUnsafeText(value) {
 		return fail("invalid_resource")
-	}
-	for _, segment := range strings.Split(value, "/") {
-		if segment == "." || segment == ".." {
-			return fail("invalid_resource")
-		}
 	}
 	return nil
 }
@@ -969,6 +1001,6 @@ func MCPJSON(server, tool string, input []byte) (Prepared, error) {
 	}
 	return prepared(
 		[]byte("mcp:"+server+"/"+tool+"#"+hashBytes(canonical)),
-		map[string]any{"server": server, "tool": tool, "input": executionInput},
+		MCPExecution{Server: server, Tool: tool, Input: executionInput},
 	)
 }
