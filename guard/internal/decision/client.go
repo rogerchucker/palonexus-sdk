@@ -91,6 +91,15 @@ func NewFromConfig(configuration *config.Config, options Options) (*Client, erro
 		return nil, ErrInvalidConfig
 	}
 	options.Endpoint = configuration.DecisionEndpoint()
+	return NewForConfiguredRoute(configuration, options)
+}
+
+// NewForConfiguredRoute constructs a client for an endpoint already validated
+// as part of configuration.Routes.
+func NewForConfiguredRoute(configuration *config.Config, options Options) (*Client, error) {
+	if configuration == nil || options.Endpoint == "" {
+		return nil, ErrInvalidConfig
+	}
 	pem := configuration.TrustedCAPEM()
 	parsedEndpoint, parseErr := url.Parse(options.Endpoint)
 	if parseErr != nil {
@@ -120,7 +129,7 @@ func newWithNetworkForTesting(options Options, controls transportControls) (*Cli
 }
 
 func newClient(options Options, allowLocalHTTP bool, controls transportControls) (*Client, error) {
-	endpoint, scheme, localHTTP, err := validateEndpoint(options.Endpoint, allowLocalHTTP)
+	endpoint, scheme, localEndpoint, err := validateEndpoint(options.Endpoint, allowLocalHTTP)
 	if err != nil || options.AccessToken == nil {
 		return nil, ErrInvalidConfig
 	}
@@ -145,7 +154,7 @@ func newClient(options Options, allowLocalHTTP bool, controls transportControls)
 	if options.Timeout > 15*time.Second {
 		return nil, ErrInvalidConfig
 	}
-	tlsConfig, err := buildTLSConfig(options.TLS, localHTTP)
+	tlsConfig, err := buildTLSConfig(options.TLS, scheme == "http")
 	if err != nil {
 		return nil, err
 	}
@@ -166,7 +175,7 @@ func newClient(options Options, allowLocalHTTP bool, controls transportControls)
 		dialer := &net.Dialer{}
 		dial = dialer.DialContext
 	}
-	if localHTTP {
+	if localEndpoint {
 		host := mustEndpointHost(endpoint)
 		transport.DialContext = func(ctx context.Context, network, address string) (net.Conn, error) {
 			return dialLoopback(ctx, network, address, host, dial)
@@ -472,7 +481,8 @@ func validateEndpoint(raw string, allowLocalHTTP bool) (string, string, bool, er
 		}
 	}
 	if parsed.Scheme == "https" {
-		return parsed.String(), parsed.Scheme, false, nil
+		ip := net.ParseIP(parsed.Hostname())
+		return parsed.String(), parsed.Scheme, allowLocalHTTP && ip != nil && ip.IsLoopback(), nil
 	}
 	ip := net.ParseIP(parsed.Hostname())
 	if parsed.Scheme != "http" || !allowLocalHTTP || ip == nil || !ip.IsLoopback() {

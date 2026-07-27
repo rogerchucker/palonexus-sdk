@@ -39,12 +39,6 @@ func signalStableProcess(state lifecycleState, signal syscall.Signal) error {
 		!errors.Is(err, unix.ESRCH) {
 		return ErrUnavailable
 	}
-	// The daemon starts a new session whose process-group ID equals its PID.
-	// While the pidfd pins the leader, this group cannot be confused with an
-	// unrelated reused PID; signal descendants within the bounded shutdown.
-	if err := syscall.Kill(-state.PID, signal); err != nil && !errors.Is(err, syscall.ESRCH) {
-		return ErrUnavailable
-	}
 	return nil
 }
 

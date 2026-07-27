@@ -216,6 +216,8 @@ guard/internal/state/store_unsupported_test.go,rogerchucker/palonexus-sdk,WORKTR
 guard/internal/auth/oidc.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/auth/oidc.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/auth/oidc_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/auth/oidc_test.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/auth/session.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/auth/session.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/auth/session_reader.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/auth/session_reader.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/auth/session_reader_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/auth/session_reader_test.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/decision/client.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/decision/client.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/decision/client_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/decision/client_test.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/decision/errors.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/decision/errors.go,PaloNexus,yes,new,MIT,rogerchucker
@@ -239,6 +241,13 @@ guard/internal/daemon/autostart.go,rogerchucker/palonexus-sdk,WORKTREE,guard/int
 guard/internal/daemon/daemon.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/daemon.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/daemon/daemon_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/daemon_test.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/daemon/launch_darwin.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/launch_darwin.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/daemon/launch_darwin_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/launch_darwin_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/daemon/launch_cleanup_linux.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/launch_cleanup_linux.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/daemon/launch_linux.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/launch_linux.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/daemon/launch_linux_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/launch_linux_test.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/daemon/process_darwin.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/process_darwin.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/daemon/process_linux.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/process_linux.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/daemon/running_executable_darwin.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/running_executable_darwin.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/daemon/running_executable_linux.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/running_executable_linux.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/daemon/started_process_darwin.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/started_process_darwin.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/daemon/started_process_linux.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/daemon/started_process_linux.go,PaloNexus,yes,new,MIT,rogerchucker

@@ -57,7 +57,7 @@ func signalStableProcess(state lifecycleState, signal syscall.Signal) error {
 	if !stateMatchesProcess(state) {
 		return ErrUnprovenProcess
 	}
-	if err := syscall.Kill(-state.PID, signal); err != nil && !errors.Is(err, syscall.ESRCH) {
+	if err := syscall.Kill(state.PID, signal); err != nil && !errors.Is(err, syscall.ESRCH) {
 		return ErrUnavailable
 	}
 	return nil

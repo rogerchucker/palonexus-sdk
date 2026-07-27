@@ -337,6 +337,78 @@ func TestDaemonAndOneShotRejectMalformedActionBeforePipeline(t *testing.T) {
 	}
 }
 
+func TestDaemonAndOneShotShareFiveSecondRequestBudget(t *testing.T) {
+	cfg := testConfig(t)
+	var delay atomic.Int64
+	delay.Store(int64(1500 * time.Millisecond))
+	cfg.Handler = func(ctx context.Context, request []byte) ([]byte, error) {
+		select {
+		case <-time.After(time.Duration(delay.Load())):
+			return safeHandler(ctx, request)
+		case <-ctx.Done():
+			return nil, ctx.Err()
+		}
+	}
+	manager, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document := validActionDocument(t)
+	check := func(oneShot bool) {
+		t.Helper()
+		started := time.Now()
+		response, checkErr := manager.Check(context.Background(), document, oneShot)
+		if checkErr != nil {
+			t.Fatalf("oneShot=%t: %v", oneShot, checkErr)
+		}
+		if elapsed := time.Since(started); elapsed < 1400*time.Millisecond ||
+			elapsed > 3*time.Second {
+			t.Fatalf("oneShot=%t elapsed %s", oneShot, elapsed)
+		}
+		if _, parseErr := protocol.ParseProtocolError(response); parseErr != nil {
+			t.Fatalf("oneShot=%t response: %s: %v", oneShot, response, parseErr)
+		}
+	}
+	check(true)
+
+	runContext, cancelRun := context.WithCancel(context.Background())
+	runDone := make(chan error, 1)
+	go func() { runDone <- manager.Run(runContext) }()
+	t.Cleanup(func() {
+		cancelRun()
+		<-runDone
+	})
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		status, statusErr := manager.Status(context.Background())
+		if statusErr == nil && status.Running {
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("daemon readiness: %#v, %v", status, statusErr)
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	check(false)
+
+	delay.Store(int64(6 * time.Second))
+	for _, oneShot := range []bool{true, false} {
+		started := time.Now()
+		response, checkErr := manager.Check(context.Background(), document, oneShot)
+		elapsed := time.Since(started)
+		if elapsed < 4500*time.Millisecond || elapsed > 6*time.Second {
+			t.Fatalf("oneShot=%t timeout elapsed %s", oneShot, elapsed)
+		}
+		if checkErr == nil {
+			failure, parseErr := protocol.ParseProtocolError(response)
+			if parseErr != nil ||
+				failure.Code != protocol.ProtocolErrorCodeAuthorizationUnavailable {
+				t.Fatalf("oneShot=%t timeout response %s, %v", oneShot, response, parseErr)
+			}
+		}
+	}
+}
+
 func TestCancelledUncooperativeOneShotIsBounded(t *testing.T) {
 	cfg := testConfig(t)
 	block := make(chan struct{})
@@ -882,6 +954,14 @@ func TestStatusBindsCanonicalArgumentsAndEnvironment(t *testing.T) {
 		if _, err := other.Status(context.Background()); !errors.Is(err, ErrUnprovenProcess) {
 			t.Fatalf("Status with changed launch identity = %v", err)
 		}
+	}
+	t.Setenv("HOME", filepath.Join(t.TempDir(), "changed-home"))
+	changedEnvironment, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := changedEnvironment.Status(context.Background()); !errors.Is(err, ErrUnprovenProcess) {
+		t.Fatalf("Status with changed sanitized environment = %v", err)
 	}
 }
 

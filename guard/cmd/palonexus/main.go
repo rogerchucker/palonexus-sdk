@@ -9,13 +9,17 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/rogerchucker/palonexus-sdk/guard/internal/auth"
 	"github.com/rogerchucker/palonexus-sdk/guard/internal/cli"
 	"github.com/rogerchucker/palonexus-sdk/guard/internal/config"
 	"github.com/rogerchucker/palonexus-sdk/guard/internal/daemon"
+	"github.com/rogerchucker/palonexus-sdk/guard/internal/decision"
 	guardcore "github.com/rogerchucker/palonexus-sdk/guard/internal/guard"
+	"github.com/rogerchucker/palonexus-sdk/guard/internal/keystore"
 	"github.com/rogerchucker/palonexus-sdk/guard/internal/normalize"
 	"github.com/rogerchucker/palonexus-sdk/guard/internal/routing"
 	guardsocket "github.com/rogerchucker/palonexus-sdk/guard/internal/socket"
+	"github.com/rogerchucker/palonexus-sdk/guard/internal/state"
 	"github.com/rogerchucker/palonexus-sdk/guard/pkg/protocol"
 )
 
@@ -147,22 +151,96 @@ func (safeResourceNormalizer) Normalize(
 	return normalize.FromSafeResource(resource)
 }
 
-type missingSessionSource struct{}
+type productionSessions struct{ reader *auth.SessionReader }
 
-func (missingSessionSource) Current(context.Context) (guardcore.AuthenticatedSession, error) {
-	return guardcore.AuthenticatedSession{}, guardcore.ErrNoSession
+func (s productionSessions) Current(ctx context.Context) (guardcore.AuthenticatedSession, error) {
+	current, err := s.reader.Current(ctx)
+	if errors.Is(err, auth.ErrNoSession) {
+		return guardcore.AuthenticatedSession{}, guardcore.ErrNoSession
+	}
+	if err != nil {
+		return guardcore.AuthenticatedSession{}, err
+	}
+	return guardcore.AuthenticatedSession{
+		TenantID: current.TenantID, AccountID: current.AccountID,
+		ClientID: current.ClientID, SessionID: protocol.SessionID(current.SessionID),
+	}, nil
 }
 
-type unavailableDecider struct{}
+type productionClients struct {
+	reader        *auth.SessionReader
+	configuration *config.Config
+}
 
-func (unavailableDecider) Decide(
-	context.Context,
-	guardcore.DecisionRequest,
+func (c productionClients) Client(
+	_ context.Context,
+	destination string,
+	session guardcore.AuthenticatedSession,
+) (guardcore.ProtocolClient, error) {
+	options := decision.Options{
+		Endpoint: destination,
+		AccessToken: func(ctx context.Context) ([]byte, error) {
+			return c.reader.AccessToken(ctx, string(session.SessionID))
+		},
+	}
+	return decision.NewForConfiguredRoute(c.configuration, options)
+}
+
+type recordingDecider struct {
+	remote   *guardcore.RemoteDecider
+	decision protocol.AuthorizationDecision
+}
+
+func (d *recordingDecider) Decide(
+	ctx context.Context,
+	request guardcore.DecisionRequest,
 ) (protocol.AuthorizationDecision, error) {
-	return protocol.AuthorizationDecision{}, errors.New("authorization unavailable")
+	value, err := d.remote.Decide(ctx, request)
+	d.decision = value
+	return value, err
 }
 
 func checkerHandler(configuration *config.Config) (guardsocket.Handler, error) {
+	if configuration.TenantID() == "" || configuration.AccountID() == "" ||
+		configuration.ClientID() == "" || configuration.StateDir() == "" {
+		return nil, errors.New("guard identity configuration unavailable")
+	}
+	metadata, err := state.New(configuration.StateDir())
+	if err != nil {
+		return nil, err
+	}
+	var backend keystore.Backend
+	key := configuration.TestCredentialKey()
+	if configuration.LocalTestMode() && configuration.TestCredentialRoot() != "" {
+		backend, err = keystore.NewEncryptedFileBackend(keystore.EncryptedFileOptions{
+			Root: configuration.TestCredentialRoot(), Key: key, EnableForTesting: true,
+		})
+		keystore.Zero(key)
+	} else {
+		backend, err = keystore.NativeBackend()
+	}
+	if err != nil {
+		_ = metadata.Close()
+		return nil, err
+	}
+	service := configuration.CredentialService()
+	if service == "" {
+		service = "palonexus"
+	}
+	credentials, err := keystore.New(service, backend)
+	if err != nil {
+		_ = metadata.Close()
+		return nil, err
+	}
+	reader, err := auth.NewSessionReader(auth.SessionReaderOptions{
+		Tenant: configuration.TenantID(), Account: configuration.AccountID(),
+		ClientID: configuration.ClientID(), Metadata: metadata, Credentials: credentials,
+	})
+	if err != nil {
+		_ = credentials.Close()
+		_ = metadata.Close()
+		return nil, err
+	}
 	routes := configuration.Routes()
 	compiled := make([]routing.Route, 0, len(routes))
 	for _, route := range routes {
@@ -174,13 +252,9 @@ func checkerHandler(configuration *config.Config) (guardsocket.Handler, error) {
 	if err != nil {
 		return nil, err
 	}
-	checker := guardcore.New(
-		safeResourceNormalizer{}, missingSessionSource{},
-		guardcore.NewTableRouteResolver(table), unavailableDecider{},
-	)
-	if checker == nil {
-		return nil, errors.New("guard composition unavailable")
-	}
+	sessions := productionSessions{reader: reader}
+	clients := productionClients{reader: reader, configuration: configuration}
+	remote := guardcore.NewRemoteDecider(clients)
 	return func(ctx context.Context, document []byte) ([]byte, error) {
 		action, err := protocol.ParseActionRequest(document)
 		if err != nil {
@@ -188,6 +262,11 @@ func checkerHandler(configuration *config.Config) (guardsocket.Handler, error) {
 				protocol.ProtocolErrorCodeInvalidRequest, "The request is invalid.", false,
 			), nil
 		}
+		recording := &recordingDecider{remote: remote}
+		checker := guardcore.New(
+			safeResourceNormalizer{}, sessions,
+			guardcore.NewTableRouteResolver(table), recording,
+		)
 		result := checker.Check(ctx, guardcore.Input{
 			Normalization: guardcore.NormalizationRequest{
 				Kind: action.Target.Kind, Service: action.Target.Service,
@@ -196,6 +275,11 @@ func checkerHandler(configuration *config.Config) (guardsocket.Handler, error) {
 			RouteTarget: action.Target.Service,
 			Action:      action,
 		})
+		if recording.decision.SchemaVersion != "" {
+			if response, marshalErr := json.Marshal(recording.decision); marshalErr == nil {
+				return response, nil
+			}
+		}
 		code := protocol.ProtocolErrorCodeAuthorizationUnavailable
 		message := protocol.SafeText("Authorization is temporarily unavailable.")
 		retryable := true

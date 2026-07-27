@@ -513,6 +513,31 @@ func TestPublishedPathMustReachActualListener(t *testing.T) {
 	}
 }
 
+func TestLifecycleProofHasIndependentMinimumBudget(t *testing.T) {
+	for iteration := range 100 {
+		root, err := os.MkdirTemp("", "pl-")
+		if err != nil {
+			t.Fatal(err)
+		}
+		dir := filepath.Join(root, "run")
+		server, err := New(Config{
+			RuntimeDir: dir,
+			SocketName: DefaultSocketName,
+			Handler:    echoHandler,
+			IOTimeout:  time.Nanosecond,
+		})
+		if err != nil {
+			t.Fatalf("iteration %d: %v", iteration, err)
+		}
+		if err := server.Close(); err != nil {
+			t.Fatalf("iteration %d close: %v", iteration, err)
+		}
+		if err := os.RemoveAll(root); err != nil {
+			t.Fatalf("iteration %d cleanup: %v", iteration, err)
+		}
+	}
+}
+
 func TestRuntimeDirectoryPermissionChangeBeforeBindIsRejected(t *testing.T) {
 	root, err := os.MkdirTemp("", "pn-mode-")
 	if err != nil {

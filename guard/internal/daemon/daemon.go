@@ -88,6 +88,7 @@ type Manager struct {
 	cfg          Config
 	launch       executableIdentity
 	launchHash   string
+	environment  []string
 	oneShotSlots chan struct{}
 	mu           sync.Mutex
 }
@@ -104,6 +105,7 @@ func New(cfg Config) (*Manager, error) {
 			return nil, ErrUnsafeExecutable
 		}
 		cfg.Executable = canonical
+		cfg.ChildEnv = ensureLaunchSource(cfg.ChildEnv, canonical)
 		identity, launchErr := validateLaunch(
 			cfg.Executable, cfg.Arguments, cfg.ChildEnv,
 		)
@@ -111,6 +113,8 @@ func New(cfg Config) (*Manager, error) {
 			return nil, launchErr
 		}
 		launch = identity
+	} else if source := os.Getenv("PALONEXUS_DAEMON_SOURCE"); source != "" {
+		cfg.ChildEnv = ensureLaunchSource(cfg.ChildEnv, source)
 	}
 	if cfg.ConfigurationDigest != "" && !validHexDigest(cfg.ConfigurationDigest) {
 		return nil, ErrUnsafeExecutable
@@ -136,11 +140,13 @@ func New(cfg Config) (*Manager, error) {
 	if closeErr := dir.Close(); closeErr != nil {
 		return nil, ErrUnsafeRuntime
 	}
+	environment := append(safeBaseEnvironment(), cfg.ChildEnv...)
 	return &Manager{
 		cfg: cloneConfig(cfg), launch: launch,
 		launchHash: canonicalLaunchHash(
-			launch.Digest, cfg.Arguments, cfg.ChildEnv, cfg.ConfigurationDigest,
+			launch.Digest, cfg.Arguments, environment, cfg.ConfigurationDigest,
 		),
+		environment:  append([]string(nil), environment...),
 		oneShotSlots: make(chan struct{}, maxOneShotActive),
 	}, nil
 }
@@ -151,6 +157,15 @@ func cloneConfig(cfg Config) Config {
 	return cfg
 }
 
+func ensureLaunchSource(environment []string, source string) []string {
+	for _, assignment := range environment {
+		if strings.HasPrefix(assignment, "PALONEXUS_DAEMON_SOURCE=") {
+			return environment
+		}
+	}
+	return append(environment, "PALONEXUS_DAEMON_SOURCE="+source)
+}
+
 func (m *Manager) Run(ctx context.Context) error {
 	if m == nil || ctx == nil {
 		return ErrUnavailable
@@ -158,6 +173,7 @@ func (m *Manager) Run(ctx context.Context) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	defer cleanupRunningExecutable(m.cfg.RuntimeDir)
 	runCtx, cancel := signal.NotifyContext(ctx, os.Interrupt, syscall.SIGTERM)
 	defer cancel()
 	token, err := randomToken()
@@ -201,7 +217,7 @@ func (m *Manager) Run(ctx context.Context) error {
 		Executable: executable, Device: identity.Device, Inode: identity.Inode,
 		Mode: identity.Mode, UID: identity.UID, BinaryHash: identity.Digest,
 		LaunchHash: canonicalLaunchHash(
-			identity.Digest, m.cfg.Arguments, m.cfg.ChildEnv, m.cfg.ConfigurationDigest,
+			identity.Digest, m.cfg.Arguments, m.environment, m.cfg.ConfigurationDigest,
 		),
 		StartToken: startToken,
 	}
@@ -404,7 +420,10 @@ func validateResponse(response []byte) ([]byte, error) {
 }
 
 func exchange(ctx context.Context, path string, document []byte) ([]byte, error) {
-	deadline := time.Now().Add(probeBudget(ctx))
+	deadline := time.Now().Add(maxOneShot)
+	if contextDeadline, ok := ctx.Deadline(); ok && contextDeadline.Before(deadline) {
+		deadline = contextDeadline
+	}
 	dialer := net.Dialer{Timeout: probeBudget(ctx)}
 	conn, err := dialer.DialContext(ctx, "unix", path)
 	if err != nil {
@@ -464,10 +483,6 @@ func sendStop(ctx context.Context, path, token string) error {
 func (m *Manager) stateMatchesLaunch(state lifecycleState) bool {
 	return m.cfg.Executable == "" ||
 		state.Executable == m.cfg.Executable &&
-			state.Device == m.launch.Device &&
-			state.Inode == m.launch.Inode &&
-			state.Mode == m.launch.Mode &&
-			state.UID == m.launch.UID &&
 			state.BinaryHash == m.launch.Digest &&
 			state.LaunchHash == m.launchHash
 }
@@ -555,15 +570,14 @@ type executableIdentity struct {
 }
 
 func currentExecutableIdentity() (string, executableIdentity, error) {
-	path, err := os.Executable()
+	path, err := runningExecutablePath()
 	if err != nil {
 		return "", executableIdentity{}, err
 	}
-	path, err = filepath.EvalSymlinks(path)
-	if err != nil {
-		return "", executableIdentity{}, err
+	identity, err := inspectRunningExecutable(path)
+	if source := os.Getenv("PALONEXUS_DAEMON_SOURCE"); source != "" {
+		path = source
 	}
-	identity, err := inspectExecutable(path)
 	return path, identity, err
 }
 

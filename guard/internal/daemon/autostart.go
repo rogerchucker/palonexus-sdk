@@ -81,6 +81,13 @@ func (m *Manager) Start(ctx context.Context) error {
 		_ = logFile.Close()
 		return ErrUnavailable
 	}
+	processGuard, err := pinStartedProcess(command.Process)
+	if err != nil {
+		closeExecutable()
+		_ = logFile.Close()
+		return ErrUnprovenProcess
+	}
+	defer processGuard.close()
 	closeExecutable()
 	_ = logFile.Close()
 	waitDone := make(chan error, 1)
@@ -105,32 +112,34 @@ func (m *Manager) Start(ctx context.Context) error {
 		}
 		select {
 		case <-ctx.Done():
-			stopStartedProcess(command.Process, waitDone, m.cfg.KillTimeout)
+			stopStartedProcess(processGuard, waitDone, m.cfg.KillTimeout)
 			return ctx.Err()
 		case <-deadline.C:
-			stopStartedProcess(command.Process, waitDone, m.cfg.KillTimeout)
+			stopStartedProcess(processGuard, waitDone, m.cfg.KillTimeout)
 			return ErrUnavailable
 		case <-ticker.C:
 		}
 	}
 }
 
-func stopStartedProcess(process *os.Process, waitDone <-chan error, maximum time.Duration) {
+func stopStartedProcess(
+	process *startedProcessGuard,
+	waitDone <-chan error,
+	maximum time.Duration,
+) {
 	select {
 	case <-waitDone:
 		return
 	default:
 	}
-	_ = syscall.Kill(-process.Pid, syscall.SIGINT)
-	_ = process.Signal(os.Interrupt)
+	_ = process.signal(syscall.SIGINT)
 	timer := time.NewTimer(maximum)
 	defer timer.Stop()
 	select {
 	case <-waitDone:
 		return
 	case <-timer.C:
-		_ = syscall.Kill(-process.Pid, syscall.SIGKILL)
-		_ = process.Kill()
+		_ = process.signal(syscall.SIGKILL)
 	}
 	select {
 	case <-waitDone:

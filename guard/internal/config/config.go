@@ -13,6 +13,7 @@ import (
 	"net"
 	"net/url"
 	"os"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
@@ -36,28 +37,51 @@ type Route struct {
 }
 
 type fileConfig struct {
-	DecisionEndpoint string  `json:"decision_endpoint"`
-	OIDCIssuer       string  `json:"oidc_issuer"`
-	TrustedCAFile    string  `json:"trusted_ca_file"`
-	LocalTestMode    bool    `json:"local_test_mode"`
-	Routes           []Route `json:"routes"`
+	DecisionEndpoint      string  `json:"decision_endpoint"`
+	OIDCIssuer            string  `json:"oidc_issuer"`
+	TrustedCAFile         string  `json:"trusted_ca_file"`
+	LocalTestMode         bool    `json:"local_test_mode"`
+	Routes                []Route `json:"routes"`
+	TenantID              string  `json:"tenant_id"`
+	AccountID             string  `json:"account_id"`
+	ClientID              string  `json:"client_id"`
+	StateDir              string  `json:"state_dir"`
+	CredentialService     string  `json:"credential_service"`
+	TestCredentialRoot    string  `json:"test_credential_root"`
+	TestCredentialKeyFile string  `json:"test_credential_key_file"`
 }
 
 // Config exposes immutable values through accessors. Slices are copied.
 type Config struct {
-	decisionEndpoint string
-	oidcIssuer       string
-	trustedCAPEM     []byte
-	localTestMode    bool
-	routes           []Route
-	digest           string
+	decisionEndpoint   string
+	oidcIssuer         string
+	trustedCAPEM       []byte
+	localTestMode      bool
+	routes             []Route
+	digest             string
+	tenantID           string
+	accountID          string
+	clientID           string
+	stateDir           string
+	credentialService  string
+	testCredentialRoot string
+	testCredentialKey  []byte
 }
 
-func (c *Config) DecisionEndpoint() string { return c.decisionEndpoint }
-func (c *Config) OIDCIssuer() string       { return c.oidcIssuer }
-func (c *Config) LocalTestMode() bool      { return c.localTestMode }
-func (c *Config) Routes() []Route          { return append([]Route(nil), c.routes...) }
-func (c *Config) Digest() string           { return c.digest }
+func (c *Config) DecisionEndpoint() string   { return c.decisionEndpoint }
+func (c *Config) OIDCIssuer() string         { return c.oidcIssuer }
+func (c *Config) LocalTestMode() bool        { return c.localTestMode }
+func (c *Config) Routes() []Route            { return append([]Route(nil), c.routes...) }
+func (c *Config) Digest() string             { return c.digest }
+func (c *Config) TenantID() string           { return c.tenantID }
+func (c *Config) AccountID() string          { return c.accountID }
+func (c *Config) ClientID() string           { return c.clientID }
+func (c *Config) StateDir() string           { return c.stateDir }
+func (c *Config) CredentialService() string  { return c.credentialService }
+func (c *Config) TestCredentialRoot() string { return c.testCredentialRoot }
+func (c *Config) TestCredentialKey() []byte {
+	return append([]byte(nil), c.testCredentialKey...)
+}
 
 // TrustedCAPEM returns a defensive copy of CA certificates read from the
 // securely validated descriptor. TLS consumers must use this retained material
@@ -114,6 +138,21 @@ func Load(path string, options Options) (*Config, error) {
 	if _, err := routing.New(compiledRoutes); err != nil {
 		return nil, errors.New("load config: invalid or ambiguous routes")
 	}
+	if raw.StateDir != "" && (!filepath.IsAbs(raw.StateDir) ||
+		filepath.Clean(raw.StateDir) == string(filepath.Separator)) {
+		return nil, errors.New("load config: invalid state directory")
+	}
+	var testCredentialKey []byte
+	if raw.TestCredentialRoot != "" || raw.TestCredentialKeyFile != "" {
+		if !localAllowed || !filepath.IsAbs(raw.TestCredentialRoot) ||
+			!filepath.IsAbs(raw.TestCredentialKeyFile) {
+			return nil, errors.New("load config: invalid test credential storage")
+		}
+		testCredentialKey, err = readValidatedFile(raw.TestCredentialKeyFile, fileKindConfig)
+		if err != nil || len(testCredentialKey) != 32 {
+			return nil, errors.New("load config: invalid test credential key")
+		}
+	}
 	var trustedCAPEM []byte
 	if raw.TrustedCAFile != "" {
 		trustedCAPEM, err = readValidatedFile(raw.TrustedCAFile, fileKindCA)
@@ -125,13 +164,27 @@ func Load(path string, options Options) (*Config, error) {
 		}
 	}
 
+	digest := sha256.New()
+	digest.Write([]byte("palonexus-config-security-v1\x00"))
+	digest.Write(data)
+	digest.Write([]byte{0})
+	digest.Write(trustedCAPEM)
+	digest.Write([]byte{0})
+	digest.Write(testCredentialKey)
 	return &Config{
-		decisionEndpoint: raw.DecisionEndpoint,
-		oidcIssuer:       raw.OIDCIssuer,
-		trustedCAPEM:     append([]byte(nil), trustedCAPEM...),
-		localTestMode:    localAllowed,
-		routes:           append([]Route(nil), raw.Routes...),
-		digest:           fmt.Sprintf("%x", sha256.Sum256(data)),
+		decisionEndpoint:   raw.DecisionEndpoint,
+		oidcIssuer:         raw.OIDCIssuer,
+		trustedCAPEM:       append([]byte(nil), trustedCAPEM...),
+		localTestMode:      localAllowed,
+		routes:             append([]Route(nil), raw.Routes...),
+		digest:             fmt.Sprintf("%x", digest.Sum(nil)),
+		tenantID:           raw.TenantID,
+		accountID:          raw.AccountID,
+		clientID:           raw.ClientID,
+		stateDir:           raw.StateDir,
+		credentialService:  raw.CredentialService,
+		testCredentialRoot: raw.TestCredentialRoot,
+		testCredentialKey:  append([]byte(nil), testCredentialKey...),
 	}, nil
 }
 

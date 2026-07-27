@@ -27,6 +27,7 @@ const (
 	DefaultSocketName  = "guard.sock"
 	defaultMaxRequest  = 1 << 20
 	defaultIOTimeout   = 5 * time.Second
+	minLifecycleProof  = time.Second
 	defaultMaxClients  = 64
 	defaultMaxHandlers = 16
 	hardMaxConcurrency = 256
@@ -303,7 +304,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.afterStageBind != nil {
 		cfg.afterStageBind(stagePath)
 	}
-	if err := proveListenerPath(listener, stagePath, cfg.IOTimeout); err != nil {
+	if err := proveListenerPath(listener, stagePath, lifecycleProofBudget(cfg.IOTimeout)); err != nil {
 		_ = listener.Close()
 		return fail(err)
 	}
@@ -390,7 +391,7 @@ func New(cfg Config) (*Server, error) {
 	if cfg.beforeListenerProof != nil {
 		cfg.beforeListenerProof(path)
 	}
-	if err := proveListenerPath(listener, path, cfg.IOTimeout); err != nil {
+	if err := proveListenerPath(listener, path, lifecycleProofBudget(cfg.IOTimeout)); err != nil {
 		return cleanupListener(err)
 	}
 	finalNode, err := inspectAt(dir, cfg.SocketName)
@@ -520,7 +521,7 @@ func recoverLifecycle(
 		return err
 	}
 	path := filepath.Join(cfg.RuntimeDir, candidates[0].name)
-	if probeGuard(path, cfg.IOTimeout) != probeRefused {
+	if probeGuard(path, lifecycleProofBudget(cfg.IOTimeout)) != probeRefused {
 		return errors.New("socket: lifecycle candidate may still be active")
 	}
 	if err := verifyRuntimeDir(dir, cfg.RuntimeDir, dirInfo); err != nil {
@@ -545,6 +546,13 @@ const (
 	challengeField    = "_palonexusGuardChallenge"
 	challengePIDField = "serverPid"
 )
+
+func lifecycleProofBudget(operational time.Duration) time.Duration {
+	if operational < minLifecycleProof {
+		return minLifecycleProof
+	}
+	return operational
+}
 
 func probeGuard(path string, timeout time.Duration) probeResult {
 	_, result := probeGuardPID(path, timeout)
