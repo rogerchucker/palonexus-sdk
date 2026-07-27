@@ -63,6 +63,7 @@ try:
     from langgraph.types import Command
 
     from .langchain import (
+        LangChainActionPolicy,
         LangChainAuthorizationContext,
         LangChainInvalidRequest,
         PaloNexusLangChainMiddleware,
@@ -271,7 +272,7 @@ class PaloNexusDeepAgentsMiddleware(AgentMiddleware[Any, Any]):
     ) -> PaloNexusDeepAgentsMiddleware:
         if not governed_subagents or bound_agent_name not in self._accountable_actors:
             _invalid()
-        return PaloNexusDeepAgentsMiddleware(
+        return _FactoryBoundPaloNexusMiddleware(
             authorization=self._authorization,
             accountable_actors=self._accountable_actors,
             _bound_agent_name=bound_agent_name,
@@ -295,9 +296,9 @@ class PaloNexusDeepAgentsMiddleware(AgentMiddleware[Any, Any]):
         if expected_actor is None or context.authorization.actor_ref != expected_actor:
             _invalid()
 
-    def _orchestration_tool(self, request: ToolCallRequest) -> bool:
+    def _orchestration_tool(self, request: ToolCallRequest) -> str | None:
         if not self._orchestration_builtins:
-            return False
+            return None
         try:
             name = request.tool_call["name"]
             arguments = request.tool_call["args"]
@@ -309,11 +310,13 @@ class PaloNexusDeepAgentsMiddleware(AgentMiddleware[Any, Any]):
             ):
                 raise TypeError
             if name == "write_todos":
-                return frozenset(arguments) == {"todos"} and isinstance(
+                if frozenset(arguments) != {"todos"} or not isinstance(
                     arguments["todos"], list
-                )
+                ):
+                    raise TypeError
+                return "write_todos"
             if name != "task":
-                return False
+                return None
             if frozenset(arguments) != {"description", "subagent_type"}:
                 raise TypeError
             description = arguments["description"]
@@ -325,7 +328,7 @@ class PaloNexusDeepAgentsMiddleware(AgentMiddleware[Any, Any]):
                 or subagent_type not in self._governed_subagents
             ):
                 raise TypeError
-            return True
+            return subagent_type
         except Exception:
             _invalid()
         raise AssertionError("unreachable")
@@ -336,8 +339,20 @@ class PaloNexusDeepAgentsMiddleware(AgentMiddleware[Any, Any]):
         handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
     ) -> ToolMessage | Command[Any]:
         self._validate(request)
-        if self._orchestration_tool(request):
+        orchestration = self._orchestration_tool(request)
+        if orchestration == "write_todos":
             return handler(request)
+        if orchestration is not None:
+            if request.tool is None:
+                _invalid()
+            bound = self._authorization.with_tool_binding(
+                tool=request.tool,
+                policy=LangChainActionPolicy(
+                    service=f"deep-agent-{orchestration}",
+                    side_effect="external",
+                ),
+            )
+            return bound.wrap_tool_call(request, handler)
         return self._authorization.wrap_tool_call(request, handler)
 
     async def awrap_tool_call(
@@ -349,8 +364,20 @@ class PaloNexusDeepAgentsMiddleware(AgentMiddleware[Any, Any]):
         ],
     ) -> ToolMessage | Command[Any]:
         self._validate(request)
-        if self._orchestration_tool(request):
+        orchestration = self._orchestration_tool(request)
+        if orchestration == "write_todos":
             return await handler(request)
+        if orchestration is not None:
+            if request.tool is None:
+                _invalid()
+            bound = self._authorization.with_tool_binding(
+                tool=request.tool,
+                policy=LangChainActionPolicy(
+                    service=f"deep-agent-{orchestration}",
+                    side_effect="external",
+                ),
+            )
+            return await bound.awrap_tool_call(request, handler)
         return await self._authorization.awrap_tool_call(request, handler)
 
     def wrap_model_call(
@@ -368,6 +395,20 @@ class PaloNexusDeepAgentsMiddleware(AgentMiddleware[Any, Any]):
     ) -> ModelResponse[Any] | AIMessage:
         self._validate(request)
         return await self._authorization.awrap_model_call(request, handler)
+
+
+class _FactoryBoundPaloNexusMiddleware(PaloNexusDeepAgentsMiddleware):
+    """Profile-resistant bound middleware.
+
+    Deep Agents matches excluded middleware classes by exact type and string
+    entries by the public ``name`` alias. A factory-local subtype prevents an
+    exclusion of the public configurable class from matching. A public-name
+    string exclusion likewise matches nothing, which Deep Agents rejects
+    through its documented exclusion-coverage validation instead of silently
+    constructing an unguarded graph.
+    """
+
+    __slots__ = ()
 
 
 def _factory_supports_public_hooks(factory: Callable[..., object]) -> bool:

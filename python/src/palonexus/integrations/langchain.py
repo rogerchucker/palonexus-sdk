@@ -467,6 +467,41 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
             tool_bindings=tool_bindings,
         )
 
+    def with_tool_binding(
+        self,
+        *,
+        tool: BaseTool,
+        policy: LangChainActionPolicy,
+    ) -> PaloNexusLangChainMiddleware:
+        """Return a copy bound to one exact host-created public tool object.
+
+        Host integrations use this only after validating a framework-generated
+        tool and its immutable target. The exact object binding preserves the
+        same substitution resistance as statically configured tools.
+        """
+
+        if not isinstance(tool, BaseTool) or type(policy) is not LangChainActionPolicy:
+            raise InvalidRequest() from None
+        name = tool.name
+        existing_tool = self._tool_bindings.get(name)
+        existing_policy = self._tool_policies.get(name)
+        if (existing_tool is not None and existing_tool is not tool) or (
+            existing_policy is not None and existing_policy != policy
+        ):
+            raise InvalidRequest() from None
+        tools = dict(self._tool_bindings)
+        policies = dict(self._tool_policies)
+        tools[name] = tool
+        policies[name] = policy
+        return PaloNexusLangChainMiddleware(
+            client=self._client,
+            async_client=self._async_client,
+            tool_policies=policies,
+            model_policies=self._model_policies,
+            model_bindings=self._model_bindings,
+            tool_bindings=tools,
+        )
+
     def _prepare(
         self,
         *,

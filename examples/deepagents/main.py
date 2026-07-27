@@ -80,6 +80,7 @@ def build(outcome: object) -> tuple[object, list[str], DeepAgentsAuthorizationCo
     engine = ScriptedEngine(
         ScriptedEngine.allow(),
         ScriptedEngine.allow(),
+        ScriptedEngine.allow(),
         outcome,
         ScriptedEngine.allow(),
         ScriptedEngine.allow(),
