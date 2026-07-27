@@ -1,0 +1,465 @@
+// SPDX-License-Identifier: MIT
+// Package decision implements the guard's fail-closed authorization transport.
+package decision
+
+import (
+	"bytes"
+	"context"
+	"crypto/sha256"
+	"crypto/subtle"
+	"crypto/tls"
+	"crypto/x509"
+	"encoding/hex"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"mime"
+	"net"
+	"net/http"
+	"net/netip"
+	"net/url"
+	"regexp"
+	"strconv"
+	"strings"
+	"time"
+
+	"github.com/rogerchucker/palonexus-sdk/guard/internal/normalize"
+	"github.com/rogerchucker/palonexus-sdk/guard/pkg/protocol"
+)
+
+const MaxResponseBytes = 256 << 10
+
+type TokenSource func(context.Context) (string, error)
+
+type Options struct {
+	Endpoint     string
+	RootCAs      *x509.CertPool
+	HTTPClient   *http.Client
+	AccessToken  TokenSource
+	Timeout      time.Duration
+	MaxClockSkew time.Duration
+	Now          func() time.Time
+	testing      bool
+}
+
+type Client struct {
+	endpoint string
+	http     *http.Client
+	token    TokenSource
+	now      func() time.Time
+	skew     time.Duration
+}
+
+func (*Client) String() string     { return "decision.Client{configuration:[REDACTED]}" }
+func (c *Client) GoString() string { return c.String() }
+
+func newForTesting(options Options) (*Client, error) {
+	options.testing = true
+	return New(options)
+}
+
+func New(options Options) (*Client, error) {
+	endpoint, err := validateEndpoint(options.Endpoint)
+	if err != nil || options.AccessToken == nil {
+		return nil, ErrInvalidConfig
+	}
+	if options.Now == nil {
+		options.Now = time.Now
+	}
+	if options.MaxClockSkew < 0 {
+		return nil, ErrInvalidConfig
+	}
+	if options.MaxClockSkew == 0 {
+		options.MaxClockSkew = time.Minute
+	}
+	if options.MaxClockSkew > 5*time.Minute {
+		return nil, ErrInvalidConfig
+	}
+	if options.Timeout < 0 {
+		return nil, ErrInvalidConfig
+	}
+	if options.Timeout == 0 {
+		options.Timeout = 10 * time.Second
+	}
+	if options.Timeout > 15*time.Second {
+		return nil, ErrInvalidConfig
+	}
+	var transport *http.Transport
+	if options.testing && options.HTTPClient != nil {
+		if base, ok := options.HTTPClient.Transport.(*http.Transport); ok {
+			transport = base.Clone()
+			if base.TLSClientConfig != nil {
+				transport.TLSClientConfig = base.TLSClientConfig.Clone()
+			}
+		} else {
+			// Test-only custom transports are retained for deterministic mock TLS.
+			client := *options.HTTPClient
+			client.CheckRedirect = rejectRedirect
+			if client.Timeout == 0 || client.Timeout > options.Timeout {
+				client.Timeout = options.Timeout
+			}
+			return &Client{endpoint: endpoint, http: &client, token: options.AccessToken, now: options.Now, skew: options.MaxClockSkew}, nil
+		}
+	} else {
+		transport = http.DefaultTransport.(*http.Transport).Clone()
+	}
+	transport.Proxy = nil
+	transport.DisableCompression = true
+	if !options.testing {
+		transport.DialContext = safeDial
+	}
+	tlsConfig := transport.TLSClientConfig
+	if tlsConfig == nil {
+		tlsConfig = &tls.Config{}
+	} else {
+		tlsConfig = tlsConfig.Clone()
+	}
+	if tlsConfig.MinVersion < tls.VersionTLS12 {
+		tlsConfig.MinVersion = tls.VersionTLS12
+	}
+	if options.RootCAs != nil {
+		tlsConfig.RootCAs = options.RootCAs.Clone()
+	}
+	transport.TLSClientConfig = tlsConfig
+	return &Client{
+		endpoint: endpoint,
+		http:     &http.Client{Transport: transport, Timeout: options.Timeout, CheckRedirect: rejectRedirect},
+		token:    options.AccessToken, now: options.Now, skew: options.MaxClockSkew,
+	}, nil
+}
+
+func rejectRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+
+func validateEndpoint(raw string) (string, error) {
+	for _, r := range raw {
+		if r <= 0x1f || r == 0x7f {
+			return "", ErrInvalidConfig
+		}
+	}
+	parsed, err := url.Parse(raw)
+	if err != nil || parsed.Scheme != "https" || parsed.Host == "" ||
+		parsed.Hostname() == "" || parsed.User != nil || parsed.RawQuery != "" ||
+		parsed.ForceQuery || parsed.Fragment != "" || parsed.Opaque != "" ||
+		strings.HasSuffix(parsed.Host, ":") || !validEndpointHost(parsed.Hostname()) ||
+		!validEndpointPath(parsed) {
+		return "", ErrInvalidConfig
+	}
+	if port := parsed.Port(); port != "" {
+		number, portErr := strconv.Atoi(port)
+		if portErr != nil || number < 1 || number > 65535 {
+			return "", ErrInvalidConfig
+		}
+	}
+	return parsed.String(), nil
+}
+
+var endpointDNSLabel = regexp.MustCompile(`^[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?$`)
+var ambiguousNumericHost = regexp.MustCompile(`^(?:[0-9.]+|0[xX][0-9A-Fa-f]+)$`)
+
+func validEndpointHost(host string) bool {
+	if ip := net.ParseIP(host); ip != nil {
+		return true
+	}
+	if len(host) > 253 || strings.HasSuffix(host, ".") || ambiguousNumericHost.MatchString(host) {
+		return false
+	}
+	for _, label := range strings.Split(host, ".") {
+		if !endpointDNSLabel.MatchString(label) {
+			return false
+		}
+	}
+	return true
+}
+
+func validEndpointPath(endpoint *url.URL) bool {
+	if endpoint.RawPath != "" || strings.ContainsAny(endpoint.Path, "\\\r\n") ||
+		strings.Contains(endpoint.Path, "//") {
+		return false
+	}
+	if endpoint.Path == "" {
+		return true
+	}
+	if !strings.HasPrefix(endpoint.Path, "/") {
+		return false
+	}
+	for _, segment := range strings.Split(endpoint.Path, "/") {
+		if segment == "." || segment == ".." {
+			return false
+		}
+	}
+	return true
+}
+
+func safeDial(ctx context.Context, network, address string) (net.Conn, error) {
+	dialer := &net.Dialer{}
+	return dialResolved(ctx, network, address, net.DefaultResolver, dialer.DialContext)
+}
+
+type ipResolver interface {
+	LookupIPAddr(context.Context, string) ([]net.IPAddr, error)
+}
+
+type contextDialer func(context.Context, string, string) (net.Conn, error)
+
+func dialResolved(
+	ctx context.Context,
+	network string,
+	address string,
+	resolver ipResolver,
+	dial contextDialer,
+) (net.Conn, error) {
+	if network != "tcp" && network != "tcp4" && network != "tcp6" {
+		return nil, errors.New("unsafe decision destination")
+	}
+	host, port, err := net.SplitHostPort(address)
+	if err != nil {
+		return nil, errors.New("unsafe decision destination")
+	}
+	portNumber, err := strconv.Atoi(port)
+	if err != nil || portNumber < 1 || portNumber > 65535 {
+		return nil, errors.New("unsafe decision destination")
+	}
+	ips, err := resolver.LookupIPAddr(ctx, host)
+	if err != nil || len(ips) == 0 {
+		return nil, errors.New("decision destination unavailable")
+	}
+	for _, candidate := range ips {
+		if candidate.Zone != "" || unsafeIP(candidate.IP) {
+			return nil, errors.New("unsafe decision destination")
+		}
+	}
+	// Pin the connection to one address from the validated answer, preventing a
+	// second resolver lookup from changing the destination.
+	return dial(ctx, network, net.JoinHostPort(ips[0].IP.String(), port))
+}
+
+func unsafeIP(ip net.IP) bool {
+	if ip == nil {
+		return true
+	}
+	address, ok := netip.AddrFromSlice(ip)
+	if !ok {
+		return true
+	}
+	address = address.Unmap()
+	if !address.IsGlobalUnicast() {
+		return true
+	}
+	for _, prefix := range unsafeDestinationPrefixes {
+		if prefix.Contains(address) {
+			return true
+		}
+	}
+	return false
+}
+
+var unsafeDestinationPrefixes = []netip.Prefix{
+	netip.MustParsePrefix("0.0.0.0/8"),
+	netip.MustParsePrefix("10.0.0.0/8"),
+	netip.MustParsePrefix("100.64.0.0/10"),
+	netip.MustParsePrefix("127.0.0.0/8"),
+	netip.MustParsePrefix("169.254.0.0/16"),
+	netip.MustParsePrefix("172.16.0.0/12"),
+	netip.MustParsePrefix("192.0.0.0/24"),
+	netip.MustParsePrefix("192.0.2.0/24"),
+	netip.MustParsePrefix("192.168.0.0/16"),
+	netip.MustParsePrefix("198.18.0.0/15"),
+	netip.MustParsePrefix("198.51.100.0/24"),
+	netip.MustParsePrefix("203.0.113.0/24"),
+	netip.MustParsePrefix("224.0.0.0/4"),
+	netip.MustParsePrefix("240.0.0.0/4"),
+	netip.MustParsePrefix("64:ff9b:1::/48"),
+	netip.MustParsePrefix("100::/64"),
+	netip.MustParsePrefix("2001::/23"),
+	netip.MustParsePrefix("2001:db8::/32"),
+	netip.MustParsePrefix("2002::/16"),
+	netip.MustParsePrefix("fc00::/7"),
+	netip.MustParsePrefix("fe80::/10"),
+	netip.MustParsePrefix("ff00::/8"),
+}
+
+// ClientScopeHash computes the protocol-v1 client-visible scope binding.
+func ClientScopeHash(request protocol.ActionRequest) (protocol.SHA256Digest, error) {
+	if err := request.ValidateStructural(); err != nil {
+		return "", ErrInvalidRequest
+	}
+	resourcePreimage := map[string]any{
+		"preimageType": "palonexus.resource", "preimageVersion": "1",
+		"kind": request.Target.Kind, "service": request.Target.Service,
+		"resource": request.Target.Resource,
+	}
+	resourceJSON, err := canonicalJSON(resourcePreimage)
+	if err != nil {
+		return "", ErrInvalidRequest
+	}
+	resourceSum := sha256.Sum256(resourceJSON)
+	expectedResourceHash := "sha256:" + hex.EncodeToString(resourceSum[:])
+	if subtle.ConstantTimeCompare([]byte(expectedResourceHash), []byte(request.Target.ResourceHash)) != 1 {
+		return "", ErrInvalidRequest
+	}
+	scope := map[string]any{
+		"scopeType": "client", "scopeVersion": "1",
+		"adapter":    map[string]any{"id": request.Adapter.ID, "version": request.Adapter.Version},
+		"task":       map[string]any{"taskId": request.Task.TaskID, "sessionId": request.Task.SessionID},
+		"action":     request.Action,
+		"target":     map[string]any{"kind": request.Target.Kind, "service": request.Target.Service, "resourceHash": request.Target.ResourceHash},
+		"sideEffect": request.SideEffect,
+	}
+	encoded, err := canonicalJSON(scope)
+	if err != nil {
+		return "", ErrInvalidRequest
+	}
+	sum := sha256.Sum256(encoded)
+	return protocol.SHA256Digest("sha256:" + hex.EncodeToString(sum[:])), nil
+}
+
+func canonicalJSON(value any) ([]byte, error) {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return nil, err
+	}
+	return normalize.CanonicalJSON(raw)
+}
+
+func (c *Client) Decide(ctx context.Context, request protocol.ActionRequest) (protocol.AuthorizationDecision, error) {
+	if ctx == nil {
+		return protocol.AuthorizationDecision{}, unavailable()
+	}
+	if err := ctx.Err(); err != nil {
+		return protocol.AuthorizationDecision{}, unavailable()
+	}
+	scope, err := ClientScopeHash(request)
+	if err != nil {
+		return protocol.AuthorizationDecision{}, err
+	}
+	body, err := json.Marshal(request)
+	if err != nil {
+		return protocol.AuthorizationDecision{}, ErrInvalidRequest
+	}
+	token, err := c.token(ctx)
+	if err != nil || !validBearerToken(token) {
+		return protocol.AuthorizationDecision{}, unavailable()
+	}
+	httpRequest, err := http.NewRequestWithContext(ctx, http.MethodPost, c.endpoint, bytes.NewReader(body))
+	if err != nil {
+		return protocol.AuthorizationDecision{}, unavailable()
+	}
+	httpRequest.Header.Set("Authorization", "Bearer "+token)
+	httpRequest.Header.Set("Content-Type", "application/json")
+	httpRequest.Header.Set("Accept", "application/json")
+	httpRequest.Header.Set("Accept-Encoding", "identity")
+	httpRequest.Header.Set("Idempotency-Key", string(request.IdempotencyKey))
+	httpRequest.Header.Set("X-Palonexus-Protocol-Version", "1")
+	response, err := c.http.Do(httpRequest)
+	if err != nil {
+		return protocol.AuthorizationDecision{}, unavailable()
+	}
+	defer response.Body.Close()
+	if response.StatusCode != http.StatusOK {
+		return protocol.AuthorizationDecision{}, unavailable()
+	}
+	if !validResponseHeaders(response) {
+		return protocol.AuthorizationDecision{}, ErrInvalidDecision
+	}
+	document, err := io.ReadAll(io.LimitReader(response.Body, MaxResponseBytes+1))
+	if err != nil || len(document) > MaxResponseBytes {
+		return protocol.AuthorizationDecision{}, ErrInvalidDecision
+	}
+	decision, err := protocol.ParseAuthorizationDecision(document)
+	if err != nil || decision.RequestID != request.RequestID ||
+		decision.CorrelationID != request.CorrelationID ||
+		decision.ClientScopeHash != scope || decision.AuthoritativeScopeHash == "" {
+		return protocol.AuthorizationDecision{}, ErrInvalidDecision
+	}
+	serverTime, err1 := parseTimestamp(string(decision.ServerTime))
+	expiresAt, err2 := parseTimestamp(string(decision.ExpiresAt))
+	now := c.now()
+	if err1 != nil || err2 != nil || compareTimestamp(expiresAt, serverTime) <= 0 ||
+		compareTimestamp(serverTime, timestampFromTime(now.Add(-c.skew))) < 0 ||
+		compareTimestamp(serverTime, timestampFromTime(now.Add(c.skew))) > 0 ||
+		compareTimestamp(expiresAt, timestampFromTime(now.Add(c.skew))) <= 0 {
+		return protocol.AuthorizationDecision{}, ErrInvalidDecision
+	}
+	switch decision.Outcome {
+	case protocol.DecisionOutcomeAllow:
+		return decision, nil
+	case protocol.DecisionOutcomeDeny, protocol.DecisionOutcomeApprovalRequired:
+		return decision, &OutcomeError{Decision: decision}
+	default:
+		return protocol.AuthorizationDecision{}, ErrInvalidDecision
+	}
+}
+
+var bearerToken = regexp.MustCompile(`^[A-Za-z0-9\-._~+/]+=*$`)
+
+func validBearerToken(token string) bool {
+	return token != "" && len(token) <= 16<<10 && bearerToken.MatchString(token)
+}
+
+func validResponseHeaders(response *http.Response) bool {
+	contentTypes := response.Header.Values("Content-Type")
+	if len(contentTypes) != 1 {
+		return false
+	}
+	mediaType, parameters, err := mime.ParseMediaType(contentTypes[0])
+	if err != nil || strings.ToLower(mediaType) != "application/json" {
+		return false
+	}
+	if len(parameters) > 1 {
+		return false
+	}
+	if charset, ok := parameters["charset"]; ok && !strings.EqualFold(charset, "utf-8") {
+		return false
+	}
+	encodings := response.Header.Values("Content-Encoding")
+	if len(encodings) > 1 ||
+		len(encodings) == 1 && !strings.EqualFold(strings.TrimSpace(encodings[0]), "identity") {
+		return false
+	}
+	return response.ContentLength >= -1 && response.ContentLength <= MaxResponseBytes
+}
+
+var strictTimestamp = regexp.MustCompile(
+	`^([0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2})(?:\.([0-9]+))?(Z|[+-][0-9]{2}:[0-9]{2})$`,
+)
+
+type exactTimestamp struct {
+	seconds  int64
+	fraction string
+}
+
+func parseTimestamp(value string) (exactTimestamp, error) {
+	match := strictTimestamp.FindStringSubmatch(value)
+	if match == nil {
+		return exactTimestamp{}, errors.New("invalid timestamp")
+	}
+	base, err := time.Parse("2006-01-02T15:04:05Z07:00", match[1]+match[3])
+	if err != nil {
+		return exactTimestamp{}, errors.New("invalid timestamp")
+	}
+	return exactTimestamp{seconds: base.Unix(), fraction: strings.TrimRight(match[2], "0")}, nil
+}
+
+func timestampFromTime(value time.Time) exactTimestamp {
+	return exactTimestamp{
+		seconds:  value.Unix(),
+		fraction: strings.TrimRight(fmt.Sprintf("%09d", value.Nanosecond()), "0"),
+	}
+}
+
+func compareTimestamp(left, right exactTimestamp) int {
+	if left.seconds < right.seconds {
+		return -1
+	}
+	if left.seconds > right.seconds {
+		return 1
+	}
+	width := len(left.fraction)
+	if len(right.fraction) > width {
+		width = len(right.fraction)
+	}
+	leftFraction := left.fraction + strings.Repeat("0", width-len(left.fraction))
+	rightFraction := right.fraction + strings.Repeat("0", width-len(right.fraction))
+	return strings.Compare(leftFraction, rightFraction)
+}
