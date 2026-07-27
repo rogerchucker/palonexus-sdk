@@ -30,9 +30,14 @@ func (f sessionSourceFunc) Current(ctx context.Context) (AuthenticatedSession, e
 	return f(ctx)
 }
 
-type routeResolverFunc func(string) (routing.Route, error)
+type routeResolverFunc func(context.Context, string) (routing.Route, error)
 
-func (f routeResolverFunc) Resolve(target string) (routing.Route, error) { return f(target) }
+func (f routeResolverFunc) Resolve(
+	ctx context.Context,
+	target string,
+) (routing.Route, error) {
+	return f(ctx, target)
+}
 
 type deciderFunc func(context.Context, DecisionRequest) (protocol.AuthorizationDecision, error)
 
@@ -58,6 +63,32 @@ func (f protocolClientFunc) Decide(
 ) (protocol.AuthorizationDecision, error) {
 	return f(ctx, request)
 }
+
+type wrappedError struct{ inner error }
+
+func (wrappedError) Error() string   { return "wrapped decision failure" }
+func (e wrappedError) Unwrap() error { return e.inner }
+
+type adversarialAsError struct{}
+
+func (adversarialAsError) Error() string { return "adversarial decision failure" }
+func (adversarialAsError) As(target any) bool {
+	slot, ok := target.(**decision.OutcomeError)
+	if !ok {
+		return false
+	}
+	*slot = nil
+	return true
+}
+
+type typedNilContext struct{}
+
+func (*typedNilContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (*typedNilContext) Done() <-chan struct{}       { return nil }
+func (*typedNilContext) Err() error {
+	panic("typed nil context Err must not be called")
+}
+func (*typedNilContext) Value(any) any { return nil }
 
 func validInput() Input {
 	return Input{
@@ -138,7 +169,7 @@ func pipeline(t *testing.T, decide deciderFunc) *Checker {
 		sessionSourceFunc(func(context.Context) (AuthenticatedSession, error) {
 			return validSession(), nil
 		}),
-		routeResolverFunc(func(target string) (routing.Route, error) {
+		routeResolverFunc(func(_ context.Context, target string) (routing.Route, error) {
 			return routing.Route{Target: target, Destination: "https://decision.example/v1/authorize"}, nil
 		}),
 		decide,
@@ -178,6 +209,80 @@ func TestCheckRunsPipelineAndBindsTrustedIdentityAndNormalizedTarget(t *testing.
 	result := checker.Check(context.Background(), validInput())
 	if calls != 1 || !result.Allowed || result.Outcome != OutcomeAllow {
 		t.Fatalf("result = %#v, calls = %d", result, calls)
+	}
+}
+
+func TestOutboundActionUsesExplicitScalarAllowlistAndDropsCallerPayloads(t *testing.T) {
+	const secret = "SECRET-SENTINEL-MUST-NOT-LEAVE-GUARD"
+	input := validInput()
+	input.Normalization.Opaque = map[string]any{
+		"raw": []any{map[string]any{"deep": secret}},
+	}
+	causation := protocol.CausationID("dec_01J5ABCDEFGHJKMNPQRSTVWXY9")
+	approval := protocol.ApprovalID("apr_01J5ABCDEFGHJKMNPQRSTVWXY9")
+	input.Action.CausationID = &causation
+	input.Action.ResumeFromApprovalID = &approval
+	input.Action.Adapter.Extensions = &map[string]any{
+		"dev.palonexus.secret.v1": map[string]any{"nested": []any{secret}},
+	}
+	input.Action.Task.Extensions = &map[string]any{
+		"dev.palonexus.secret.v1": secret,
+	}
+	input.Action.Target = protocol.ActionTarget{
+		Kind: protocol.TargetKindTool, Service: "attacker.example",
+		Resource:     protocol.SafeText(secret),
+		ResourceHash: "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+		Extensions:   &map[string]any{"dev.palonexus.secret.v1": secret},
+	}
+	input.Action.Context = protocol.ActionContext{
+		Cwd: ptrSafe(secret), Repository: ptrSafe(secret), ToolName: ptrSafe(secret),
+		SafeDisplay: ptrSafe(secret),
+		Extensions:  &map[string]any{"dev.palonexus.secret.v1": []any{secret}},
+	}
+	input.Action.Extensions = &map[string]any{
+		"dev.palonexus.secret.v1": map[string]any{"deep": map[string]any{"value": secret}},
+	}
+
+	checker := pipeline(t, func(_ context.Context, envelope DecisionRequest) (protocol.AuthorizationDecision, error) {
+		wire, err := json.Marshal(envelope.Action)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if strings.Contains(string(wire), secret) {
+			t.Fatalf("caller payload reached authority: %s", wire)
+		}
+		action := envelope.Action
+		if action.SchemaVersion != input.Action.SchemaVersion ||
+			action.ActionID != input.Action.ActionID ||
+			action.RequestID != input.Action.RequestID ||
+			action.CorrelationID != input.Action.CorrelationID ||
+			action.IdempotencyKey != input.Action.IdempotencyKey ||
+			action.Adapter.ID != input.Action.Adapter.ID ||
+			action.Adapter.Version != input.Action.Adapter.Version ||
+			action.Adapter.HostVersion != input.Action.Adapter.HostVersion ||
+			action.Task.TaskID != input.Action.Task.TaskID ||
+			action.Task.SessionID != input.Action.Task.SessionID ||
+			action.Action != input.Action.Action ||
+			action.SideEffect != input.Action.SideEffect ||
+			action.OccurredAt != input.Action.OccurredAt {
+			t.Fatalf("required scalar binding drifted: %#v", action)
+		}
+		if action.CausationID == nil || *action.CausationID != causation ||
+			action.ResumeFromApprovalID == nil || *action.ResumeFromApprovalID != approval {
+			t.Fatalf("optional scalar binding drifted: %#v", action)
+		}
+		if action.Adapter.Extensions != nil || action.Task.Extensions != nil ||
+			action.Target.Extensions != nil || action.Extensions != nil ||
+			action.Context != (protocol.ActionContext{}) {
+			t.Fatalf("caller-owned nested values survived: %#v", action)
+		}
+		if _, err := decision.ClientScopeHash(action); err != nil {
+			t.Fatalf("sanitized action is invalid: %v", err)
+		}
+		return validDecision(action, protocol.DecisionOutcomeAllow), nil
+	})
+	if got := checker.Check(context.Background(), input); !got.Allowed {
+		t.Fatalf("result = %#v", got)
 	}
 }
 
@@ -223,7 +328,7 @@ func TestRemoteDeciderSelectsAuthenticatedClientAndUsesProductionDecisionSignatu
 			return validPrepared(t), nil
 		}),
 		sessionSourceFunc(func(context.Context) (AuthenticatedSession, error) { return validSession(), nil }),
-		routeResolverFunc(func(target string) (routing.Route, error) {
+		routeResolverFunc(func(_ context.Context, target string) (routing.Route, error) {
 			return routing.Route{Target: target, Destination: "https://decision.example/v1/authorize"}, nil
 		}),
 		remote,
@@ -277,7 +382,7 @@ func TestCheckFailsClosedBeforeDecision(t *testing.T) {
 				return normalize.Prepared{}, errors.New("normalization contained raw-secret")
 			},
 			session: func(context.Context) (AuthenticatedSession, error) { return validSession(), nil },
-			route:   func(string) (routing.Route, error) { return routing.Route{}, nil },
+			route:   func(context.Context, string) (routing.Route, error) { return routing.Route{}, nil },
 			code:    CodeInvalidRequest,
 		},
 		{
@@ -285,7 +390,7 @@ func TestCheckFailsClosedBeforeDecision(t *testing.T) {
 				return validPrepared(t), nil
 			},
 			session: func(context.Context) (AuthenticatedSession, error) { return AuthenticatedSession{}, ErrNoSession },
-			route:   func(string) (routing.Route, error) { return routing.Route{}, nil },
+			route:   func(context.Context, string) (routing.Route, error) { return routing.Route{}, nil },
 			code:    CodeMissingIdentity,
 		},
 		{
@@ -293,8 +398,10 @@ func TestCheckFailsClosedBeforeDecision(t *testing.T) {
 				return validPrepared(t), nil
 			},
 			session: func(context.Context) (AuthenticatedSession, error) { return validSession(), nil },
-			route:   func(string) (routing.Route, error) { return routing.Route{}, routing.ErrUnknownTarget },
-			code:    CodeUnknownRoute,
+			route: func(context.Context, string) (routing.Route, error) {
+				return routing.Route{}, routing.ErrUnknownTarget
+			},
+			code: CodeUnknownRoute,
 		},
 	}
 	for _, test := range tests {
@@ -321,7 +428,7 @@ func TestSessionStoreOutageIsNotMisreportedAsMissingLogin(t *testing.T) {
 		sessionSourceFunc(func(context.Context) (AuthenticatedSession, error) {
 			return AuthenticatedSession{}, errors.New("storage outage with raw-secret")
 		}),
-		routeResolverFunc(func(string) (routing.Route, error) {
+		routeResolverFunc(func(context.Context, string) (routing.Route, error) {
 			t.Fatal("route called")
 			return routing.Route{}, nil
 		}),
@@ -370,6 +477,28 @@ func TestCheckFailsClosedOnDecisionFailuresAndMalformedCombinations(t *testing.T
 	}
 }
 
+func TestTypedNilOutcomeErrorsFailClosedWithoutPanic(t *testing.T) {
+	var typedNil *decision.OutcomeError
+	for _, test := range []struct {
+		name string
+		err  error
+	}{
+		{"direct", typedNil},
+		{"wrapped", wrappedError{inner: typedNil}},
+		{"multiply wrapped", wrappedError{inner: wrappedError{inner: typedNil}}},
+		{"adversarial As", adversarialAsError{}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			got := pipeline(t, func(context.Context, DecisionRequest) (protocol.AuthorizationDecision, error) {
+				return protocol.AuthorizationDecision{}, test.err
+			}).Check(context.Background(), validInput())
+			if got.Allowed || got.Outcome != OutcomeError || got.Code != CodeInvalidDecision {
+				t.Fatalf("result = %#v", got)
+			}
+		})
+	}
+}
+
 func TestCheckRejectsInvalidTrustedIdentityAndCannotSourceItFromAdapter(t *testing.T) {
 	input := validInput()
 	input.Action.Adapter.ID = "registered-admin"
@@ -384,7 +513,7 @@ func TestCheckRejectsInvalidTrustedIdentityAndCannotSourceItFromAdapter(t *testi
 				return validPrepared(t), nil
 			}),
 			sessionSourceFunc(func(context.Context) (AuthenticatedSession, error) { return session, nil }),
-			routeResolverFunc(func(string) (routing.Route, error) {
+			routeResolverFunc(func(context.Context, string) (routing.Route, error) {
 				return routing.Route{Destination: "https://decision.example"}, nil
 			}),
 			deciderFunc(func(context.Context, DecisionRequest) (protocol.AuthorizationDecision, error) {
@@ -445,7 +574,7 @@ func TestCancellationStopsEachStageAndNeverAllows(t *testing.T) {
 					}
 					return validSession(), ctx.Err()
 				}),
-				routeResolverFunc(func(target string) (routing.Route, error) {
+				routeResolverFunc(func(_ context.Context, target string) (routing.Route, error) {
 					if stage == "route" {
 						cancel()
 					}
@@ -467,6 +596,90 @@ func TestCancellationStopsEachStageAndNeverAllows(t *testing.T) {
 				t.Fatalf("decision calls = %d", decideCalls.Load())
 			}
 		})
+	}
+}
+
+func TestBlockingRouteResolverHonorsCancellationWithoutDetachedWork(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	started := make(chan struct{})
+	returned := make(chan struct{})
+	checker := New(
+		normalizerFunc(func(context.Context, NormalizationRequest) (normalize.Prepared, error) {
+			return validPrepared(t), nil
+		}),
+		sessionSourceFunc(func(context.Context) (AuthenticatedSession, error) { return validSession(), nil }),
+		routeResolverFunc(func(ctx context.Context, _ string) (routing.Route, error) {
+			close(started)
+			defer close(returned)
+			<-ctx.Done()
+			return routing.Route{}, ctx.Err()
+		}),
+		deciderFunc(func(context.Context, DecisionRequest) (protocol.AuthorizationDecision, error) {
+			t.Fatal("decide called")
+			return protocol.AuthorizationDecision{}, nil
+		}),
+	)
+	result := make(chan Result, 1)
+	go func() { result <- checker.Check(ctx, validInput()) }()
+	<-started
+	cancel()
+	select {
+	case got := <-result:
+		if got.Allowed || got.Code != CodeAuthorizationUnavailable {
+			t.Fatalf("result = %#v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("check did not return after route cancellation")
+	}
+	select {
+	case <-returned:
+	case <-time.After(time.Second):
+		t.Fatal("route work leaked after check returned")
+	}
+}
+
+func TestRouteResolverAlwaysReceivesBoundedCallerContext(t *testing.T) {
+	now := time.Now()
+	checker := New(
+		normalizerFunc(func(context.Context, NormalizationRequest) (normalize.Prepared, error) {
+			return validPrepared(t), nil
+		}),
+		sessionSourceFunc(func(context.Context) (AuthenticatedSession, error) { return validSession(), nil }),
+		routeResolverFunc(func(ctx context.Context, target string) (routing.Route, error) {
+			deadline, ok := ctx.Deadline()
+			if !ok || deadline.Before(now) || deadline.After(now.Add(MaxCheckDuration+time.Second)) {
+				t.Fatalf("resolver deadline = %v, present = %t", deadline, ok)
+			}
+			return routing.Route{Target: target, Destination: "https://decision.example"}, nil
+		}),
+		deciderFunc(func(_ context.Context, request DecisionRequest) (protocol.AuthorizationDecision, error) {
+			return validDecision(request.Action, protocol.DecisionOutcomeAllow), nil
+		}),
+	)
+	if got := checker.Check(context.Background(), validInput()); !got.Allowed {
+		t.Fatalf("result = %#v", got)
+	}
+}
+
+func TestTableRouteResolverAdaptsProductionRoutingTableAndHonorsContext(t *testing.T) {
+	table, err := routing.New([]routing.Route{{
+		Target: "github.example.com", Destination: "https://decision.example",
+	}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	resolver := NewTableRouteResolver(table)
+	route, err := resolver.Resolve(context.Background(), "GITHUB.EXAMPLE.COM.")
+	if err != nil || route.Destination != "https://decision.example" {
+		t.Fatalf("route %#v, error %v", route, err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	if _, err := resolver.Resolve(ctx, "github.example.com"); !errors.Is(err, context.Canceled) {
+		t.Fatalf("canceled error = %v", err)
+	}
+	if NewTableRouteResolver(nil) != nil {
+		t.Fatal("nil routing table accepted")
 	}
 }
 
@@ -506,6 +719,30 @@ func TestNewRejectsMissingDependenciesAndNilContextFailsClosed(t *testing.T) {
 	}
 }
 
+func TestTypedNilContextsFailClosedWithoutCallingMethods(t *testing.T) {
+	var ctx *typedNilContext
+	var calls atomic.Int32
+	checker := pipeline(t, func(context.Context, DecisionRequest) (protocol.AuthorizationDecision, error) {
+		calls.Add(1)
+		return protocol.AuthorizationDecision{}, nil
+	})
+	if got := checker.Check(ctx, validInput()); got.Allowed || got.Code != CodeAuthorizationUnavailable {
+		t.Fatalf("check result = %#v", got)
+	}
+	remote := NewRemoteDecider(clientSelectorFunc(func(
+		context.Context, string, AuthenticatedSession,
+	) (ProtocolClient, error) {
+		calls.Add(1)
+		return nil, nil
+	}))
+	if _, err := remote.Decide(ctx, DecisionRequest{}); !errors.Is(err, decision.ErrUnavailable) {
+		t.Fatalf("remote error = %v", err)
+	}
+	if calls.Load() != 0 {
+		t.Fatalf("downstream calls = %d", calls.Load())
+	}
+}
+
 func TestDeadlineAlreadyExpiredSkipsPipeline(t *testing.T) {
 	ctx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
@@ -516,7 +753,9 @@ func TestDeadlineAlreadyExpiredSkipsPipeline(t *testing.T) {
 			return validPrepared(t), nil
 		}),
 		sessionSourceFunc(func(context.Context) (AuthenticatedSession, error) { return validSession(), nil }),
-		routeResolverFunc(func(string) (routing.Route, error) { return routing.Route{}, nil }),
+		routeResolverFunc(func(context.Context, string) (routing.Route, error) {
+			return routing.Route{}, nil
+		}),
 		deciderFunc(func(context.Context, DecisionRequest) (protocol.AuthorizationDecision, error) {
 			return protocol.AuthorizationDecision{}, nil
 		}),

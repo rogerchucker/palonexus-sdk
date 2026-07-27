@@ -10,6 +10,7 @@ import (
 	"reflect"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/rogerchucker/palonexus-sdk/guard/internal/decision"
 	"github.com/rogerchucker/palonexus-sdk/guard/internal/normalize"
@@ -26,8 +27,16 @@ type NormalizationRequest struct {
 	Opaque  any
 }
 
-// Input contains caller-visible action metadata. Adapter is diagnostic only.
-// Authenticated identity is obtained independently through SessionSource.
+// Input spans two trust domains:
+//   - Normalization.Opaque, Action.Context, and every Extensions map are
+//     caller-owned payloads. They are consumed locally or discarded and never
+//     forwarded to the decision authority.
+//   - Action's scalar protocol envelope is locally assigned metadata. Check
+//     copies only an explicit allowlist of those scalars into the wire request.
+//
+// Adapter ID/version scalars are preserved solely as protocol-required
+// diagnostic labels. Authenticated identity is obtained independently through
+// SessionSource and is never selected from Action.
 type Input struct {
 	Normalization NormalizationRequest
 	RouteTarget   string
@@ -52,7 +61,33 @@ type SessionSource interface {
 }
 
 type RouteResolver interface {
-	Resolve(string) (routing.Route, error)
+	// Resolve must honor ctx and return promptly after cancellation. Checker
+	// invokes it synchronously and never detaches resolver work.
+	Resolve(context.Context, string) (routing.Route, error)
+}
+
+// TableRouteResolver adapts the production immutable routing table to the
+// context-aware pipeline boundary. Table lookup is bounded CPU-only work.
+type TableRouteResolver struct{ table *routing.Table }
+
+func NewTableRouteResolver(table *routing.Table) *TableRouteResolver {
+	if table == nil {
+		return nil
+	}
+	return &TableRouteResolver{table: table}
+}
+
+func (r *TableRouteResolver) Resolve(
+	ctx context.Context,
+	target string,
+) (routing.Route, error) {
+	if r == nil || r.table == nil || isNil(ctx) {
+		return routing.Route{}, context.Canceled
+	}
+	if err := ctx.Err(); err != nil {
+		return routing.Route{}, err
+	}
+	return r.table.Resolve(target)
 }
 
 // DecisionRequest binds the authenticated identity and selected authority to
@@ -92,7 +127,7 @@ func (d *RemoteDecider) Decide(
 	ctx context.Context,
 	request DecisionRequest,
 ) (protocol.AuthorizationDecision, error) {
-	if d == nil || ctx == nil || ctx.Err() != nil {
+	if d == nil || isNil(ctx) || ctx.Err() != nil {
 		return protocol.AuthorizationDecision{}, decision.ErrUnavailable
 	}
 	client, err := d.clients.Client(ctx, request.Destination, request.Session)
@@ -105,6 +140,8 @@ func (d *RemoteDecider) Decide(
 }
 
 var ErrNoSession = errors.New("no authenticated session")
+
+const MaxCheckDuration = 15 * time.Second
 
 type Outcome string
 
@@ -215,9 +252,11 @@ func validateSession(session AuthenticatedSession) bool {
 }
 
 func (c *Checker) Check(ctx context.Context, input Input) Result {
-	if c == nil || ctx == nil || ctx.Err() != nil {
+	if c == nil || isNil(ctx) || ctx.Err() != nil {
 		return failure(CodeAuthorizationUnavailable)
 	}
+	ctx, cancel := context.WithTimeout(ctx, MaxCheckDuration)
+	defer cancel()
 
 	prepared, err := c.normalizer.Normalize(ctx, input.Normalization)
 	if err != nil {
@@ -247,7 +286,7 @@ func (c *Checker) Check(ctx context.Context, input Input) Result {
 		return failure(CodeAuthorizationUnavailable)
 	}
 
-	route, err := c.routes.Resolve(input.RouteTarget)
+	route, err := c.routes.Resolve(ctx, input.RouteTarget)
 	if err != nil || route.Destination == "" {
 		if ctx.Err() != nil {
 			return failure(CodeAuthorizationUnavailable)
@@ -262,8 +301,7 @@ func (c *Checker) Check(ctx context.Context, input Input) Result {
 	if err != nil {
 		return failure(CodeInvalidRequest)
 	}
-	action := input.Action
-	action.Target = target
+	action := sanitizedAction(input.Action, target)
 	if err := action.ValidateStructural(); err != nil {
 		return failure(CodeInvalidRequest)
 	}
@@ -285,6 +323,40 @@ func (c *Checker) Check(ctx context.Context, input Input) Result {
 	return renderDecision(action, value, decideErr)
 }
 
+func sanitizedAction(source protocol.ActionRequest, target protocol.ActionTarget) protocol.ActionRequest {
+	result := protocol.ActionRequest{
+		SchemaVersion:  source.SchemaVersion,
+		ActionID:       source.ActionID,
+		RequestID:      source.RequestID,
+		CorrelationID:  source.CorrelationID,
+		IdempotencyKey: source.IdempotencyKey,
+		Adapter: protocol.Adapter{
+			ID: source.Adapter.ID, Version: source.Adapter.Version,
+			HostVersion: source.Adapter.HostVersion,
+		},
+		Task: protocol.TaskBinding{
+			TaskID: source.Task.TaskID, SessionID: source.Task.SessionID,
+		},
+		Action:     source.Action,
+		Target:     target,
+		SideEffect: source.SideEffect,
+		OccurredAt: source.OccurredAt,
+		// Context is protocol-required but no context producer is trusted by
+		// this pipeline yet. Keep the object empty rather than forwarding
+		// caller display strings, paths, repository names, or tool labels.
+		Context: protocol.ActionContext{},
+	}
+	if source.CausationID != nil {
+		value := *source.CausationID
+		result.CausationID = &value
+	}
+	if source.ResumeFromApprovalID != nil {
+		value := *source.ResumeFromApprovalID
+		result.ResumeFromApprovalID = &value
+	}
+	return result
+}
+
 func renderDecision(
 	request protocol.ActionRequest,
 	value protocol.AuthorizationDecision,
@@ -293,6 +365,9 @@ func renderDecision(
 	if err != nil {
 		var outcome *decision.OutcomeError
 		if errors.As(err, &outcome) {
+			if outcome == nil {
+				return failure(CodeInvalidDecision)
+			}
 			if !reflect.DeepEqual(outcome.Decision, value) ||
 				!validDecisionForRequest(request, value) {
 				return failure(CodeInvalidDecision)
