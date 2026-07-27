@@ -10,6 +10,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 	"net"
 	"net/url"
 	"path"
@@ -41,9 +42,14 @@ func (e *Error) Error() string { return "canonicalization failed: " + e.Code }
 func fail(code string) error { return &Error{Code: code} }
 
 type Prepared struct {
-	Resource  protocol.SafeText
-	Execution any
+	Resource  protocol.SafeText `json:"resource"`
+	execution any
 }
+
+// SensitiveExecution returns the exact normalized value the host must execute.
+// It may contain credentials or raw tool input and MUST NOT be logged,
+// serialized, reflected, or included in errors.
+func (p Prepared) SensitiveExecution() any { return p.execution }
 
 // String is intentionally diagnostic-only and never renders Execution.
 func (p Prepared) String() string {
@@ -53,10 +59,26 @@ func (p Prepared) String() string {
 // GoString keeps %#v log formatting from exposing Execution.
 func (p Prepared) GoString() string { return p.String() }
 
+func (p Prepared) MarshalJSON() ([]byte, error) {
+	return json.Marshal(struct {
+		Resource protocol.SafeText `json:"resource"`
+	}{Resource: p.Resource})
+}
+
+func (p Prepared) LogValue() slog.Value {
+	return slog.GroupValue(slog.String("resource", string(p.Resource)))
+}
+
 // Target derives the protocol target and its typed resource-preimage hash.
 func (p Prepared) Target(kind protocol.TargetKind, service string) (protocol.ActionTarget, error) {
-	if service == "" || len(service) > MaxStringBytes || !utf8.ValidString(service) {
+	if !validTargetKind(kind) {
+		return protocol.ActionTarget{}, fail("invalid_target_kind")
+	}
+	if !validService(service) {
 		return protocol.ActionTarget{}, fail("invalid_service")
+	}
+	if err := validateResource(p.Resource); err != nil {
+		return protocol.ActionTarget{}, err
 	}
 	preimage := map[string]any{
 		"preimageType": "palonexus.resource", "preimageVersion": "1",
@@ -70,6 +92,55 @@ func (p Prepared) Target(kind protocol.TargetKind, service string) (protocol.Act
 		Kind: kind, Service: service, Resource: p.Resource,
 		ResourceHash: protocol.SHA256Digest(hashBytes(encoded)),
 	}, nil
+}
+
+var servicePattern = regexp.MustCompile(
+	`^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*$`,
+)
+
+func validTargetKind(kind protocol.TargetKind) bool {
+	return kind == protocol.TargetKindLocalAction ||
+		kind == protocol.TargetKindMCPTool ||
+		kind == protocol.TargetKindTool
+}
+
+func validService(service string) bool {
+	return utf8.ValidString(service) && utf8.RuneCountInString(service) <= 253 &&
+		!hasUnsafeText(service) && servicePattern.MatchString(service)
+}
+
+func hasUnsafeText(value string) bool {
+	for _, r := range value {
+		if r <= 0x1f || r >= 0x7f && r <= 0x9f ||
+			r == 0x061c || r == 0x200e || r == 0x200f ||
+			r >= 0x2028 && r <= 0x202e || r >= 0x2066 && r <= 0x2069 {
+			return true
+		}
+	}
+	return false
+}
+
+func validateResource(resource protocol.SafeText) error {
+	value := string(resource)
+	if !utf8.ValidString(value) || value == "" ||
+		utf8.RuneCountInString(value) > 2048 || hasUnsafeText(value) ||
+		strings.Contains(value, "\\") {
+		return fail("invalid_resource")
+	}
+	for _, segment := range strings.Split(value, "/") {
+		if segment == "." || segment == ".." {
+			return fail("invalid_resource")
+		}
+	}
+	return nil
+}
+
+func prepared(resource []byte, execution any) (Prepared, error) {
+	result := Prepared{Resource: protocol.SafeText(resource), execution: execution}
+	if err := validateResource(result.Resource); err != nil {
+		return Prepared{}, err
+	}
+	return result, nil
 }
 
 func normalizeString(value, code string) (string, error) {
@@ -112,7 +183,7 @@ func Path(value, cwd string) (Prepared, error) {
 	if value == "." {
 		value = "/"
 	}
-	return Prepared{Resource: protocol.SafeText("path:" + value), Execution: value}, nil
+	return prepared([]byte("path:"+value), value)
 }
 
 func hashBytes(value []byte) string {
@@ -408,7 +479,7 @@ func URL(value string, additionalSensitive []string) (Prepared, error) {
 	if err != nil {
 		return Prepared{}, err
 	}
-	return Prepared{Resource: protocol.SafeText(resource), Execution: execution}, nil
+	return prepared(resource, execution)
 }
 
 func canonicalURL(raw string, additional []string, hide bool) (string, error) {
@@ -508,12 +579,25 @@ func unicode151AssignedIDNALabel(value string) bool {
 	if value == "" {
 		return false
 	}
+	hasExtensionI := false
+	var compatible strings.Builder
 	for _, r := range value {
-		if r < 0x2EBF0 || r > 0x2EE5D {
-			return false
+		if r >= 0x2EBF0 && r <= 0x2EE5D {
+			hasExtensionI = true
+			// Extension-I scalars share the IDNA properties of established
+			// unified ideographs. Substitute one only for x/net's context,
+			// bidi, and label validation; exact original punycode round-trip
+			// remains mandatory at the caller.
+			compatible.WriteRune('中')
+		} else {
+			compatible.WriteRune(r)
 		}
 	}
-	return true
+	if !hasExtensionI {
+		return false
+	}
+	_, err := idna2008.ToASCII(compatible.String())
+	return err == nil
 }
 
 func hasControl(value string) bool {
@@ -726,7 +810,7 @@ func Shell(command string, additional []string) (Prepared, error) {
 	if err != nil {
 		return Prepared{}, err
 	}
-	return Prepared{Resource: protocol.SafeText(resource), Execution: command}, nil
+	return prepared(resource, command)
 }
 
 // tokenizeShell performs only POSIX quote/escape/whitespace tokenization.
@@ -735,11 +819,15 @@ func Shell(command string, additional []string) (Prepared, error) {
 func tokenizeShell(command string) ([]string, error) {
 	var tokens []string
 	var current strings.Builder
-	inSingle, inDouble, escaped, started := false, false, false, false
+	inSingle, inDouble, escaped, escapedInDouble, started := false, false, false, false, false
 	for _, r := range command {
 		if escaped {
+			if escapedInDouble && r != '"' && r != '\\' {
+				current.WriteByte('\\')
+			}
 			current.WriteRune(r)
 			escaped = false
+			escapedInDouble = false
 			started = true
 			continue
 		}
@@ -757,6 +845,7 @@ func tokenizeShell(command string) ([]string, error) {
 				inDouble = false
 			case '\\':
 				escaped = true
+				escapedInDouble = true
 			default:
 				current.WriteRune(r)
 			}
@@ -772,7 +861,7 @@ func tokenizeShell(command string) ([]string, error) {
 			case r == '"':
 				inDouble = true
 				started = true
-			case unicode.IsSpace(r):
+			case r == ' ' || r == '\t' || r == '\r' || r == '\n':
 				if started {
 					tokens = append(tokens, current.String())
 					current.Reset()
@@ -878,8 +967,8 @@ func MCPJSON(server, tool string, input []byte) (Prepared, error) {
 	if err := decoder.Decode(&executionInput); err != nil {
 		return Prepared{}, fail("invalid_json")
 	}
-	return Prepared{
-		Resource:  protocol.SafeText("mcp:" + server + "/" + tool + "#" + hashBytes(canonical)),
-		Execution: map[string]any{"server": server, "tool": tool, "input": executionInput},
-	}, nil
+	return prepared(
+		[]byte("mcp:"+server+"/"+tool+"#"+hashBytes(canonical)),
+		map[string]any{"server": server, "tool": tool, "input": executionInput},
+	)
 }

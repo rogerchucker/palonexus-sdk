@@ -6,6 +6,7 @@ import base64
 import csv
 import hashlib
 import json
+import os
 import re
 import subprocess
 import sys
@@ -824,46 +825,76 @@ def _public_go_module_path(module: str) -> bool:
 
 
 def _go_requirements(
-    contents: str, relative: Path, errors: list[str]
+    manifest: Path, relative: Path, errors: list[str]
 ) -> dict[str, str]:
     requirements: dict[str, str] = {}
-    in_block = False
-    for line_number, raw_line in enumerate(contents.splitlines(), start=1):
-        stripped = raw_line.strip()
-        if not stripped or stripped.startswith("//"):
-            continue
-        if re.match(r"^(replace|exclude|retract|tool)\b", stripped):
-            errors.append(f"Go module replacements are not allowed: {relative}")
-            continue
-        if stripped == "require (":
-            if in_block:
-                errors.append(f"malformed Go require block: {relative}")
-            in_block = True
-            continue
-        if in_block and stripped == ")":
-            in_block = False
-            continue
-        if stripped.startswith(("module ", "go ", "toolchain ")):
-            continue
-        requirement = (
-            stripped
-            if in_block
-            else (
-                stripped.removeprefix("require ").strip()
-                if stripped.startswith("require ")
-                else ""
-            )
+    environment = os.environ.copy()
+    environment.update({"GOTOOLCHAIN": "local", "GOPROXY": "off", "GOSUMDB": "off"})
+    try:
+        result = subprocess.run(
+            ["go", "mod", "edit", "-json", str(manifest)],
+            cwd=manifest.parent,
+            env=environment,
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=10,
         )
-        if not requirement:
-            # Syntax outside dependency directives belongs to Go itself and is
-            # irrelevant unless it mutates dependency resolution.
+    except (FileNotFoundError, subprocess.TimeoutExpired) as exc:
+        errors.append(f"cannot parse Go dependency manifest {relative}: {exc}")
+        return requirements
+    if result.returncode:
+        errors.append(f"cannot parse Go dependency manifest {relative}")
+        return requirements
+    try:
+        document = json.loads(result.stdout)
+    except json.JSONDecodeError:
+        errors.append(f"cannot parse Go dependency manifest {relative}")
+        return requirements
+    allowed_fields = {
+        "Module",
+        "Go",
+        "Toolchain",
+        "Require",
+        "Exclude",
+        "Replace",
+        "Retract",
+        "Tool",
+        "Ignore",
+    }
+    if not isinstance(document, dict) or set(document) - allowed_fields:
+        errors.append(f"unknown Go dependency manifest fields: {relative}")
+        return requirements
+    module_record = document.get("Module")
+    if (
+        not isinstance(module_record, dict)
+        or not isinstance(module_record.get("Path"), str)
+        or not isinstance(document.get("Go"), str)
+    ):
+        errors.append(f"Go module and go directives are required: {relative}")
+        return requirements
+    if any(
+        document.get(field)
+        for field in ("Exclude", "Replace", "Retract", "Tool", "Ignore")
+    ):
+        errors.append(f"Go dependency graph directives are not allowed: {relative}")
+    raw_requirements = document.get("Require") or []
+    if not isinstance(raw_requirements, list):
+        errors.append(f"malformed Go requirements: {relative}")
+        return requirements
+    for record in raw_requirements:
+        if not isinstance(record, dict) or set(record) - {
+            "Path",
+            "Version",
+            "Indirect",
+        }:
+            errors.append(f"malformed Go requirement: {relative}")
             continue
-        requirement = requirement.split("//", 1)[0].strip()
-        fields = requirement.split()
-        if len(fields) != 2:
-            errors.append(f"malformed Go requirement: {relative}:{line_number}")
+        module = record.get("Path")
+        version = record.get("Version")
+        if not isinstance(module, str) or not isinstance(version, str):
+            errors.append(f"malformed Go requirement: {relative}")
             continue
-        module, version = fields
         if not _public_go_module_path(module):
             errors.append(f"private or non-public Go module path: {module}")
             continue
@@ -874,8 +905,6 @@ def _go_requirements(
             errors.append(f"duplicate Go module requirement: {module}")
             continue
         requirements[module] = version
-    if in_block:
-        errors.append(f"unterminated Go require block: {relative}")
     return requirements
 
 
@@ -896,17 +925,25 @@ def _go_dependencies(errors: list[str]) -> dict[str, str]:
         for path in ROOT.rglob("go.mod")
         if not IGNORED_PARTS.intersection(path.relative_to(ROOT).parts)
     ]
+    manifest_directories = {path.parent for path in manifests}
+    for sum_path in ROOT.rglob("go.sum"):
+        relative = sum_path.relative_to(ROOT)
+        if (
+            not IGNORED_PARTS.intersection(relative.parts)
+            and sum_path.parent not in manifest_directories
+        ):
+            errors.append(f"Go checksum file has no dependency manifest: {relative}")
     for manifest in manifests:
         relative = manifest.relative_to(ROOT)
         if manifest.is_symlink():
             errors.append(f"dependency manifest symlink is not allowed: {relative}")
             continue
         try:
-            contents = manifest.read_text(encoding="utf-8")
+            manifest.read_text(encoding="utf-8")
         except (OSError, UnicodeError) as exc:
             errors.append(f"cannot read dependency manifest {relative}: {exc}")
             continue
-        requirements = _go_requirements(contents, relative, errors)
+        requirements = _go_requirements(manifest, relative, errors)
         for module, version in requirements.items():
             if module in dependencies and dependencies[module] != version:
                 errors.append(f"conflicting Go module requirement: {module}")

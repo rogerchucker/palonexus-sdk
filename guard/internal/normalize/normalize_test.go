@@ -2,13 +2,18 @@
 package normalize
 
 import (
+	"bytes"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/rogerchucker/palonexus-sdk/guard/pkg/protocol"
 )
@@ -25,7 +30,7 @@ func TestPathMatchesProtocolVector(t *testing.T) {
 	}
 	for _, tc := range cases {
 		got, err := Path(tc.path, tc.cwd)
-		if err != nil || got.Execution != tc.want || string(got.Resource) != "path:"+tc.want {
+		if err != nil || got.SensitiveExecution() != tc.want || string(got.Resource) != "path:"+tc.want {
 			t.Fatalf("Path(%q): got %#v, %v; want %q", tc.path, got, err, tc.want)
 		}
 	}
@@ -55,8 +60,8 @@ func TestURLMatchesProtocolVectorAndKeepsExecutionSecretPrivate(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Execution != "https://example.com/b?a=2&a=1&token=raw-secret&z=last" {
-		t.Fatalf("unexpected execution URL: %#v", got.Execution)
+	if got.SensitiveExecution() != "https://example.com/b?a=2&a=1&token=raw-secret&z=last" {
+		t.Fatalf("unexpected execution URL")
 	}
 	if strings.Contains(fmt.Sprintf("%v %#v", got, got), "raw-secret") {
 		t.Fatal("log-safe prepared representation exposed execution secret")
@@ -65,8 +70,8 @@ func TestURLMatchesProtocolVectorAndKeepsExecutionSecretPrivate(t *testing.T) {
 	if strings.Contains(resource, "raw-secret") || !strings.Contains(resource, "token=%5BREDACTED%5D") {
 		t.Fatalf("resource is not safely redacted: %s", resource)
 	}
-	gotAgain, err := URL(got.Execution.(string), nil)
-	if err != nil || gotAgain.Resource != got.Resource || gotAgain.Execution != got.Execution {
+	gotAgain, err := URL(got.SensitiveExecution().(string), nil)
+	if err != nil || gotAgain.Resource != got.Resource || gotAgain.SensitiveExecution() != got.SensitiveExecution() {
 		t.Fatalf("URL normalization is not idempotent: %#v, %v", gotAgain, err)
 	}
 }
@@ -133,7 +138,7 @@ func TestShellRedactsSecretsAndBindsRawCommand(t *testing.T) {
 	if left.Resource == right.Resource {
 		t.Fatal("different commands collided after redaction")
 	}
-	if left.Execution != `curl -H "Authorization: Bearer raw-secret" "https://example.com/run?token=raw-secret" --password raw-secret` {
+	if left.SensitiveExecution() != `curl -H "Authorization: Bearer raw-secret" "https://example.com/run?token=raw-secret" --password raw-secret` {
 		t.Fatal("prepared execution was not retained privately")
 	}
 }
@@ -169,6 +174,150 @@ func TestShellTokenizerDoesNotInterpretCommentsOrOperators(t *testing.T) {
 	want := []string{"echo", "#", "literal", "&&", "printf", "ok"}
 	if fmt.Sprint(resource.Tokens) != fmt.Sprint(want) {
 		t.Fatalf("shell input was semantically parsed: got %v, want %v", resource.Tokens, want)
+	}
+}
+
+func TestShellTokenizerMatchesFrozenPOSIXCorpus(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		command string
+		want    []string
+	}{
+		{"", nil},
+		{" \t\r\n ", nil},
+		{`'' "" a''b`, []string{"", "", "ab"}},
+		{`echo # literal && printf ok`, []string{"echo", "#", "literal", "&&", "printf", "ok"}},
+		{`a\ b c`, []string{"a b", "c"}},
+		{`a\\b`, []string{`a\b`}},
+		{`\# x`, []string{"#", "x"}},
+		{`"a\"b"`, []string{`a"b`}},
+		{`"a\\b"`, []string{`a\b`}},
+		{`"a\qb"`, []string{`a\qb`}},
+		{`"a\$b"`, []string{`a\$b`}},
+		{`'a\b'`, []string{`a\b`}},
+		{"a\u00a0b a\u2003b", []string{"a\u00a0b", "a\u2003b"}},
+	}
+	for _, tc := range cases {
+		got, err := tokenizeShell(tc.command)
+		if err != nil || fmt.Sprint(got) != fmt.Sprint(tc.want) {
+			t.Fatalf("tokenizeShell corpus mismatch: got %q, %v; want %q", got, err, tc.want)
+		}
+	}
+	for _, malformed := range []string{`echo \`, `echo 'unterminated`, `echo "unterminated`} {
+		if _, err := tokenizeShell(malformed); err == nil {
+			t.Fatal("accepted malformed shell quoting")
+		}
+	}
+}
+
+func TestShellTokenizerDifferentialAgainstPythonReference(t *testing.T) {
+	commands := []string{
+		"", `'' "" a''b`, `echo # literal && printf ok`, `a\ b c`,
+		`"a\"b"`, `"a\\b"`, `"a\qb"`, `"a\$b"`, `'a\b'`,
+		"a\u00a0b a\u2003b", "line\\\ncontinued",
+		`echo \`, `echo 'unterminated`, `echo "unterminated`,
+	}
+	input, err := json.Marshal(commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	script := `import json,sys
+from protocol.reference.canonicalize import canonicalize_shell
+items=json.load(sys.stdin)
+print(json.dumps([canonicalize_shell(x)["tokens"] for x in items]))`
+	command := exec.CommandContext(
+		ctx, "uv", "run", "--frozen", "--offline", "--no-sync",
+		"python", "-c", script,
+	)
+	command.Dir = filepath.Join("..", "..", "..")
+	command.Stdin = bytes.NewReader(input)
+	output, err := command.Output()
+	if err != nil {
+		t.Fatalf("Python differential oracle failed: %v", err)
+	}
+	if len(output) > 64*1024 {
+		t.Fatal("Python differential oracle output exceeded bound")
+	}
+	var expected [][]string
+	if err := json.Unmarshal(output, &expected); err != nil || len(expected) != len(commands) {
+		t.Fatalf("invalid Python differential output: %v", err)
+	}
+	for index, shellCommand := range commands {
+		got, tokenErr := tokenizeShell(shellCommand)
+		if tokenErr != nil {
+			got = []string{"[UNPARSEABLE]"}
+		}
+		if fmt.Sprint(got) != fmt.Sprint(expected[index]) {
+			t.Fatalf("shell parity mismatch at %d: got %q, want %q", index, got, expected[index])
+		}
+	}
+}
+
+func TestResourceDifferentialAgainstPythonReference(t *testing.T) {
+	const script = `import json,sys
+from protocol.reference.canonicalize import (
+ canonical_json,parse_json,prepare_mcp_resource,prepare_path_resource,prepare_url_resource
+)
+data=json.load(sys.stdin)
+mcp=prepare_mcp_resource(data["server"],data["tool"],parse_json(data["mcp"]))
+path=prepare_path_resource(data["path"],cwd=data["cwd"])
+url=prepare_url_resource(data["url"])
+print(json.dumps({
+ "json":canonical_json(parse_json(data["json"])).decode(),
+ "mcp_resource":mcp.resource,
+ "path_resource":path.resource,"path_execution":path.execution,
+ "url_resource":url.resource,"url_execution":url.execution,
+}))`
+	input := map[string]string{
+		"json":   `{"e\u0301":"Cafe\u0301","n":1.0}`,
+		"server": "github", "tool": "issues.create",
+		"mcp":  `{"title":"Cafe\u0301","priority":1.0}`,
+		"path": `src/../Café.txt`, "cwd": "/workspace",
+		"url": `HTTPS://Example.COM:443/a/../Caf%C3%A9?token=raw-secret&b=2&a=1`,
+	}
+	encoded, _ := json.Marshal(input)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	command := exec.CommandContext(
+		ctx, "uv", "run", "--frozen", "--offline", "--no-sync",
+		"python", "-c", script,
+	)
+	command.Dir = filepath.Join("..", "..", "..")
+	command.Stdin = bytes.NewReader(encoded)
+	output, err := command.Output()
+	if err != nil || len(output) > 64*1024 {
+		t.Fatalf("bounded Python resource oracle failed: %v", err)
+	}
+	var expected struct {
+		JSON          string `json:"json"`
+		MCPResource   string `json:"mcp_resource"`
+		PathResource  string `json:"path_resource"`
+		PathExecution string `json:"path_execution"`
+		URLResource   string `json:"url_resource"`
+		URLExecution  string `json:"url_execution"`
+	}
+	if err := json.Unmarshal(output, &expected); err != nil {
+		t.Fatal(err)
+	}
+	canonical, err := CanonicalJSON([]byte(input["json"]))
+	if err != nil || string(canonical) != expected.JSON {
+		t.Fatal("canonical JSON differs from Python reference")
+	}
+	mcp, err := MCPJSON(input["server"], input["tool"], []byte(input["mcp"]))
+	if err != nil || string(mcp.Resource) != expected.MCPResource {
+		t.Fatal("MCP differs from Python reference")
+	}
+	pathValue, err := Path(input["path"], input["cwd"])
+	if err != nil || string(pathValue.Resource) != expected.PathResource ||
+		pathValue.SensitiveExecution() != expected.PathExecution {
+		t.Fatal("path differs from Python reference")
+	}
+	urlValue, err := URL(input["url"], nil)
+	if err != nil || string(urlValue.Resource) != expected.URLResource ||
+		urlValue.SensitiveExecution() != expected.URLExecution {
+		t.Fatal("URL differs from Python reference")
 	}
 }
 
@@ -228,7 +377,7 @@ func TestIDNA2008Vector(t *testing.T) {
 	}
 	for raw, want := range accepted {
 		got, err := URL(raw, nil)
-		if err != nil || got.Execution != want {
+		if err != nil || got.SensitiveExecution() != want {
 			t.Fatalf("URL IDNA accepted vector: got %#v, %v; want %s", got, err, want)
 		}
 	}
@@ -244,14 +393,36 @@ func TestIDNA2008Vector(t *testing.T) {
 	}
 }
 
+func TestIDNAUnicode151ExceptionComposesWithOtherwiseValidScalars(t *testing.T) {
+	t.Parallel()
+	for raw, want := range map[string]string{
+		"https://xn--a-8n62a.example/":  "https://xn--a-8n62a.example/",
+		"https://xn--a-7n62a.example/":  "https://xn--a-7n62a.example/",
+		"https://xn--fiq4244n.example/": "https://xn--fiq4244n.example/",
+	} {
+		got, err := URL(raw, nil)
+		if err != nil || got.SensitiveExecution() != want {
+			t.Fatalf("mixed Unicode 15.1 IDNA label rejected: %v", err)
+		}
+	}
+	for _, raw := range []string{
+		"https://xn--a-ugnv4543a.example/",
+		"https://xn--1ugy703z.example/",
+	} {
+		if _, err := URL(raw, nil); err == nil {
+			t.Fatal("accepted context-invalid mixed IDNA label")
+		}
+	}
+}
+
 func TestMixedPercentRunKeepsReservedBytesEncoded(t *testing.T) {
 	t.Parallel()
 	got, err := URL("https://example.com/%C3%A9%2F", nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Execution != "https://example.com/%C3%A9%2F" {
-		t.Fatalf("reserved escape was decoded: %s", got.Execution)
+	if got.SensitiveExecution() != "https://example.com/%C3%A9%2F" {
+		t.Fatalf("reserved escape was decoded")
 	}
 }
 
@@ -261,8 +432,8 @@ func TestURLQueryIgnoresEmptySeparatorsLikeReference(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got.Execution != "https://example.com/?a=1&b=2" {
-		t.Fatalf("empty query separator changed scope: %s", got.Execution)
+	if got.SensitiveExecution() != "https://example.com/?a=1&b=2" {
+		t.Fatalf("empty query separator changed scope")
 	}
 }
 
@@ -312,6 +483,119 @@ func TestPreparedTargetUsesProtocolTypesAndDeterministicResourceHash(t *testing.
 	}
 	if left != right || left.ResourceHash == "" {
 		t.Fatalf("target is not deterministic: %#v / %#v", left, right)
+	}
+}
+
+func TestPreparedStructuredRepresentationsNeverExposeExecution(t *testing.T) {
+	t.Parallel()
+	for name, prepare := range map[string]func() (Prepared, error){
+		"url": func() (Prepared, error) {
+			return URL("https://example.com/?token=raw-url-secret", nil)
+		},
+		"shell": func() (Prepared, error) {
+			return Shell("deploy --token raw-shell-secret", nil)
+		},
+		"mcp": func() (Prepared, error) {
+			return MCPJSON("github", "issues.create", []byte(`{"token":"raw-mcp-secret"}`))
+		},
+	} {
+		prepared, err := prepare()
+		if err != nil {
+			t.Fatal(err)
+		}
+		jsonValue, err := json.Marshal(prepared)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var logOutput bytes.Buffer
+		logger := slog.New(slog.NewJSONHandler(&logOutput, nil))
+		logger.Info("prepared", "value", prepared)
+		diagnostics := string(jsonValue) + logOutput.String() + fmt.Sprintf("%v %#v", prepared, prepared)
+		if strings.Contains(diagnostics, "raw-") {
+			t.Fatalf("%s structured representation leaked execution: %s", name, diagnostics)
+		}
+		if strings.Contains(string(jsonValue), `"execution":`) {
+			t.Fatalf("%s JSON exposed execution field", name)
+		}
+	}
+}
+
+func TestTargetEnforcesGeneratedSchemaConstraints(t *testing.T) {
+	t.Parallel()
+	prepared, err := Path("file", "/workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	validServices := []string{"a", "service-name", "api.example.com", strings.Repeat("a", 63) + ".com"}
+	for _, service := range validServices {
+		if _, err := prepared.Target(protocol.TargetKindLocalAction, service); err != nil {
+			t.Fatalf("rejected valid service: %v", err)
+		}
+	}
+	for _, kind := range []protocol.TargetKind{"", "unknown", "LOCAL-ACTION"} {
+		if _, err := prepared.Target(kind, "workspace"); err == nil {
+			t.Fatal("accepted unknown target kind")
+		}
+	}
+	for _, service := range []string{
+		"", "-bad", "bad-", "Bad", "bad_name", "a..b",
+		strings.Repeat("a", 64) + ".com", strings.Repeat("a", 254),
+		"bad\x00name",
+	} {
+		if _, err := prepared.Target(protocol.TargetKindLocalAction, service); err == nil {
+			t.Fatal("accepted invalid target service")
+		}
+	}
+	for _, resource := range []protocol.SafeText{
+		"", `path:/workspace\file`, "path:/workspace/../secret",
+		"resource:\x00unsafe", protocol.SafeText(strings.Repeat("x", 2049)),
+	} {
+		unsafe := Prepared{Resource: resource, execution: "private"}
+		if _, err := unsafe.Target(protocol.TargetKindLocalAction, "workspace"); err == nil {
+			t.Fatal("accepted resource outside generated schema")
+		}
+	}
+}
+
+func TestConstructorsRejectResourcesOutsideActionTargetSchema(t *testing.T) {
+	t.Parallel()
+	if _, err := Path(strings.Repeat("a", 2048), "/"); err == nil {
+		t.Fatal("path constructor emitted overlong resource")
+	}
+	if _, err := Shell(strings.Repeat("x ", 1500), nil); err == nil {
+		t.Fatal("shell constructor emitted overlong resource")
+	}
+}
+
+func TestTargetRoundTripsThroughGeneratedActionParser(t *testing.T) {
+	t.Parallel()
+	prepared, err := Path("deploy.yaml", "/workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := prepared.Target(protocol.TargetKindLocalAction, "workspace")
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture, err := os.ReadFile(filepath.Join(
+		"..", "..", "..", "protocol", "test-vectors", "action", "valid", "file-write.json",
+	))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document map[string]any
+	if err := json.Unmarshal(fixture, &document); err != nil {
+		t.Fatal(err)
+	}
+	targetJSON, _ := json.Marshal(target)
+	var targetValue any
+	if err := json.Unmarshal(targetJSON, &targetValue); err != nil {
+		t.Fatal(err)
+	}
+	document["target"] = targetValue
+	encoded, _ := json.Marshal(document)
+	if _, err := protocol.ParseActionRequest(encoded); err != nil {
+		t.Fatalf("prepared target violates generated ActionTarget schema: %v", err)
 	}
 }
 

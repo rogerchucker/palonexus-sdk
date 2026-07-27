@@ -182,5 +182,6 @@ go.sum,rogerchucker/palonexus-sdk,GENERATED,go.mod,PaloNexus,yes,generated,MIT,r
 guard/internal/normalize/normalize.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/normalize/normalize.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/normalize/normalize_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/normalize/normalize_test.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/normalize/fuzz_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/normalize/fuzz_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/normalize/vectors_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/normalize/vectors_test.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/redact/redact.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/redact/redact.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/redact/redact_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/redact/redact_test.go,PaloNexus,yes,new,MIT,rogerchucker

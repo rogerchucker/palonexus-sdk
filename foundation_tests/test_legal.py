@@ -177,19 +177,92 @@ def test_verifier_reconciles_indirect_go_modules(tmp_path: Path) -> None:
 
 
 @pytest.mark.parametrize(
+    "require_block",
+    [
+        "require(\n\tgolang.org/x/text v0.40.0\n)\n",
+        "require\t(\n\tgolang.org/x/text v0.40.0 // indirect\n)\n",
+        "require golang.org/x/text v0.40.0 // direct comment\n",
+    ],
+)
+def test_verifier_parses_all_valid_go_require_whitespace(
+    tmp_path: Path, require_block: str
+) -> None:
+    repository = _legal_fixture(tmp_path)
+    _write_go_module(
+        repository,
+        go_mod="module example.com/test\n\ngo 1.25.0\n\n" + require_block,
+    )
+    _add_dependency(repository)
+
+    result = _run_verifier(repository)
+
+    assert result.returncode == 0, result.stdout
+
+
+@pytest.mark.parametrize(
+    "directive",
+    [
+        "replace golang.org/x/text => golang.org/x/text v0.39.0",
+        "exclude golang.org/x/text v0.39.0",
+        "retract v1.0.0",
+        "tool golang.org/x/text",
+        "ignore ./ignored",
+        "unknown-directive value",
+    ],
+)
+def test_verifier_fails_closed_on_go_graph_or_unknown_directives(
+    tmp_path: Path, directive: str
+) -> None:
+    repository = _legal_fixture(tmp_path)
+    _write_go_module(
+        repository,
+        go_mod=(
+            "module example.com/test\n\ngo 1.25.0\n"
+            "toolchain go1.25.12\nrequire golang.org/x/text v0.40.0\n"
+            f"{directive}\n"
+        ),
+    )
+    _add_dependency(repository)
+
+    result = _run_verifier(repository)
+
+    assert result.returncode == 1
+    assert (
+        "Go dependency graph directives are not allowed" in result.stdout
+        or "cannot parse Go dependency manifest" in result.stdout
+    )
+
+
+def test_verifier_rejects_orphan_go_sum(tmp_path: Path) -> None:
+    repository = _legal_fixture(tmp_path)
+    orphan = repository / "nested"
+    orphan.mkdir()
+    (orphan / "go.sum").write_text(
+        "golang.org/x/text v0.40.0 h1:Ub2Z6/xjgF1WrYQz2nuITOEegKFtiIy+rieRJ5lHZKs=\n",
+        encoding="utf-8",
+    )
+    _add_provenance(repository, "nested/go.sum")
+
+    result = _run_verifier(repository)
+
+    assert result.returncode == 1
+    assert "Go checksum file has no dependency manifest" in result.stdout
+
+
+@pytest.mark.parametrize(
     ("go_mod", "go_sum", "expected"),
     [
         (
             "module example.com/test\ngo 1.25\nrequire golang.org/x/text latest\n",
             "",
-            "Go module version is not exactly pinned",
+            "cannot parse Go dependency manifest",
         ),
         (
             "module example.com/test\ngo 1.25\n"
             "require golang.org/x/text v0.40.0\n"
             "replace golang.org/x/text => ../text\n",
             "",
-            "Go module replacements are not allowed",
+            "Go dependency graph directives are not allowed",
         ),
         (
             "module example.com/test\ngo 1.25\nrequire corp.internal/private v1.0.0\n",
