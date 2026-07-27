@@ -316,14 +316,30 @@ def test_verification_entrypoint_is_cwd_independent_and_has_stable_modes(
         capture_output=True,
         text=True,
     ).stdout.strip()
-    dco = subprocess.run(
+    # `--dco-commit` always inspects the repository containing the script, so this
+    # asserts cwd-independence rather than a property of HEAD itself. On a pull
+    # request the checked-out HEAD is GitHub's synthetic merge commit, which carries
+    # no sign-off, so requiring a 0 here would fail for reasons unrelated to cwd.
+    # Real history is covered by the dedicated `dco` job, which runs `--dco-range`
+    # over the actual commits with full depth.
+    dco_from_tmp = subprocess.run(
         [str(verify), "--dco-commit", head],
         cwd=tmp_path,
         check=False,
         capture_output=True,
         text=True,
     )
-    assert dco.returncode == 0, dco.stdout + dco.stderr
+    dco_from_root = subprocess.run(
+        [str(verify), "--dco-commit", head],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert dco_from_tmp.returncode == dco_from_root.returncode
+    assert dco_from_tmp.stdout == dco_from_root.stdout
+    assert dco_from_tmp.stderr == dco_from_root.stderr
+    assert dco_from_tmp.returncode in (0, 65)
 
     if not (ROOT / "scripts" / "verify_host_fixtures.py").is_file():
         host = subprocess.run(
