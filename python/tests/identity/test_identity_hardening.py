@@ -11,6 +11,7 @@ import traceback
 from collections.abc import Callable, Mapping
 from datetime import UTC, datetime, timedelta, tzinfo
 from functools import partial
+from pathlib import Path
 from types import TracebackType
 from typing import Any, cast
 
@@ -37,6 +38,15 @@ from palonexus.identity import (
 
 NOW = datetime(2026, 7, 27, 12, 0, tzinfo=UTC)
 TENANT = "tenant-hardening"
+_SDK_SOURCE_ROOT = Path(__file__).resolve().parents[2] / "src" / "palonexus"
+
+
+def _is_sdk_source_path(filename: str) -> bool:
+    return Path(filename).resolve().is_relative_to(_SDK_SOURCE_ROOT)
+
+
+def test_secret_graph_frame_filter_excludes_repository_test_paths() -> None:
+    assert not _is_sdk_source_path(__file__)
 
 
 def _identity_graph_values(error: BaseException) -> list[object]:
@@ -54,7 +64,7 @@ def _identity_graph_values(error: BaseException) -> list[object]:
         if current.__context__ is not None:
             pending.append(current.__context__)
         for frame, _ in traceback.walk_tb(current.__traceback__):
-            if "/palonexus/" in frame.f_code.co_filename:
+            if _is_sdk_source_path(frame.f_code.co_filename):
                 values.extend(frame.f_locals.values())
     return values
 

@@ -12,6 +12,7 @@ import threading
 import traceback
 from concurrent.futures import ThreadPoolExecutor
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 
 import httpx
 import pytest
@@ -34,6 +35,15 @@ ISSUER = "https://issuer.example"
 DISCOVERY = f"{ISSUER}/.well-known/openid-configuration"
 JWKS = f"{ISSUER}/keys"
 AUDIENCE = "palonexus-sdk"
+_SDK_SOURCE_ROOT = Path(__file__).resolve().parents[2] / "src" / "palonexus"
+
+
+def _is_sdk_source_path(filename: str) -> bool:
+    return Path(filename).resolve().is_relative_to(_SDK_SOURCE_ROOT)
+
+
+def test_secret_graph_frame_filter_excludes_repository_test_paths() -> None:
+    assert not _is_sdk_source_path(__file__)
 
 
 def _b64(value: bytes) -> str:
@@ -553,7 +563,7 @@ def test_raw_token_url_and_callback_secrets_are_unreachable_from_error_graph(
         if current.__context__ is not None:
             pending.append(current.__context__)
         for frame, _ in traceback.walk_tb(current.__traceback__):
-            if "/palonexus/" in frame.f_code.co_filename:
+            if _is_sdk_source_path(frame.f_code.co_filename):
                 values.extend(frame.f_locals.values())
     rendered = " ".join(repr(value) for value in values)
     assert raw_token not in rendered
