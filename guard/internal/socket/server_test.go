@@ -16,6 +16,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -1152,52 +1153,143 @@ func TestLifecycleCrashHelper(t *testing.T) {
 	t.Fatalf("fault point %q was not reached", point)
 }
 
-func TestSIGKILLAtLifecycleBoundariesRecoversOnReopen(t *testing.T) {
+func runLifecycleCrash(t *testing.T, point, dir string) {
+	t.Helper()
 	executable, err := os.Executable()
 	if err != nil {
 		t.Fatal(err)
 	}
-	points := []string{
-		"journal_before_write",
-		"journal_after_write",
-		"journal_after_fsync",
-		"journal_before_rename",
-		"journal_after_rename",
-		"journal_after_dirsync",
-		"after_preparing",
-		"after_bind",
-		"after_stage_chmod",
-		"after_stage_proof",
-		"before_publish",
-		"after_publish",
-		"after_publish_dirsync",
+	command := exec.Command(executable, "-test.run=^TestLifecycleCrashHelper$")
+	command.Env = append(os.Environ(),
+		"PALONEXUS_SOCKET_CRASH_POINT="+point,
+		"PALONEXUS_SOCKET_CRASH_DIR="+dir,
+	)
+	if err := command.Run(); err == nil {
+		t.Fatalf("helper was not killed at %s", point)
+	}
+}
+
+func TestPreparingRecoveryPreservesUnprovenReplacementSocket(t *testing.T) {
+	root, err := os.MkdirTemp("", "pn-preparing-replace-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	dir := filepath.Join(root, "run")
+	runLifecycleCrash(t, "after_preparing", dir)
+	dirFile, _, err := prepareRuntimeDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record, err := readLifecycleRecord(dirFile, "."+DefaultSocketName+".lifecycle")
+	_ = dirFile.Close()
+	if err != nil || record == nil || record.Phase != "preparing" {
+		t.Fatalf("missing preparing record: %#v, %v", record, err)
+	}
+	stagePath := filepath.Join(dir, record.StageName)
+	replacement, err := net.ListenUnix("unix", &net.UnixAddr{Name: stagePath, Net: "unix"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement.SetUnlinkOnClose(false)
+	defer replacement.Close()
+	_, err = New(Config{RuntimeDir: dir, Handler: echoHandler})
+	if !errors.Is(err, ErrRecoveryAmbiguous) {
+		t.Fatalf("unproven preparing node was not ambiguous: %v", err)
+	}
+	info, statErr := os.Lstat(stagePath)
+	if statErr != nil || info.Mode()&os.ModeSocket == 0 {
+		t.Fatalf("unproven replacement was removed: %v", statErr)
+	}
+}
+
+func TestLifecycleTempReplacementIsPreservedAsAmbiguous(t *testing.T) {
+	root, err := os.MkdirTemp("", "pn-temp-replace-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	dir := filepath.Join(root, "run")
+	runLifecycleCrash(t, "journal_after_write", dir)
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var tempPath string
+	for _, entry := range entries {
+		if strings.Contains(entry.Name(), ".lifecycle.tmp-") {
+			tempPath = filepath.Join(dir, entry.Name())
+			break
+		}
+	}
+	if tempPath == "" {
+		t.Fatal("crash did not leave a lifecycle temp")
+	}
+	if err := os.Remove(tempPath); err != nil {
+		t.Fatal(err)
+	}
+	const sentinel = "attacker replacement"
+	if err := os.WriteFile(tempPath, []byte(sentinel), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	_, err = New(Config{RuntimeDir: dir, Handler: echoHandler})
+	if !errors.Is(err, ErrRecoveryAmbiguous) {
+		t.Fatalf("unproven lifecycle temp was not ambiguous: %v", err)
+	}
+	data, readErr := os.ReadFile(tempPath)
+	if readErr != nil || string(data) != sentinel {
+		t.Fatalf("lifecycle temp replacement changed: %q, %v", data, readErr)
+	}
+}
+
+func TestSIGKILLAtLifecycleBoundariesRecoversOnReopen(t *testing.T) {
+	points := []struct {
+		name      string
+		ambiguous bool
+	}{
+		{"journal_before_write", true},
+		{"journal_after_write", true},
+		{"journal_after_fsync", true},
+		{"journal_before_rename", true},
+		{"journal_after_rename", false},
+		{"journal_after_dirsync", false},
+		{"after_preparing", false},
+		{"after_bind", true},
+		{"after_stage_chmod", true},
+		{"after_stage_proof", true},
+		{"before_publish", false},
+		{"after_publish", false},
+		{"after_publish_dirsync", false},
 	}
 	for _, point := range points {
-		t.Run(point, func(t *testing.T) {
+		t.Run(point.name, func(t *testing.T) {
 			root, err := os.MkdirTemp("", "pn-kill-")
 			if err != nil {
 				t.Fatal(err)
 			}
 			defer os.RemoveAll(root)
 			dir := filepath.Join(root, "run")
-			command := exec.Command(executable, "-test.run=^TestLifecycleCrashHelper$")
-			command.Env = append(os.Environ(),
-				"PALONEXUS_SOCKET_CRASH_POINT="+point,
-				"PALONEXUS_SOCKET_CRASH_DIR="+dir,
-			)
-			if err := command.Run(); err == nil {
-				t.Fatalf("helper was not killed at %s", point)
-			}
+			runLifecycleCrash(t, point.name, dir)
 			cfg := Config{
 				RuntimeDir: dir, Handler: echoHandler,
 				IOTimeout: 100 * time.Millisecond,
 			}
 			restarted, err := New(cfg)
 			if err != nil {
-				t.Fatalf("reopen failed after %s: %v", point, err)
+				if restarted != nil {
+					_ = restarted.Close()
+				}
+				if !errors.Is(err, ErrRecoveryAmbiguous) {
+					t.Fatalf("unsafe recovery failure after %s: %v", point.name, err)
+				}
+				return
+			}
+			if point.ambiguous {
+				_ = restarted.Close()
+				t.Fatalf("unproven artifact was automatically removed after %s", point.name)
 			}
 			if err := restarted.Close(); err != nil {
-				t.Fatalf("cleanup failed after %s: %v", point, err)
+				t.Fatalf("cleanup failed after %s: %v", point.name, err)
 			}
 			entries, err := os.ReadDir(dir)
 			if err != nil {
@@ -1209,7 +1301,7 @@ func TestSIGKILLAtLifecycleBoundariesRecoversOnReopen(t *testing.T) {
 					"." + DefaultSocketName + ".lifecycle":
 					continue
 				}
-				t.Fatalf("orphan artifact after %s: %s", point, entry.Name())
+				t.Fatalf("orphan artifact after %s: %s", point.name, entry.Name())
 			}
 		})
 	}

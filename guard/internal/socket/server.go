@@ -47,6 +47,18 @@ func (err *CloseError) Error() string {
 
 func (err *CloseError) Unwrap() error { return err.Err }
 
+var ErrRecoveryAmbiguous = errors.New("socket: recovery requires manual cleanup")
+
+type RecoveryAmbiguousError struct {
+	Artifact string
+}
+
+func (err *RecoveryAmbiguousError) Error() string {
+	return "socket: recovery cannot prove ownership of " + err.Artifact
+}
+
+func (err *RecoveryAmbiguousError) Unwrap() error { return ErrRecoveryAmbiguous }
+
 type Config struct {
 	RuntimeDir            string
 	SocketName            string
@@ -471,31 +483,7 @@ func recoverLifecycle(
 			node.uid != currentUID() || node.nlink != 1 {
 			return errors.New("socket: ambiguous preparing lifecycle candidate")
 		}
-		if err := verifyRuntimeDir(dir, cfg.RuntimeDir, dirInfo); err != nil {
-			return err
-		}
-		if err := verifyLockPath(dir, lockName, lockID); err != nil {
-			return err
-		}
-		if probeGuard(filepath.Join(cfg.RuntimeDir, record.StageName), cfg.IOTimeout) != probeRefused {
-			return errors.New("socket: preparing lifecycle candidate may still be active")
-		}
-		if err := verifyRuntimeDir(dir, cfg.RuntimeDir, dirInfo); err != nil {
-			return err
-		}
-		if err := verifyLockPath(dir, lockName, lockID); err != nil {
-			return err
-		}
-		current, err := inspectAt(dir, record.StageName)
-		if err != nil || current.identity != node.identity {
-			return errors.New("socket: preparing lifecycle candidate changed")
-		}
-		if err := removeOwnedAt(dir, record.StageName, node.identity); err != nil {
-			return err
-		}
-		return writeLifecycleRecord(
-			dir, journalName, cleanLifecycle(cfg.SocketName), nil,
-		)
+		return &RecoveryAmbiguousError{Artifact: record.StageName}
 	}
 	expected := fileIdentity{device: record.Device, inode: record.Inode}
 	type candidate struct {
