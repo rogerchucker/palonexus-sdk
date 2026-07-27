@@ -213,6 +213,13 @@ guard/internal/keystore/keyring_linux_native.go,rogerchucker/palonexus-sdk,WORKT
 guard/internal/keystore/keyring_linux_native_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/keystore/keyring_linux_native_test.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/state/store_unix.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/state/store_unix.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/state/store_unsupported_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/state/store_unsupported_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/reconcile/queue.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/reconcile/queue.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/reconcile/queue_unix.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/reconcile/queue_unix.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/reconcile/queue_unsupported.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/reconcile/queue_unsupported.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/reconcile/publish_darwin.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/reconcile/publish_darwin.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/reconcile/publish_linux.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/reconcile/publish_linux.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/reconcile/reconcile_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/reconcile/reconcile_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/reconcile/uploader.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/reconcile/uploader.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/auth/oidc.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/auth/oidc.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/auth/oidc_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/auth/oidc_test.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/auth/session.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/auth/session.go,PaloNexus,yes,new,MIT,rogerchucker
