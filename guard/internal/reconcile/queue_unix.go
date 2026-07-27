@@ -71,13 +71,6 @@ type fileSnapshot struct {
 	digest [32]byte
 }
 
-type doneTombstone struct {
-	Version       int    `json:"version"`
-	Operation     string `json:"operation"`
-	RecordName    string `json:"recordName"`
-	JournalDigest string `json:"journalDigest"`
-}
-
 type unixQueue struct {
 	rootFD                  int
 	root                    string
@@ -1489,11 +1482,6 @@ func (q *unixQueue) recoverTransactions(ctx context.Context) error {
 		}
 		transaction, decodeErr := decodeBatchTransaction(document)
 		if decodeErr != nil {
-			if isDoneTransactionName(name) {
-				if tombstoneErr := validateDoneTombstone(name, document); tombstoneErr == nil {
-					continue
-				}
-			}
 			if quarantineErr := q.quarantine(name); quarantineErr != nil {
 				return errors.Join(ErrCorrupt, quarantineErr)
 			}
@@ -1512,7 +1500,7 @@ func (q *unixQueue) recoverTransactions(ctx context.Context) error {
 			if name != transactionControlName(".done-", transaction) {
 				return ErrCorrupt
 			}
-			if retainErr := q.compactRetainedTransaction(name, snapshot, transaction); retainErr != nil {
+			if retainErr := q.verifyRetainedTransaction(name, snapshot); retainErr != nil {
 				return retainErr
 			}
 			continue
@@ -1526,24 +1514,6 @@ func (q *unixQueue) recoverTransactions(ctx context.Context) error {
 			}
 			return err
 		}
-	}
-	return nil
-}
-
-func validateDoneTombstone(name string, document []byte) error {
-	var tombstone doneTombstone
-	decoder := json.NewDecoder(bytes.NewReader(document))
-	decoder.DisallowUnknownFields()
-	if decoder.Decode(&tombstone) != nil || decoder.Decode(&struct{}{}) != io.EOF ||
-		tombstone.Version != envelopeVersion ||
-		(tombstone.Operation != "enqueue" && tombstone.Operation != "ack") ||
-		!isRecordName(tombstone.RecordName) ||
-		!validHex(tombstone.JournalDigest) || len(tombstone.JournalDigest) != 64 {
-		return ErrCorrupt
-	}
-	transaction := batchTransaction{Operation: tombstone.Operation, RecordName: tombstone.RecordName}
-	if name != transactionControlName(".done-", transaction) {
-		return ErrCorrupt
 	}
 	return nil
 }
@@ -1596,15 +1566,42 @@ func (q *unixQueue) verifyAppliedTransaction(transaction batchTransaction) error
 		return ErrCorrupt
 	}
 	record, err := q.read(transaction.RecordName)
-	if err != nil || record.digest != sha256.Sum256(recordWire) {
+	if errors.Is(err, ErrCorrupt) {
+		if quarantineErr := q.quarantine(transaction.RecordName); quarantineErr != nil {
+			return errors.Join(err, quarantineErr)
+		}
 		return ErrConflict
 	}
-	checkpointWire, err := json.Marshal(transaction.NewCheckpoint)
-	if err != nil || len(checkpointWire) > q.config.MaxRecordBytes {
-		return ErrCorrupt
+	checkpoint, checkpointErr := q.readCheckpointByName(transaction.CheckpointName)
+	if checkpointErr != nil ||
+		checkpoint.ExpectedNextSequence < transaction.NewCheckpoint.ExpectedNextSequence ||
+		len(checkpoint.CompletedPrefix) < len(transaction.NewCheckpoint.CompletedPrefix) {
+		return ErrConflict
 	}
-	checkpoint, err := q.readCheckpointByName(transaction.CheckpointName)
-	if err != nil || checkpoint.digest != sha256.Sum256(checkpointWire) {
+	for key, entry := range transaction.NewCheckpoint.CompletedPrefix {
+		if checkpoint.CompletedPrefix[key] != entry {
+			return ErrConflict
+		}
+	}
+	if errors.Is(err, ErrNotFound) {
+		key := strconv.FormatInt(int64(transaction.NewEnvelope.Record.BatchSequence), 10)
+		expected := checkpointEntry{ReconciliationID: transaction.NewEnvelope.Record.ReconciliationID,
+			EvidenceHash: transaction.NewEnvelope.EvidenceHash}
+		if checkpoint.CompletedPrefix[key] != expected {
+			return ErrConflict
+		}
+		return nil
+	}
+	if err != nil ||
+		record.EvidenceHash != transaction.NewEnvelope.EvidenceHash ||
+		record.TenantHash != transaction.NewEnvelope.TenantHash ||
+		record.SubjectHash != transaction.NewEnvelope.SubjectHash ||
+		record.Record.ReconciliationID != transaction.NewEnvelope.Record.ReconciliationID ||
+		record.Record.BatchID != transaction.NewEnvelope.Record.BatchID ||
+		record.Record.BatchSequence != transaction.NewEnvelope.Record.BatchSequence {
+		return ErrConflict
+	}
+	if transaction.Operation == "ack" && record.digest != sha256.Sum256(recordWire) {
 		return ErrConflict
 	}
 	return nil
@@ -1907,45 +1904,12 @@ func (q *unixQueue) finishTransaction(name string, snapshot fileSnapshot, transa
 			return err
 		}
 	}
-	return q.compactRetainedTransaction(quarantined, snapshot, transaction)
+	return q.verifyRetainedTransaction(quarantined, snapshot)
 }
 
-func (q *unixQueue) compactRetainedTransaction(name string, snapshot fileSnapshot, transaction batchTransaction) error {
-	fd, err := unix.Openat(q.rootFD, name, unix.O_RDWR|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
-	if err != nil {
-		return ErrDurabilityIndeterminate
-	}
-	defer unix.Close(fd)
-	if err := validateRegular(fd, 0o600); err != nil {
-		return err
-	}
-	var st unix.Stat_t
-	if unix.Fstat(fd, &st) != nil || uint64(st.Dev) != snapshot.dev || uint64(st.Ino) != snapshot.ino {
-		return ErrDurabilityIndeterminate
-	}
-	tombstone := doneTombstone{Version: envelopeVersion, Operation: transaction.Operation,
-		RecordName: transaction.RecordName, JournalDigest: hex.EncodeToString(snapshot.digest[:])}
-	document, err := json.Marshal(tombstone)
-	if err != nil || int64(len(document)) > maxTransactionBytes {
-		return ErrCorrupt
-	}
-	if unix.Ftruncate(fd, int64(len(document))) != nil {
-		return ErrDurabilityIndeterminate
-	}
-	written := 0
-	for written < len(document) {
-		n, writeErr := unix.Pwrite(fd, document[written:], int64(written))
-		if writeErr != nil || n == 0 {
-			return ErrDurabilityIndeterminate
-		}
-		written += n
-	}
-	if unix.Fsync(fd) != nil {
-		return ErrDurabilityIndeterminate
-	}
-	var pathStat unix.Stat_t
-	if unix.Fstatat(q.rootFD, name, &pathStat, unix.AT_SYMLINK_NOFOLLOW) != nil ||
-		uint64(pathStat.Dev) != snapshot.dev || uint64(pathStat.Ino) != snapshot.ino {
+func (q *unixQueue) verifyRetainedTransaction(name string, snapshot fileSnapshot) error {
+	_, retained, err := q.readSafeFile(name, maxTransactionBytes)
+	if err != nil || retained != snapshot {
 		return ErrDurabilityIndeterminate
 	}
 	return nil

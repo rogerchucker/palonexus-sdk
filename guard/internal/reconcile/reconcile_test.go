@@ -1267,9 +1267,14 @@ func TestOpenRecoversDoneTransactionAtEveryRemovalCrashBoundary(t *testing.T) {
 				t.Fatal(err)
 			}
 			done := 0
+			var retainedDocument []byte
 			for _, entry := range entries {
 				if isDoneTransactionName(entry.Name()) {
 					done++
+					retainedDocument, err = os.ReadFile(filepath.Join(root, entry.Name()))
+					if err != nil {
+						t.Fatal(err)
+					}
 				}
 			}
 			if done != 1 {
@@ -1295,6 +1300,13 @@ func TestOpenRecoversDoneTransactionAtEveryRemovalCrashBoundary(t *testing.T) {
 				}
 				if isDoneTransactionName(entry.Name()) {
 					done++
+					after, readErr := os.ReadFile(filepath.Join(root, entry.Name()))
+					if readErr != nil {
+						t.Fatal(readErr)
+					}
+					if !bytes.Equal(after, retainedDocument) {
+						t.Fatal("retained full journal was rewritten during recovery")
+					}
 				}
 			}
 			if done != 1 {
