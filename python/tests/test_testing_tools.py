@@ -1028,7 +1028,7 @@ def test_async_expiry_cancellation_and_commit_are_linearized() -> None:
     asyncio.run(commit_wins())
 
 
-def test_async_cancellation_does_not_block_loop_during_fallible_prepare() -> None:
+def test_async_late_cancellation_does_not_replace_fallible_prepare_error() -> None:
     async def scenario() -> None:
         entered = threading.Event()
         release = threading.Event()
@@ -1057,9 +1057,8 @@ def test_async_cancellation_does_not_block_loop_during_fallible_prepare() -> Non
         elapsed = time.monotonic() - started
         release.set()
         fallback_release.join()
-        with pytest.raises(asyncio.CancelledError) as caught:
+        with pytest.raises(InvalidRequest):
             await task
-        assert caught.value.args == ("prepare-cancelled",)
         assert elapsed < 0.1
         assert scripted.recorded_calls == ()
         scripted._id_source = None
@@ -1092,6 +1091,169 @@ def test_postcommit_observer_failure_cannot_replace_committed_result() -> None:
     )
     assert str(result.outcome) == "allow"
     assert len(scripted.recorded_calls) == 1
+
+
+def test_cancellation_wins_before_decide_id_allocation() -> None:
+    async def scenario() -> None:
+        at_commit = threading.Event()
+        release = threading.Event()
+        supplied = iter(
+            (
+                "dec_01J5ABCDEFGHJKMNPQRSTVWXY1",
+                "audit_01J5ABCDEFGHJKMNPQRSTVWXY2",
+            )
+        )
+        calls = 0
+
+        def id_source() -> str:
+            nonlocal calls
+            calls += 1
+            return next(supplied)
+
+        def before_commit(operation: str) -> None:
+            if operation == "decide":
+                at_commit.set()
+                release.wait()
+
+        scripted = ScriptedEngine(
+            ScriptedEngine.allow(),
+            testing_only=True,
+            id_source=id_source,
+            before_commit=before_commit,
+        )
+        value = request()
+        task = asyncio.create_task(
+            AsyncFakeTransport(scripted, testing_only=True).decide(
+                value, client_scope_hash=scope(value)
+            )
+        )
+        await asyncio.to_thread(at_commit.wait)
+        task.cancel("before-ids")
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert calls == 0
+        assert scripted._sequence == 0
+        scripted._before_commit = None
+        result = FakeTransport(scripted, testing_only=True).decide(
+            value, client_scope_hash=scope(value)
+        )
+        assert str(result.decision_id).endswith("01J5ABCDEFGHJKMNPQRSTVWXY1")
+        assert calls == 2
+
+    asyncio.run(scenario())
+
+
+def test_late_cancellation_after_commit_arbitration_returns_result() -> None:
+    async def scenario() -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        supplied = iter(
+            (
+                "dec_01J5ABCDEFGHJKMNPQRSTVWXY1",
+                "audit_01J5ABCDEFGHJKMNPQRSTVWXY2",
+            )
+        )
+
+        def id_source() -> str:
+            entered.set()
+            release.wait()
+            return next(supplied)
+
+        scripted = ScriptedEngine(
+            ScriptedEngine.allow(),
+            testing_only=True,
+            id_source=id_source,
+        )
+        value = request()
+        task = asyncio.create_task(
+            AsyncFakeTransport(scripted, testing_only=True).decide(
+                value, client_scope_hash=scope(value)
+            )
+        )
+        await asyncio.to_thread(entered.wait)
+        task.cancel("commit-won")
+        started = time.monotonic()
+        await asyncio.sleep(0.02)
+        assert time.monotonic() - started < 0.1
+        release.set()
+        assert str((await task).outcome) == "allow"
+
+    asyncio.run(scenario())
+
+
+@pytest.mark.parametrize("operation", ("request_approval", "get_approval"))
+def test_cancellation_wins_before_approval_id_allocation(operation: str) -> None:
+    async def scenario() -> None:
+        clock = FrozenClock("2026-07-25T20:00:00Z")
+        scripted = ScriptedEngine(
+            ScriptedEngine.approval_required(),
+            testing_only=True,
+            clock=clock,
+        )
+        value = request()
+        decision = scripted.decide(value, client_scope_hash=scope(value))
+        assert decision.approval is not None
+        approval_kwargs = {
+            "decision_id": str(decision.decision_id),
+            "authoritative_scope_hash": str(decision.authoritative_scope_hash),
+            "approval_id": str(decision.approval.approval_id),
+        }
+        approval = None
+        if operation == "get_approval":
+            approval = scripted.request_approval(value, **approval_kwargs)
+            clock.advance(900)
+
+        supplied = iter(f"x_01J5ABCDEFGHJKMNPQRSTVWXY{i}" for i in range(1, 5))
+        calls = 0
+
+        def id_source() -> str:
+            nonlocal calls
+            calls += 1
+            return next(supplied)
+
+        at_commit = threading.Event()
+        release = threading.Event()
+
+        def before_commit(current: str) -> None:
+            if current == operation:
+                at_commit.set()
+                release.wait()
+
+        scripted._id_source = id_source
+        sequence = scripted._sequence
+        scripted._before_commit = before_commit
+        transport = AsyncFakeTransport(scripted, testing_only=True)
+        if operation == "request_approval":
+            task = asyncio.create_task(
+                transport.request_approval(value, **approval_kwargs)
+            )
+        else:
+            assert approval is not None
+            task = asyncio.create_task(
+                transport.get_approval(str(approval.approval_id))
+            )
+        await asyncio.to_thread(at_commit.wait)
+        task.cancel("approval-before-ids")
+        await asyncio.sleep(0)
+        release.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert calls == 0
+        assert scripted._sequence == sequence
+        scripted._before_commit = None
+        if operation == "request_approval":
+            scripted.request_approval(value, **approval_kwargs)
+            assert calls == 1
+        else:
+            assert approval is not None
+            assert str(scripted.get_approval(str(approval.approval_id)).status) == (
+                "expired"
+            )
+            assert calls == 3
+
+    asyncio.run(scenario())
 
 
 def test_mock_server_sanitizes_engine_callback_failures() -> None:

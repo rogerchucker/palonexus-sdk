@@ -144,21 +144,40 @@ class _WorkerOutcome:
 
 
 class _CommitGate:
-    __slots__ = ("_cancelled", "_outcome")
+    __slots__ = ("_lock", "_outcome", "_state")
 
     def __init__(self) -> None:
-        self._cancelled = threading.Event()
+        self._lock = threading.Lock()
+        self._state: Literal["OPEN", "CANCELLED", "COMMITTING", "COMMITTED"] = "OPEN"
         self._outcome: _WorkerOutcome | None = None
 
-    def cancel(self) -> None:
-        self._cancelled.set()
+    def cancel(self) -> bool:
+        if not self._lock.acquire(blocking=False):
+            return False
+        try:
+            if self._state != "OPEN":
+                return False
+            self._state = "CANCELLED"
+            return True
+        finally:
+            self._lock.release()
 
     @property
     def cancelled(self) -> bool:
-        return self._cancelled.is_set()
+        return self._state == "CANCELLED"
+
+    def begin_commit(self) -> None:
+        with self._lock:
+            if self._state == "CANCELLED":
+                raise concurrent.futures.CancelledError from None
+            if self._state != "OPEN":
+                raise AuthorizationUnavailable() from None
+            self._state = "COMMITTING"
 
     def publish_committed(self, result: object) -> None:
-        self._outcome = _WorkerOutcome("COMMITTED", result)
+        with self._lock:
+            self._outcome = _WorkerOutcome("COMMITTED", result)
+            self._state = "COMMITTED"
 
     @property
     def outcome(self) -> _WorkerOutcome | None:
@@ -269,8 +288,8 @@ class ScriptedEngine:
     ) -> object:
         if self._before_commit is not None:
             self._before_commit(operation)
-        if gate is not None and gate.cancelled:
-            raise concurrent.futures.CancelledError from None
+        if gate is not None:
+            gate.begin_commit()
         result = mutation()
         if gate is not None:
             gate.publish_committed(result)
@@ -358,7 +377,7 @@ class ScriptedEngine:
         return value.astimezone(UTC)
 
     def _new_id(self, prefix: str) -> str:
-        self._sequence += 1
+        next_sequence = self._sequence + 1
         if self._id_source is not None:
             failed = False
             control: BaseException | None = None
@@ -378,7 +397,7 @@ class ScriptedEngine:
                 _invalid()
             suffix = supplied.split("_", 1)[-1]
         else:
-            suffix = f"01J5ABCDEFGHJKMNPQRST{self._sequence:06X}"[-26:]
+            suffix = f"01J5ABCDEFGHJKMNPQRST{next_sequence:06X}"[-26:]
         value = f"{prefix}_{suffix}"
         validators: dict[str, Callable[[str], str]] = {
             "dec": wire.DecisionID,
@@ -387,9 +406,11 @@ class ScriptedEngine:
             "approval": wire.ApprovalResolutionIdempotencyKey,
         }
         try:
-            return str(validators[prefix](value))
+            checked = str(validators[prefix](value))
         except (KeyError, TypeError, ValueError):
             _invalid()
+        self._sequence = next_sequence
+        return checked
 
     @staticmethod
     def _hash(request: wire.ActionRequest) -> str:
@@ -625,38 +646,6 @@ class ScriptedEngine:
                 assert outcome.nested is not None
                 outcome = outcome.nested
             completion_now = self._now()
-            result = self._decision(outcome, request, client_scope_hash, completion_now)
-            if (
-                result.approval is not None
-                and len(self._decision_bindings) >= self._idempotency_capacity
-            ):
-                raise AuthorizationUnavailable(
-                    request_id=request.request_id,
-                    correlation_id=request.correlation_id,
-                ) from None
-            recorded_call = self._prepared_call(
-                request, client_scope_hash, request_hash
-            )
-            idempotency_entry = _IdempotencyEntry(
-                request_hash=request_hash,
-                result=result,
-                expires_at=completion_now + timedelta(seconds=self._idempotency_ttl),
-            )
-            decision_binding: _ApprovalBinding | None = None
-            if result.approval is not None:
-                decision_binding = _ApprovalBinding(
-                    request_hash=request_hash,
-                    action_id=str(request.action_id),
-                    request_id=str(request.request_id),
-                    correlation_id=str(request.correlation_id),
-                    client_scope_hash=client_scope_hash,
-                    authoritative_scope_hash=str(result.authoritative_scope_hash),
-                    decision_id=str(result.decision_id),
-                    approval_id=str(result.approval.approval_id),
-                    approval_expires_at=datetime.fromisoformat(
-                        str(result.approval.expires_at).replace("Z", "+00:00")
-                    ),
-                )
 
             def commit_decision() -> object:
                 if (
@@ -666,6 +655,41 @@ class ScriptedEngine:
                     or key in self._idempotency
                 ):
                     raise AuthorizationUnavailable() from None
+                result = self._decision(
+                    outcome, request, client_scope_hash, completion_now
+                )
+                if (
+                    result.approval is not None
+                    and len(self._decision_bindings) >= self._idempotency_capacity
+                ):
+                    raise AuthorizationUnavailable(
+                        request_id=request.request_id,
+                        correlation_id=request.correlation_id,
+                    ) from None
+                recorded_call = self._prepared_call(
+                    request, client_scope_hash, request_hash
+                )
+                idempotency_entry = _IdempotencyEntry(
+                    request_hash=request_hash,
+                    result=result,
+                    expires_at=completion_now
+                    + timedelta(seconds=self._idempotency_ttl),
+                )
+                decision_binding: _ApprovalBinding | None = None
+                if result.approval is not None:
+                    decision_binding = _ApprovalBinding(
+                        request_hash=request_hash,
+                        action_id=str(request.action_id),
+                        request_id=str(request.request_id),
+                        correlation_id=str(request.correlation_id),
+                        client_scope_hash=client_scope_hash,
+                        authoritative_scope_hash=str(result.authoritative_scope_hash),
+                        decision_id=str(result.decision_id),
+                        approval_id=str(result.approval.approval_id),
+                        approval_expires_at=datetime.fromisoformat(
+                            str(result.approval.expires_at).replace("Z", "+00:00")
+                        ),
+                    )
                 self._outcomes.popleft()
                 self._calls.append(recorded_call)
                 self._idempotency[key] = idempotency_entry
@@ -808,30 +832,6 @@ class ScriptedEngine:
                     correlation_id=request.correlation_id,
                 ) from None
 
-            document: dict[str, wire.JSONValue] = {
-                "schemaVersion": "1",
-                "approvalId": binding.approval_id,
-                "actionId": binding.action_id,
-                "correlationId": binding.correlation_id,
-                "authoritativeScopeHash": binding.authoritative_scope_hash,
-                "status": "pending",
-                "requestedAt": _timestamp(now),
-                "expiresAt": _timestamp(binding.approval_expires_at),
-                "requesterRef": "subject:testing-requester",
-                "authorizationDecisionId": binding.decision_id,
-                "creationAuditRef": self._new_id("audit"),
-            }
-            record = wire.parse_approval(document)
-            approval_call = self._prepared_call(
-                request, binding.client_scope_hash, request_hash
-            )
-            approval_call = RecordedCall(
-                operation="request_approval",
-                request=approval_call.request,
-                canonical_request_hash=request_hash,
-                client_scope_hash=binding.client_scope_hash,
-            )
-
             def commit_approval() -> object:
                 if (
                     self._version != expected_version
@@ -839,6 +839,29 @@ class ScriptedEngine:
                     or checked_approval_id in self._approvals
                 ):
                     raise AuthorizationUnavailable() from None
+                document: dict[str, wire.JSONValue] = {
+                    "schemaVersion": "1",
+                    "approvalId": binding.approval_id,
+                    "actionId": binding.action_id,
+                    "correlationId": binding.correlation_id,
+                    "authoritativeScopeHash": binding.authoritative_scope_hash,
+                    "status": "pending",
+                    "requestedAt": _timestamp(now),
+                    "expiresAt": _timestamp(binding.approval_expires_at),
+                    "requesterRef": "subject:testing-requester",
+                    "authorizationDecisionId": binding.decision_id,
+                    "creationAuditRef": self._new_id("audit"),
+                }
+                record = wire.parse_approval(document)
+                approval_call = self._prepared_call(
+                    request, binding.client_scope_hash, request_hash
+                )
+                approval_call = RecordedCall(
+                    operation="request_approval",
+                    request=approval_call.request,
+                    canonical_request_hash=request_hash,
+                    client_scope_hash=binding.client_scope_hash,
+                )
                 self._calls.append(approval_call)
                 self._approvals[checked_approval_id] = record
                 self._version += 1
@@ -905,26 +928,6 @@ class ScriptedEngine:
                 canonical_request_hash=approval_hash,
                 client_scope_hash="",
             )
-            prepared = record
-            expiry_key: str | None = None
-            expiry_binding: _ResolutionBinding | None = None
-            if str(record.status) == "pending" and now >= expiry:
-                expiry_key = self._new_id("approval")
-                if expiry_key in self._resolution_idempotency:
-                    raise AuthorizationUnavailable() from None
-                prepared = self._resolve(
-                    record,
-                    status="expired",
-                    reviewer_ref=None,
-                    resolution_idempotency_key=expiry_key,
-                    now=now,
-                )
-                expiry_binding = _ResolutionBinding(
-                    approval_id=approval_id,
-                    status="expired",
-                    reviewer_ref=None,
-                    result=prepared,
-                )
 
             def commit_get() -> object:
                 if (
@@ -932,6 +935,26 @@ class ScriptedEngine:
                     or self._approvals.get(approval_id) is not record
                 ):
                     raise AuthorizationUnavailable() from None
+                prepared = record
+                expiry_key: str | None = None
+                expiry_binding: _ResolutionBinding | None = None
+                if str(record.status) == "pending" and now >= expiry:
+                    expiry_key = self._new_id("approval")
+                    if expiry_key in self._resolution_idempotency:
+                        raise AuthorizationUnavailable() from None
+                    prepared = self._resolve(
+                        record,
+                        status="expired",
+                        reviewer_ref=None,
+                        resolution_idempotency_key=expiry_key,
+                        now=now,
+                    )
+                    expiry_binding = _ResolutionBinding(
+                        approval_id=approval_id,
+                        status="expired",
+                        reviewer_ref=None,
+                        result=prepared,
+                    )
                 if expiry_key is not None:
                     assert expiry_binding is not None
                     self._approvals[approval_id] = prepared
