@@ -24,6 +24,9 @@ protocol/test-vectors/action/invalid/malformed-resource-hash.json,rogerchucker/p
 protocol/test-vectors/action/invalid/missing-task.json,rogerchucker/palonexus-sdk,WORKTREE,protocol/test-vectors/action/invalid/missing-task.json,PaloNexus,yes,new,MIT,rogerchucker
 protocol/test-vectors/action/invalid/unknown-side-effect.json,rogerchucker/palonexus-sdk,WORKTREE,protocol/test-vectors/action/invalid/unknown-side-effect.json,PaloNexus,yes,new,MIT,rogerchucker
 protocol/test-vectors/action/invalid/unversioned-extension.json,rogerchucker/palonexus-sdk,WORKTREE,protocol/test-vectors/action/invalid/unversioned-extension.json,PaloNexus,yes,new,MIT,rogerchucker
+protocol/test-vectors/action/invalid/file-wrong-prefix-matching-hash.json,rogerchucker/palonexus-sdk,WORKTREE,protocol/test-vectors/action/invalid/file-wrong-prefix-matching-hash.json,PaloNexus,yes,new,MIT,rogerchucker
+protocol/test-vectors/action/invalid/file-backslash-matching-hash.json,rogerchucker/palonexus-sdk,WORKTREE,protocol/test-vectors/action/invalid/file-backslash-matching-hash.json,PaloNexus,yes,new,MIT,rogerchucker
+protocol/test-vectors/action/invalid/file-dot-segment-matching-hash.json,rogerchucker/palonexus-sdk,WORKTREE,protocol/test-vectors/action/invalid/file-dot-segment-matching-hash.json,PaloNexus,yes,new,MIT,rogerchucker
 protocol/test-vectors/action/invalid/unknown-action.json,rogerchucker/palonexus-sdk,WORKTREE,protocol/test-vectors/action/invalid/unknown-action.json,PaloNexus,yes,new,MIT,rogerchucker
 protocol/test-vectors/action/invalid/unknown-major.json,rogerchucker/palonexus-sdk,WORKTREE,protocol/test-vectors/action/invalid/unknown-major.json,PaloNexus,yes,new,MIT,rogerchucker
 protocol/test-vectors/action/valid/file-write.json,rogerchucker/palonexus-sdk,WORKTREE,protocol/test-vectors/action/valid/file-write.json,PaloNexus,yes,new,MIT,rogerchucker

@@ -616,13 +616,17 @@ print(json.dumps([prepare_shell_resource(x).resource for x in json.load(sys.stdi
 		if string(prepared.Resource) != expected[index] {
 			t.Fatalf("public Shell resource differs from Python at %d", index)
 		}
-		assertTargetParses(t, prepared, protocol.TargetKindLocalAction, "workspace")
+		assertTargetParses(
+			t, prepared, protocol.ActionNameShellExec,
+			protocol.TargetKindLocalAction, "workspace",
+		)
 	}
 }
 
 func assertTargetParses(
 	t *testing.T,
 	prepared Prepared,
+	action protocol.ActionName,
 	kind protocol.TargetKind,
 	service string,
 ) {
@@ -639,6 +643,7 @@ func assertTargetParses(
 	}
 	var document map[string]any
 	_ = json.Unmarshal(fixture, &document)
+	document["action"] = string(action)
 	targetJSON, _ := json.Marshal(target)
 	var targetValue any
 	_ = json.Unmarshal(targetJSON, &targetValue)
@@ -701,7 +706,42 @@ func TestTargetRoundTripsThroughGeneratedActionParser(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	assertTargetParses(t, prepared, protocol.TargetKindLocalAction, "workspace")
+	assertTargetParses(
+		t, prepared, protocol.ActionNameFileWrite,
+		protocol.TargetKindLocalAction, "workspace",
+	)
+}
+
+func TestGeneratedParserRejectsNoncanonicalFileTargetsWithMatchingHashes(t *testing.T) {
+	t.Parallel()
+	for _, resource := range []protocol.SafeText{
+		"workspace:/deploy/../secret",
+		`path:/workspace\secret`,
+		"path:/workspace/./secret",
+		"path:/workspace/deploy/../secret",
+	} {
+		prepared := Prepared{Resource: resource, execution: "private"}
+		target, err := prepared.Target(protocol.TargetKindLocalAction, "workspace")
+		if err != nil {
+			t.Fatalf("test target must carry a matching computed hash: %v", err)
+		}
+		fixture, err := os.ReadFile(filepath.Join(
+			"..", "..", "..", "protocol", "test-vectors", "action", "valid", "file-write.json",
+		))
+		if err != nil {
+			t.Fatal(err)
+		}
+		var document map[string]any
+		_ = json.Unmarshal(fixture, &document)
+		targetJSON, _ := json.Marshal(target)
+		var targetValue any
+		_ = json.Unmarshal(targetJSON, &targetValue)
+		document["target"] = targetValue
+		encoded, _ := json.Marshal(document)
+		if _, err := protocol.ParseActionRequest(encoded); err == nil {
+			t.Fatal("generated parser accepted noncanonical file resource with matching hash")
+		}
+	}
 }
 
 func TestCommittedCanonicalizationVectorsRemainReadable(t *testing.T) {

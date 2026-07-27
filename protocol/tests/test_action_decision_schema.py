@@ -9,6 +9,8 @@ import pytest
 from jsonschema import Draft202012Validator, FormatChecker
 from referencing import Registry, Resource
 
+from protocol.reference import canonicalize
+
 ROOT = Path(__file__).parents[1]
 SCHEMAS = ROOT / "schemas"
 VECTORS = ROOT / "test-vectors"
@@ -85,6 +87,56 @@ def test_all_invalid_action_vectors_fail_closed(
     assert vectors
     for path in vectors:
         assert _errors(action_validator, _read_json(path)), path
+
+
+@pytest.mark.parametrize("action_name", ("file:read", "file:write", "file:delete"))
+@pytest.mark.parametrize(
+    "resource",
+    (
+        "workspace:/deploy/../secret",
+        "path:/workspace\\secret",
+        "path:/workspace/./secret",
+        "path:/workspace/deploy/../secret",
+    ),
+)
+def test_file_actions_reject_noncanonical_path_resources_even_with_matching_hash(
+    action_validator: Draft202012Validator,
+    action_name: str,
+    resource: str,
+) -> None:
+    action = _read_json(VECTORS / "action" / "valid" / "file-write.json")
+    action["action"] = action_name
+    target = action["target"]
+    assert isinstance(target, dict)
+    target["resource"] = resource
+    target["resourceHash"] = canonicalize.computed_resource_hash(target)
+
+    assert _errors(action_validator, action)
+
+
+@pytest.mark.parametrize("action_name", ("file:read", "file:write", "file:delete"))
+def test_file_actions_accept_canonical_path_resources(
+    action_validator: Draft202012Validator,
+    action_name: str,
+) -> None:
+    action = _read_json(VECTORS / "action" / "valid" / "file-write.json")
+    action["action"] = action_name
+
+    assert _errors(action_validator, action) == []
+
+
+def test_shell_action_accepts_backslash_resource(
+    action_validator: Draft202012Validator,
+) -> None:
+    action = _read_json(VECTORS / "action" / "valid" / "file-write.json")
+    action["action"] = "shell:exec"
+    prepared = canonicalize.prepare_shell_resource('echo "a\\q"')
+    target = action["target"]
+    assert isinstance(target, dict)
+    target["resource"] = prepared.resource
+    target["resourceHash"] = canonicalize.computed_resource_hash(target)
+
+    assert _errors(action_validator, action) == []
 
 
 def test_all_valid_decision_vectors_conform(
