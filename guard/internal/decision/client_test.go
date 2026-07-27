@@ -5,8 +5,10 @@ import (
 	"bytes"
 	"context"
 	"crypto/ecdsa"
+	"crypto/ed25519"
 	"crypto/elliptic"
 	"crypto/rand"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/tls"
 	"crypto/x509"
@@ -1208,6 +1210,158 @@ func TestCallerCertificateMutationCannotRaceConcurrentMTLS(t *testing.T) {
 	wait.Wait()
 	close(stop)
 	<-mutated
+}
+
+func TestCertificateAuxiliaryMetadataExactBounds(t *testing.T) {
+	ca, caKey := testCA(t)
+	base := issueCertificate(t, ca, caKey, nil, true)
+	cloneOK := func(name string, mutate func(*tls.Certificate)) {
+		t.Run(name, func(t *testing.T) {
+			certificate := base
+			mutate(&certificate)
+			if _, err := cloneCertificate(certificate); err != nil {
+				t.Fatalf("exact boundary rejected: %v", err)
+			}
+		})
+	}
+	cloneRejected := func(name string, mutate func(*tls.Certificate)) {
+		t.Run(name, func(t *testing.T) {
+			certificate := base
+			mutate(&certificate)
+			if _, err := cloneCertificate(certificate); !errors.Is(err, ErrInvalidConfig) {
+				t.Fatalf("over-limit boundary accepted: %v", err)
+			}
+		})
+	}
+	schemes := func(count int) []tls.SignatureScheme {
+		result := make([]tls.SignatureScheme, count)
+		for index := range result {
+			result[index] = tls.ECDSAWithP256AndSHA256
+		}
+		return result
+	}
+	scts := func(total int) [][]byte {
+		result := make([][]byte, 0, (total+maxSCTBytes-1)/maxSCTBytes)
+		for total > 0 {
+			size := min(total, maxSCTBytes)
+			result = append(result, make([]byte, size))
+			total -= size
+		}
+		return result
+	}
+
+	cloneOK("signature algorithm count", func(value *tls.Certificate) {
+		value.SupportedSignatureAlgorithms = schemes(maxSignatureAlgorithms)
+	})
+	cloneRejected("signature algorithm count over", func(value *tls.Certificate) {
+		value.SupportedSignatureAlgorithms = schemes(maxSignatureAlgorithms + 1)
+	})
+	cloneOK("OCSP bytes", func(value *tls.Certificate) {
+		value.OCSPStaple = make([]byte, maxOCSPStapleBytes)
+	})
+	cloneRejected("OCSP bytes over", func(value *tls.Certificate) {
+		value.OCSPStaple = make([]byte, maxOCSPStapleBytes+1)
+	})
+	cloneOK("SCT count", func(value *tls.Certificate) {
+		value.SignedCertificateTimestamps = make([][]byte, maxSCTCount)
+	})
+	cloneRejected("SCT count over", func(value *tls.Certificate) {
+		value.SignedCertificateTimestamps = make([][]byte, maxSCTCount+1)
+	})
+	cloneOK("SCT item bytes", func(value *tls.Certificate) {
+		value.SignedCertificateTimestamps = [][]byte{make([]byte, maxSCTBytes)}
+	})
+	cloneRejected("SCT item bytes over", func(value *tls.Certificate) {
+		value.SignedCertificateTimestamps = [][]byte{make([]byte, maxSCTBytes+1)}
+	})
+	cloneOK("SCT aggregate bytes", func(value *tls.Certificate) {
+		value.SignedCertificateTimestamps = scts(maxSCTAggregateBytes)
+	})
+	cloneRejected("SCT aggregate bytes over", func(value *tls.Certificate) {
+		value.SignedCertificateTimestamps = scts(maxSCTAggregateBytes + 1)
+	})
+	cloneOK("auxiliary aggregate bytes", func(value *tls.Certificate) {
+		value.OCSPStaple = make([]byte, maxOCSPStapleBytes)
+		value.SignedCertificateTimestamps =
+			scts(maxAuxiliaryMetadataBytes - maxOCSPStapleBytes)
+	})
+	cloneRejected("auxiliary aggregate bytes over", func(value *tls.Certificate) {
+		value.OCSPStaple = make([]byte, maxOCSPStapleBytes)
+		value.SignedCertificateTimestamps =
+			scts(maxAuxiliaryMetadataBytes - maxOCSPStapleBytes + 1)
+	})
+}
+
+func TestCertificateChainAndDERAggregateExactBounds(t *testing.T) {
+	atCount := make([][]byte, maxCertificateChain)
+	for index := range atCount {
+		atCount[index] = []byte{1}
+	}
+	if !certificateDERWithinBounds(atCount) {
+		t.Fatal("exact certificate-chain count rejected")
+	}
+	overCount := append(append([][]byte(nil), atCount...), []byte{1})
+	if certificateDERWithinBounds(overCount) {
+		t.Fatal("over-limit certificate-chain count accepted")
+	}
+	if !certificateDERWithinBounds([][]byte{make([]byte, maxCertificateDERBytes)}) {
+		t.Fatal("exact certificate DER aggregate rejected")
+	}
+	if certificateDERWithinBounds([][]byte{make([]byte, maxCertificateDERBytes+1)}) {
+		t.Fatal("over-limit certificate DER aggregate accepted")
+	}
+}
+
+func TestPrivateKeySecurityAndEncodingExactBounds(t *testing.T) {
+	rsaAt := func(bits int) *rsa.PrivateKey {
+		return &rsa.PrivateKey{
+			PublicKey: rsa.PublicKey{
+				N: new(big.Int).Lsh(big.NewInt(1), uint(bits-1)),
+				E: 65537,
+			},
+			D:      big.NewInt(1),
+			Primes: []*big.Int{big.NewInt(1), big.NewInt(1)},
+		}
+	}
+	for _, key := range []any{
+		rsaAt(minRSABits),
+		rsaAt(maxRSABits),
+		mustECDSAKey(t, elliptic.P256()),
+		mustECDSAKey(t, elliptic.P384()),
+		mustECDSAKey(t, elliptic.P521()),
+		make(ed25519.PrivateKey, ed25519.PrivateKeySize),
+	} {
+		if err := validatePrivateKeyBounds(key); err != nil {
+			t.Errorf("accepted boundary/type rejected (%T): %v", key, err)
+		}
+	}
+	for _, key := range []any{
+		rsaAt(minRSABits - 1),
+		rsaAt(maxRSABits + 1),
+		mustECDSAKey(t, elliptic.P224()),
+		make(ed25519.PrivateKey, ed25519.PrivateKeySize-1),
+		make(ed25519.PrivateKey, ed25519.PrivateKeySize+1),
+		struct{}{},
+	} {
+		if err := validatePrivateKeyBounds(key); !errors.Is(err, ErrInvalidConfig) {
+			t.Errorf("weak/huge/unknown key accepted (%T): %v", key, err)
+		}
+	}
+	if !privateKeyDERWithinLimit(make([]byte, maxPrivateKeyDERBytes)) {
+		t.Fatal("exact PKCS#8 bound rejected")
+	}
+	if privateKeyDERWithinLimit(make([]byte, maxPrivateKeyDERBytes+1)) {
+		t.Fatal("over-limit PKCS#8 accepted")
+	}
+}
+
+func mustECDSAKey(t *testing.T, curve elliptic.Curve) *ecdsa.PrivateKey {
+	t.Helper()
+	key, err := ecdsa.GenerateKey(curve, rand.Reader)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return key
 }
 
 func TestOwnedCredentialBufferIsWipedAndHeaderReleasedImmediately(t *testing.T) {

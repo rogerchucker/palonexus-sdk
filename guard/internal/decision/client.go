@@ -6,6 +6,10 @@ import (
 	"bytes"
 	"context"
 	"crypto"
+	"crypto/ecdsa"
+	"crypto/ed25519"
+	"crypto/elliptic"
+	"crypto/rsa"
 	"crypto/sha256"
 	"crypto/subtle"
 	"crypto/tls"
@@ -15,6 +19,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"math/big"
 	"mime"
 	"net"
 	"net/http"
@@ -227,8 +232,17 @@ func buildTLSConfig(options TLSOptions, plaintext bool) (*tls.Config, error) {
 }
 
 const (
-	maxCertificateChain    = 8
-	maxCertificateDERBytes = 1 << 20
+	maxCertificateChain       = 8
+	maxCertificateDERBytes    = 1 << 20
+	maxSignatureAlgorithms    = 32
+	maxOCSPStapleBytes        = 64 << 10
+	maxSCTCount               = 64
+	maxSCTBytes               = 16 << 10
+	maxSCTAggregateBytes      = 256 << 10
+	maxAuxiliaryMetadataBytes = 300 << 10
+	minRSABits                = 2048
+	maxRSABits                = 8192
+	maxPrivateKeyDERBytes     = 64 << 10
 )
 
 func cloneCertificate(source tls.Certificate) (tls.Certificate, error) {
@@ -236,15 +250,19 @@ func cloneCertificate(source tls.Certificate) (tls.Certificate, error) {
 		source.PrivateKey == nil {
 		return tls.Certificate{}, ErrInvalidConfig
 	}
+	if err := validateCertificateMetadataBounds(source); err != nil {
+		return tls.Certificate{}, err
+	}
+	if err := validatePrivateKeyBounds(source.PrivateKey); err != nil {
+		return tls.Certificate{}, err
+	}
+	if !certificateDERWithinBounds(source.Certificate) {
+		return tls.Certificate{}, ErrInvalidConfig
+	}
+
 	result := source
 	result.Certificate = make([][]byte, len(source.Certificate))
-	total := 0
 	for index := range source.Certificate {
-		if len(source.Certificate[index]) == 0 ||
-			total > maxCertificateDERBytes-len(source.Certificate[index]) {
-			return tls.Certificate{}, ErrInvalidConfig
-		}
-		total += len(source.Certificate[index])
 		result.Certificate[index] = append([]byte(nil), source.Certificate[index]...)
 	}
 	result.SupportedSignatureAlgorithms =
@@ -264,12 +282,19 @@ func cloneCertificate(source tls.Certificate) (tls.Certificate, error) {
 	// Snapshot standard TLS private keys rather than retaining caller-owned
 	// mutable pointers. Custom signer implementations are intentionally
 	// rejected because their concurrency and mutation semantics are unknown.
-	keyDER, err := x509.MarshalPKCS8PrivateKey(source.PrivateKey)
+	privateKeySnapshot, err := snapshotPrivateKey(source.PrivateKey)
 	if err != nil {
 		return tls.Certificate{}, ErrInvalidConfig
 	}
+	keyDER, err := x509.MarshalPKCS8PrivateKey(privateKeySnapshot)
+	if err != nil {
+		return tls.Certificate{}, ErrInvalidConfig
+	}
+	defer wipe(keyDER)
+	if !privateKeyDERWithinLimit(keyDER) {
+		return tls.Certificate{}, ErrInvalidConfig
+	}
 	privateKey, err := x509.ParsePKCS8PrivateKey(keyDER)
-	wipe(keyDER)
 	if err != nil {
 		return tls.Certificate{}, ErrInvalidConfig
 	}
@@ -284,6 +309,144 @@ func cloneCertificate(source tls.Certificate) (tls.Certificate, error) {
 	}
 	result.PrivateKey = privateKey
 	return result, nil
+}
+
+func certificateDERWithinBounds(chain [][]byte) bool {
+	if len(chain) == 0 || len(chain) > maxCertificateChain {
+		return false
+	}
+	total := 0
+	for _, certificate := range chain {
+		if len(certificate) == 0 ||
+			!addWithinLimit(&total, len(certificate), maxCertificateDERBytes) {
+			return false
+		}
+	}
+	return true
+}
+
+func validateCertificateMetadataBounds(source tls.Certificate) error {
+	if len(source.SupportedSignatureAlgorithms) > maxSignatureAlgorithms ||
+		len(source.OCSPStaple) > maxOCSPStapleBytes ||
+		len(source.SignedCertificateTimestamps) > maxSCTCount {
+		return ErrInvalidConfig
+	}
+	auxiliaryTotal := len(source.SupportedSignatureAlgorithms) * 2
+	if !addWithinLimit(&auxiliaryTotal, len(source.OCSPStaple), maxAuxiliaryMetadataBytes) {
+		return ErrInvalidConfig
+	}
+	sctTotal := 0
+	for _, timestamp := range source.SignedCertificateTimestamps {
+		if len(timestamp) > maxSCTBytes ||
+			!addWithinLimit(&sctTotal, len(timestamp), maxSCTAggregateBytes) ||
+			!addWithinLimit(&auxiliaryTotal, len(timestamp), maxAuxiliaryMetadataBytes) {
+			return ErrInvalidConfig
+		}
+	}
+	return nil
+}
+
+func addWithinLimit(total *int, size, limit int) bool {
+	if total == nil || *total < 0 || size < 0 || limit < 0 ||
+		size > limit || *total > limit-size {
+		return false
+	}
+	*total += size
+	return true
+}
+
+func validatePrivateKeyBounds(key any) error {
+	switch value := key.(type) {
+	case *rsa.PrivateKey:
+		if value == nil || value.N == nil || value.D == nil ||
+			value.E < 3 || value.E > 1<<31-1 || value.E%2 == 0 ||
+			len(value.Primes) != 2 ||
+			!boundedBigInt(value.D, maxRSABits) ||
+			!boundedBigInt(value.Primes[0], maxRSABits) ||
+			!boundedBigInt(value.Primes[1], maxRSABits) ||
+			!boundedOptionalBigInt(value.Precomputed.Dp, maxRSABits) ||
+			!boundedOptionalBigInt(value.Precomputed.Dq, maxRSABits) ||
+			!boundedOptionalBigInt(value.Precomputed.Qinv, maxRSABits) ||
+			len(value.Precomputed.CRTValues) != 0 {
+			return ErrInvalidConfig
+		}
+		bits := value.N.BitLen()
+		if bits < minRSABits || bits > maxRSABits {
+			return ErrInvalidConfig
+		}
+	case *ecdsa.PrivateKey:
+		if value == nil || value.Curve == nil || value.D == nil ||
+			value.X == nil || value.Y == nil ||
+			value.Curve != elliptic.P256() &&
+				value.Curve != elliptic.P384() &&
+				value.Curve != elliptic.P521() {
+			return ErrInvalidConfig
+		}
+	case ed25519.PrivateKey:
+		if len(value) != ed25519.PrivateKeySize {
+			return ErrInvalidConfig
+		}
+	default:
+		return ErrInvalidConfig
+	}
+	return nil
+}
+
+func boundedBigInt(value *big.Int, maximumBits int) bool {
+	return value != nil && value.Sign() > 0 && value.BitLen() <= maximumBits
+}
+
+func boundedOptionalBigInt(value *big.Int, maximumBits int) bool {
+	return value == nil || boundedBigInt(value, maximumBits)
+}
+
+func snapshotPrivateKey(key any) (crypto.Signer, error) {
+	switch value := key.(type) {
+	case *rsa.PrivateKey:
+		result := &rsa.PrivateKey{
+			PublicKey: rsa.PublicKey{N: new(big.Int).Set(value.N), E: value.E},
+			D:         new(big.Int).Set(value.D),
+			Primes: []*big.Int{
+				new(big.Int).Set(value.Primes[0]),
+				new(big.Int).Set(value.Primes[1]),
+			},
+		}
+		if err := result.Validate(); err != nil {
+			return nil, ErrInvalidConfig
+		}
+		return result, nil
+	case *ecdsa.PrivateKey:
+		if value.D.Sign() <= 0 || value.D.Cmp(value.Curve.Params().N) >= 0 ||
+			!value.Curve.IsOnCurve(value.X, value.Y) {
+			return nil, ErrInvalidConfig
+		}
+		x, y := value.Curve.ScalarBaseMult(value.D.Bytes())
+		if x.Cmp(value.X) != 0 || y.Cmp(value.Y) != 0 {
+			return nil, ErrInvalidConfig
+		}
+		return &ecdsa.PrivateKey{
+			PublicKey: ecdsa.PublicKey{
+				Curve: value.Curve,
+				X:     new(big.Int).Set(value.X),
+				Y:     new(big.Int).Set(value.Y),
+			},
+			D: new(big.Int).Set(value.D),
+		}, nil
+	case ed25519.PrivateKey:
+		result := append(ed25519.PrivateKey(nil), value...)
+		expected := ed25519.NewKeyFromSeed(result.Seed())
+		if subtle.ConstantTimeCompare(result, expected) != 1 {
+			wipe(result)
+			return nil, ErrInvalidConfig
+		}
+		return result, nil
+	default:
+		return nil, ErrInvalidConfig
+	}
+}
+
+func privateKeyDERWithinLimit(encoded []byte) bool {
+	return len(encoded) != 0 && len(encoded) <= maxPrivateKeyDERBytes
 }
 
 func rejectRedirect(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
