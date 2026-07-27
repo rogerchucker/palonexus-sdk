@@ -5,8 +5,12 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import copy
 import json
-from dataclasses import dataclass
+import pickle
+import threading
+import time
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Literal
 
@@ -99,6 +103,28 @@ class _AsyncTransport:
 
     async def aclose(self) -> None:
         self.close_calls += 1
+
+
+class _RetryingSyncTransport(_SyncTransport):
+    def __init__(self, result: wire.AuthorizationDecision) -> None:
+        super().__init__(result)
+        self.authorization_attempts = 0
+
+    def decide(self, *args: Any, **kwargs: Any) -> wire.AuthorizationDecision:
+        # The transport, not the client, owns authorization retry.
+        self.authorization_attempts += 2
+        return super().decide(*args, **kwargs)
+
+
+class _RetryingAsyncTransport(_AsyncTransport):
+    def __init__(self, result: wire.AuthorizationDecision) -> None:
+        super().__init__(result)
+        self.authorization_attempts = 0
+
+    async def decide(self, *args: Any, **kwargs: Any) -> wire.AuthorizationDecision:
+        # The transport, not the client, owns authorization retry.
+        self.authorization_attempts += 2
+        return await super().decide(*args, **kwargs)
 
 
 def _attempt() -> _Attempt:
@@ -312,3 +338,368 @@ def test_public_exports_include_clients_and_decision_only() -> None:
     assert "AuthorizationClient" in palonexus.__all__
     assert "AsyncAuthorizationClient" in palonexus.__all__
     assert "AuthorizationDecision" in palonexus.__all__
+
+
+@pytest.mark.parametrize(
+    "scenario",
+    [
+        "allow",
+        "deny",
+        "approval",
+        "malformed",
+        "outage",
+        "retry_success",
+        "close",
+        "cancellation",
+    ],
+)
+def test_shared_sync_async_scenario_matrix(scenario: str) -> None:
+    """One harness proves the required public sync/async behavior matrix."""
+
+    attempt = _attempt()
+    if scenario == "allow":
+        result: object = _decision("allow")
+        operation = "decide"
+    elif scenario == "deny":
+        result = _decision("deny")
+        operation = "authorize"
+    elif scenario == "approval":
+        result = _decision("approval_required")
+        operation = "authorize"
+    elif scenario == "malformed":
+        result = object()
+        operation = "decide"
+    elif scenario == "outage":
+        result = AuthorizationUnavailable(request_id=attempt.request.request_id)
+        operation = "decide"
+    elif scenario == "cancellation":
+        result = concurrent.futures.CancelledError()
+        operation = "decide"
+    else:
+        result = _decision("allow")
+        operation = "decide"
+
+    sync_transport: _SyncTransport
+    async_transport: _AsyncTransport
+    if scenario == "retry_success":
+        sync_transport = _RetryingSyncTransport(result)  # type: ignore[arg-type]
+        async_transport = _RetryingAsyncTransport(result)  # type: ignore[arg-type]
+    else:
+        sync_transport = _SyncTransport(result)
+        async_transport = _AsyncTransport(
+            asyncio.CancelledError() if scenario == "cancellation" else result
+        )
+    sync_client = AuthorizationClient(
+        sync_transport,
+        owns_transport=scenario == "close",
+    )
+    async_client = AsyncAuthorizationClient(
+        async_transport,
+        owns_transport=scenario == "close",
+    )
+
+    sync_value: AuthorizationDecision | None = None
+    sync_failure: BaseException | None = None
+    try:
+        sync_value = getattr(sync_client, operation)(attempt)
+    except BaseException as error:
+        sync_failure = error
+    if scenario == "close":
+        sync_client.close()
+        sync_client.close()
+
+    async def run() -> tuple[AuthorizationDecision | None, BaseException | None]:
+        value: AuthorizationDecision | None = None
+        failure: BaseException | None = None
+        try:
+            value = await getattr(async_client, operation)(attempt)
+        except BaseException as error:
+            failure = error
+        if scenario == "close":
+            await async_client.aclose()
+            await async_client.aclose()
+        return value, failure
+
+    async_value, async_failure = asyncio.run(run())
+    assert sync_value == async_value
+    if sync_failure is not None or async_failure is not None:
+        assert sync_failure is not None and async_failure is not None
+        if scenario == "cancellation":
+            assert isinstance(sync_failure, concurrent.futures.CancelledError)
+            assert isinstance(async_failure, asyncio.CancelledError)
+        else:
+            assert type(sync_failure) is type(async_failure)
+            assert str(sync_failure) == str(async_failure)
+    assert sync_transport.calls == async_transport.calls
+    if scenario == "retry_success":
+        assert sync_transport.authorization_attempts == 2
+        assert async_transport.authorization_attempts == 2
+        assert len(sync_transport.calls) == len(async_transport.calls) == 1
+    if scenario == "close":
+        assert sync_transport.close_calls == async_transport.close_calls == 1
+
+
+def test_public_decisions_cannot_be_forged_copied_or_unpickled() -> None:
+    trusted, _ = _sync_decide(_decision())
+    with pytest.raises(TypeError):
+        AuthorizationDecision(  # type: ignore[call-arg]
+            request_id=trusted.request_id,
+            decision_id=trusted.decision_id,
+            correlation_id=trusted.correlation_id,
+            outcome=DecisionOutcome.ALLOW,
+            reason_code="allow",
+            client_scope_hash=trusted.client_scope_hash,
+            authoritative_scope_hash=trusted.authoritative_scope_hash,
+            policy_revision=trusted.policy_revision,
+            server_time=trusted.server_time,
+            expires_at=trusted.expires_at,
+            audit_ref=trusted.audit_ref,
+        )
+    assert copy.copy(trusted) is trusted
+    assert copy.deepcopy(trusted) is trusted
+    with pytest.raises(TypeError):
+        pickle.dumps(trusted)
+
+
+@pytest.mark.parametrize(
+    "mutate",
+    [
+        lambda allow, approval: replace(allow, approval=approval.approval),
+        lambda allow, approval: replace(approval, approval=None),
+        lambda allow, approval: replace(
+            approval,
+            approval=replace(
+                approval.approval,
+                status=wire.ApprovalStatus.APPROVED,
+            ),
+        ),
+        lambda allow, approval: replace(
+            allow,
+            expires_at=allow.server_time,
+        ),
+    ],
+)
+def test_impossible_transport_decisions_fail_closed_without_context(
+    mutate: Any,
+) -> None:
+    malformed = mutate(_decision("allow"), _decision("approval_required"))
+    secret = "must-not-appear-in-decision-error"
+    object.__setattr__(malformed, "reason_code", secret)
+    with pytest.raises(InvalidDecision) as failure:
+        _sync_decide(malformed)
+    assert secret not in str(failure.value)
+    assert failure.value.__context__ is None
+
+
+@pytest.mark.parametrize("binding", ["request", "correlation", "scope"])
+def test_decision_binding_mismatch_fails_closed(binding: str) -> None:
+    decision = _decision()
+    if binding == "request":
+        decision = replace(
+            decision,
+            request_id=wire.RequestID(f"req_{'7' * 26}"),
+        )
+    elif binding == "correlation":
+        decision = replace(
+            decision,
+            correlation_id=wire.CorrelationID(f"corr_{'7' * 26}"),
+        )
+    else:
+        decision = replace(
+            decision,
+            client_scope_hash=wire.SHA256Digest(f"sha256:{'9' * 64}"),
+        )
+    with pytest.raises(InvalidDecision):
+        _sync_decide(decision)
+
+
+class _BlockingSyncTransport(_SyncTransport):
+    def __init__(
+        self,
+        result: wire.AuthorizationDecision,
+        *,
+        close_failure: BaseException | None = None,
+    ) -> None:
+        super().__init__(result)
+        self.entered = threading.Event()
+        self.release = threading.Event()
+        self.close_failure = close_failure
+
+    def decide(self, *args: Any, **kwargs: Any) -> wire.AuthorizationDecision:
+        self.entered.set()
+        assert self.release.wait(timeout=5)
+        return super().decide(*args, **kwargs)
+
+    def close(self) -> None:
+        super().close()
+        if self.close_failure is not None:
+            raise self.close_failure
+
+
+class _BlockingAsyncTransport(_AsyncTransport):
+    def __init__(
+        self,
+        result: wire.AuthorizationDecision,
+        *,
+        close_failure: BaseException | None = None,
+    ) -> None:
+        super().__init__(result)
+        self.entered = asyncio.Event()
+        self.release = asyncio.Event()
+        self.close_failure = close_failure
+
+    async def decide(self, *args: Any, **kwargs: Any) -> wire.AuthorizationDecision:
+        self.entered.set()
+        await self.release.wait()
+        return await super().decide(*args, **kwargs)
+
+    async def aclose(self) -> None:
+        self.close_calls += 1
+        await asyncio.sleep(0)
+        if self.close_failure is not None:
+            raise self.close_failure
+
+
+def test_sync_close_waits_for_active_operation_and_rejects_new_work() -> None:
+    transport = _BlockingSyncTransport(_decision())
+    client = AuthorizationClient(transport, owns_transport=True)
+    operation = concurrent.futures.ThreadPoolExecutor(max_workers=3)
+    try:
+        decision_future = operation.submit(client.decide, _attempt())
+        assert transport.entered.wait(timeout=5)
+        close_one = operation.submit(client.close)
+        deadline = time.monotonic() + 5
+        while not close_one.running() and time.monotonic() < deadline:
+            time.sleep(0.001)
+        with pytest.raises(AuthorizationUnavailable):
+            client.decide(_attempt())
+        close_two = operation.submit(client.close)
+        assert not close_one.done()
+        assert not close_two.done()
+        assert transport.close_calls == 0
+        transport.release.set()
+        assert decision_future.result(timeout=5).outcome is DecisionOutcome.ALLOW
+        close_one.result(timeout=5)
+        close_two.result(timeout=5)
+        assert transport.close_calls == 1
+    finally:
+        transport.release.set()
+        operation.shutdown(wait=True)
+
+
+def test_sync_concurrent_closers_observe_same_safe_close_failure() -> None:
+    secret = "owned-transport-close-secret"
+    transport = _BlockingSyncTransport(
+        _decision(),
+        close_failure=RuntimeError(secret),
+    )
+    transport.release.set()
+    client = AuthorizationClient(transport, owns_transport=True)
+    barrier = threading.Barrier(3)
+
+    def close() -> BaseException:
+        barrier.wait()
+        try:
+            client.close()
+        except BaseException as error:
+            return error
+        raise AssertionError("close unexpectedly succeeded")
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
+        first = executor.submit(close)
+        second = executor.submit(close)
+        barrier.wait()
+        failures = (first.result(timeout=5), second.result(timeout=5))
+    assert all(type(error) is AuthorizationUnavailable for error in failures)
+    assert str(failures[0]) == str(failures[1])
+    assert secret not in str(failures)
+    assert transport.close_calls == 1
+    with pytest.raises(AuthorizationUnavailable):
+        client.close()
+
+
+def test_async_close_waits_for_active_operation_and_rejects_new_work() -> None:
+    async def run() -> None:
+        transport = _BlockingAsyncTransport(_decision())
+        client = AsyncAuthorizationClient(transport, owns_transport=True)
+        decision_task = asyncio.create_task(client.decide(_attempt()))
+        await transport.entered.wait()
+        close_one = asyncio.create_task(client.aclose())
+        await asyncio.sleep(0)
+        with pytest.raises(AuthorizationUnavailable):
+            await client.decide(_attempt())
+        close_two = asyncio.create_task(client.aclose())
+        await asyncio.sleep(0)
+        assert not close_one.done()
+        assert not close_two.done()
+        assert transport.close_calls == 0
+        transport.release.set()
+        assert (await decision_task).outcome is DecisionOutcome.ALLOW
+        await asyncio.gather(close_one, close_two)
+        assert transport.close_calls == 1
+
+    asyncio.run(run())
+
+
+def test_async_concurrent_closers_share_failure_and_cancellation_is_local() -> None:
+    async def run() -> None:
+        secret = "async-owned-transport-close-secret"
+        transport = _BlockingAsyncTransport(
+            _decision(),
+            close_failure=RuntimeError(secret),
+        )
+        transport.release.set()
+        client = AsyncAuthorizationClient(transport, owns_transport=True)
+        cancelled_closer = asyncio.create_task(client.aclose())
+        waiting_closers = [
+            asyncio.create_task(client.aclose()),
+            asyncio.create_task(client.aclose()),
+        ]
+        cancelled_closer.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled_closer
+        failures = await asyncio.gather(*waiting_closers, return_exceptions=True)
+        assert all(type(failure) is AuthorizationUnavailable for failure in failures)
+        assert str(failures[0]) == str(failures[1])
+        assert secret not in str(failures)
+        with pytest.raises(AuthorizationUnavailable) as repeated:
+            await client.aclose()
+        assert str(failures[0]) == str(repeated.value)
+        assert transport.close_calls == 1
+
+    asyncio.run(run())
+
+
+def test_async_reentrant_transport_close_is_a_harmless_noop() -> None:
+    class ReentrantTransport(_AsyncTransport):
+        client: AsyncAuthorizationClient
+
+        async def aclose(self) -> None:
+            self.close_calls += 1
+            await self.client.aclose()
+
+    async def run() -> None:
+        transport = ReentrantTransport(_decision())
+        client = AsyncAuthorizationClient(transport, owns_transport=True)
+        transport.client = client
+        await client.aclose()
+        await client.aclose()
+        assert transport.close_calls == 1
+
+    asyncio.run(run())
+
+
+def test_sync_reentrant_transport_close_is_a_harmless_noop() -> None:
+    class ReentrantTransport(_SyncTransport):
+        client: AuthorizationClient
+
+        def close(self) -> None:
+            self.close_calls += 1
+            self.client.close()
+
+    transport = ReentrantTransport(_decision())
+    client = AuthorizationClient(transport, owns_transport=True)
+    transport.client = client
+    client.close()
+    client.close()
+    assert transport.close_calls == 1

@@ -132,4 +132,7 @@ python/src/palonexus/transports/__init__.py,rogerchucker/palonexus-sdk,WORKTREE,
 python/src/palonexus/transports/base.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/transports/base.py,PaloNexus,yes,new,MIT,rogerchucker
 python/src/palonexus/transports/http.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/transports/http.py,PaloNexus,yes,new,MIT,rogerchucker
 python/tests/test_http_transport.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/test_http_transport.py,PaloNexus,yes,new,MIT,rogerchucker
+python/src/palonexus/client.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/client.py,PaloNexus,yes,new,MIT,rogerchucker
+python/src/palonexus/async_client.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/async_client.py,PaloNexus,yes,new,MIT,rogerchucker
+python/tests/test_client_parity.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/test_client_parity.py,PaloNexus,yes,new,MIT,rogerchucker
 python/src/palonexus/_generated/__init__.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/_generated/__init__.py,PaloNexus,yes,new,MIT,rogerchucker
