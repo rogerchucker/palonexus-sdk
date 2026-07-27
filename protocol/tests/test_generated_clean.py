@@ -31,6 +31,8 @@ def test_packaged_canonicalizer_is_synced_from_reference() -> None:
         check=True,
     )
     assert package.read_bytes() == before
+
+
 GENERATOR = ROOT / "scripts" / "generate_protocol.py"
 SCHEMAS = ROOT / "protocol" / "schemas"
 PYTHON_OUTPUT = Path("python/src/palonexus/_generated/protocol.py")

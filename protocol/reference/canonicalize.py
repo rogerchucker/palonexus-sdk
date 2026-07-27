@@ -93,6 +93,7 @@ if idna.__version__ != IDNA_VERSION:
         f"canonicalization requires idna {IDNA_VERSION}, got {idna.__version__}"
     )
 
+
 def _isolated_idna_functions() -> tuple[Any, Any]:
     """Clone idna.core functions with pinned Unicode globals.
 
