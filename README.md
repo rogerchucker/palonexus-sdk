@@ -37,16 +37,14 @@ An AES-GCM file backend exists only for isolated tests. It is disabled unless
 the caller uses the explicit testing-only constructor flag and is never
 selected by native backend discovery.
 
-Pre-release build `b379ed9` used ambiguous `tenant:account` credential keys and
-an untyped local-state envelope. Every lookup, write, and explicit delete
+Pre-release credential code used ambiguous `tenant:account` keys. Every lookup, write, and explicit delete
 attempts removal of the exact service-scoped legacy credential and never reads
 it. A cleanup failure fails closed: lookups return no current credential,
 writes do not begin, and later operations retry cleanup. Delete attempts both
 the current and legacy entries and reports any partial cleanup failure. Users
-with only a legacy credential must authenticate again. Logout also removes the three legacy
-binding-and-kind state files by their exact historical SHA-256 names without
-decoding or importing their octet-stream payloads. No legacy secret or
-arbitrary payload is migrated into the typed store.
+with only a legacy credential must authenticate again. Local state only owns
+canonical current-format filenames: version 0 typed metadata is upgraded in
+place to version 1, while unknown versions and arbitrary payloads fail closed.
 
 ## License
 

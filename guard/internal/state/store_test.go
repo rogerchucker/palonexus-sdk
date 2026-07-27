@@ -5,6 +5,8 @@ package state
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"io"
@@ -292,23 +294,28 @@ func TestCleanupTempsUsesIndependentDirectoryOffset(t *testing.T) {
 	}
 }
 
-func TestLogoutPurgesB379LegacyStateWithoutDecodingPayload(t *testing.T) {
+func TestLogoutDoesNotTouchUnreleasedLegacyStateNames(t *testing.T) {
 	store := newTestStore(t)
 	binding := Binding{Tenant: "tenant", Account: "account"}
 	for _, kind := range []Kind{KindRouting, KindSession, KindReconciliation} {
 		document := []byte(`{"version":1,"tenant":"tenant","account":"account","kind":"` + string(kind) +
 			`","payload":{"contentType":"application/octet-stream","value":"opaque"}}`)
-		writeAnchoredTestRecord(t, store, legacyRecordName(binding, kind), document)
+		writeAnchoredTestRecord(t, store, testLegacyRecordName(binding, kind), document)
 	}
 	if err := store.DeleteAccount(context.Background(), binding); err != nil {
 		t.Fatal(err)
 	}
 	for _, kind := range []Kind{KindRouting, KindSession, KindReconciliation} {
-		if err := unix.Fstatat(store.impl.(*unixStore).rootFD, legacyRecordName(binding, kind),
-			&unix.Stat_t{}, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
-			t.Fatalf("legacy %s survived: %v", kind, err)
+		if err := unix.Fstatat(store.impl.(*unixStore).rootFD, testLegacyRecordName(binding, kind),
+			&unix.Stat_t{}, unix.AT_SYMLINK_NOFOLLOW); err != nil {
+			t.Fatalf("unreleased legacy %s was mutated: %v", kind, err)
 		}
 	}
+}
+
+func testLegacyRecordName(binding Binding, kind Kind) string {
+	sum := sha256.Sum256([]byte(binding.Tenant + "\x00" + binding.Account + "\x00" + string(kind)))
+	return "state-" + hex.EncodeToString(sum[:]) + ".json"
 }
 
 func TestStoreSerializesAcrossProcesses(t *testing.T) {
