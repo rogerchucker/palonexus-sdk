@@ -218,3 +218,5 @@ guard/internal/auth/session.go,rogerchucker/palonexus-sdk,WORKTREE,guard/interna
 guard/internal/decision/client.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/decision/client.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/decision/client_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/decision/client_test.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/decision/errors.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/decision/errors.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/guard/check.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/guard/check.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/guard/check_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/guard/check_test.go,PaloNexus,yes,new,MIT,rogerchucker
