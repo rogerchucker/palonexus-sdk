@@ -624,6 +624,7 @@ def test_typed_errors_are_pickle_and_copy_safe(
 def test_top_level_exports_are_intentional_and_exclude_generated_internals() -> None:
     expected = {
         "ActionRequest",
+        "ActionRequestBuilder",
         "ActionTarget",
         "ApprovalExpired",
         "ApprovalRequired",
@@ -641,6 +642,8 @@ def test_top_level_exports_are_intentional_and_exclude_generated_internals() -> 
         "PolicyDenied",
         "TaskContext",
         "UnsupportedProtocol",
+        "atask",
+        "task",
     }
 
     assert set(palonexus.__all__) == expected

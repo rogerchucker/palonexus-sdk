@@ -26,11 +26,12 @@ Go 1.25.12. The generated Python and Go DTOs add no runtime package dependency.
 Their stable headers bind each output to the generator version and the SHA-256
 digest of all source schemas.
 
-The protocol version 1 canonicalization reference pins `unicodedata2` so Python
-3.12, Python 3.13, and later runtimes use the same Unicode 15.1.0 normalization
-tables. It pins `idna` for strict IDNA2008 A-label validation without UTS 46
-mapping. The exact package versions and supplied licenses were reviewed; the
-reference otherwise uses the Python standard library.
+The protocol version 1 canonicalizer used by the Python SDK and vector
+reference pins `unicodedata2` so Python 3.12, Python 3.13, and later runtimes
+use the same Unicode 15.1.0 normalization tables. It pins `idna` for strict
+IDNA2008 A-label validation without UTS 46 mapping. The exact package versions
+and supplied licenses were reviewed; the implementation otherwise uses the
+Python standard library.
 
 ## Dependency review inventory
 

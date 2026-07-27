@@ -294,11 +294,17 @@ wheels = [
 name = "palonexus"
 source = { editable = "python" }
 dependencies = [
+    { name = "idna" },
     { name = "pydantic" },
+    { name = "unicodedata2" },
 ]
 
 [package.metadata]
-requires-dist = [{ name = "pydantic", specifier = ">=2.13.4,<3" }]
+requires-dist = [
+    { name = "idna", specifier = "==3.18" },
+    { name = "pydantic", specifier = ">=2.13.4,<3" },
+    { name = "unicodedata2", specifier = "==15.1.0" },
+]
 
 [[package]]
 name = "pathspec"

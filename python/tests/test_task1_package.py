@@ -16,7 +16,11 @@ PACKAGE = ROOT / "python"
 def test_runtime_dependency_has_a_reviewed_compatible_range() -> None:
     project = tomllib.loads((PACKAGE / "pyproject.toml").read_text())["project"]
 
-    assert project["dependencies"] == ["pydantic>=2.13.4,<3"]
+    assert project["dependencies"] == [
+        "idna==3.18",
+        "pydantic>=2.13.4,<3",
+        "unicodedata2==15.1.0",
+    ]
 
 
 def test_package_license_is_the_canonical_repository_license() -> None:

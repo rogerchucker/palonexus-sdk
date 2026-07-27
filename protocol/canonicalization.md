@@ -155,10 +155,11 @@ URL normalization applies this policy:
   bidi-invalid A-labels fail with `invalid_url_host`.
 - IDNA category, combining-class, normalization, and bidi lookups MUST use the
   pinned Unicode 15.1.0 tables, never the host runtime tables. The Python
-  reference permanently binds `idna.core` to `unicodedata2==15.1.0` at module
-  initialization and asserts both dependency versions before exposing an
-  operation. In particular, `xn--8g0n.example` is accepted identically on
-  Python 3.12 and Python 3.13.
+  reference clones the required pure-Python `idna.core` functions into private
+  function globals bound to `unicodedata2==15.1.0`; it never mutates
+  `idna.core.unicodedata` or another process-global dependency. It asserts both
+  dependency versions before exposing an operation. In particular,
+  `xn--8g0n.example` is accepted identically on Python 3.12 and Python 3.13.
 - Accept IPv4 only as canonical dotted decimal. Reject shortened,
   single-number, octal-looking, hexadecimal-looking, zero-padded, and other
   ambiguous numeric forms.

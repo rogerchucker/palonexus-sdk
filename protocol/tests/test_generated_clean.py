@@ -18,6 +18,19 @@ import pytest
 from protocol.reference import validate
 
 ROOT = Path(__file__).parents[2]
+
+
+def test_packaged_canonicalizer_is_synced_from_reference() -> None:
+    import subprocess
+    import sys
+
+    package = ROOT / "python" / "src" / "palonexus" / "_canonicalize.py"
+    before = package.read_bytes()
+    subprocess.run(
+        [sys.executable, str(ROOT / "scripts" / "sync_python_canonicalizer.py")],
+        check=True,
+    )
+    assert package.read_bytes() == before
 GENERATOR = ROOT / "scripts" / "generate_protocol.py"
 SCHEMAS = ROOT / "protocol" / "schemas"
 PYTHON_OUTPUT = Path("python/src/palonexus/_generated/protocol.py")

@@ -28,6 +28,13 @@ strict = true
 module = "palonexus._generated.*"
 ignore_errors = true
 
+[[tool.mypy.overrides]]
+# This is the byte-identical, vector-audited protocol reference implementation.
+# Its cross-version exact-decimal and pinned-Unicode paths are checked by the
+# protocol suites on every supported Python version.
+module = "palonexus._canonicalize"
+ignore_errors = true
+
 [tool.palonexus.protocol-generation]
 generator-version = "2"
 schemas = [

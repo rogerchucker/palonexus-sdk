@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: MIT
 """Public PaloNexus Python SDK API."""
 
+from .context import atask, task
 from .errors import (
     ApprovalExpired,
     ApprovalRequired,
@@ -18,9 +19,11 @@ from .errors import (
     UnsupportedProtocol,
 )
 from .models import ActionRequest, ActionTarget, DecisionOutcome, TaskContext
+from .protocol import ActionRequestBuilder
 
 __all__ = [
     "ActionRequest",
+    "ActionRequestBuilder",
     "ActionTarget",
     "ApprovalExpired",
     "ApprovalRequired",
@@ -38,4 +41,6 @@ __all__ = [
     "PolicyDenied",
     "TaskContext",
     "UnsupportedProtocol",
+    "atask",
+    "task",
 ]

@@ -5,6 +5,8 @@ import importlib.util
 import json
 import subprocess
 import sys
+import unicodedata
+from collections.abc import Mapping
 from decimal import Decimal
 from pathlib import Path
 from types import ModuleType
@@ -61,7 +63,7 @@ def test_unicode_contract_is_pinned_and_sorts_by_scalar_value(
     assert canonicalize.UNICODE_VERSION == "15.1.0"
     assert canonicalize.unicode_data.__name__ == "unicodedata2"
     assert canonicalize.IDNA_VERSION == "3.18"
-    assert canonicalize.idna_core.unicodedata is canonicalize.unicode_data
+    assert canonicalize.idna_core.unicodedata is unicodedata
     assert canonicalize.canonical_json({"\U00010000": 2, "\ue000": 1}) == (
         '{"\ue000":1,"\U00010000":2}'.encode()
     )
@@ -171,6 +173,65 @@ def test_native_cycles_fail_with_a_stable_error(
     with pytest.raises(canonicalize.CanonicalizationError) as captured:
         canonicalize.canonical_json(value)
     assert _error_code(captured) == "cyclic_value"
+
+
+def test_shared_dag_expansion_fails_at_existing_output_limit(
+    canonicalize: ModuleType,
+) -> None:
+    shared: Any = {"leaf": "value"}
+    for _ in range(13):
+        shared = [shared, shared]
+
+    with pytest.raises(canonicalize.CanonicalizationError) as captured:
+        canonicalize.canonical_json(shared)
+
+    assert _error_code(captured) == "input_too_large"
+
+
+def test_caller_mapping_is_traversed_once(
+    canonicalize: ModuleType,
+) -> None:
+    class Changing(dict[str, Any]):
+        calls = 0
+
+        def items(self) -> Any:
+            self.calls += 1
+            if self.calls > 1:
+                raise AssertionError("caller mapping was re-read")
+            return super().items()
+
+    value = Changing({"key": ["stable"]})
+    assert canonicalize.canonical_json(value) == b'{"key":["stable"]}'
+    assert value.calls == 1
+
+
+def test_unbounded_mapping_stops_at_per_object_limit(
+    canonicalize: ModuleType,
+) -> None:
+    class Unbounded(Mapping[str, Any]):
+        yielded = 0
+
+        def __getitem__(self, key: str) -> Any:
+            raise AssertionError("snapshot must consume items directly")
+
+        def __iter__(self) -> Any:
+            raise AssertionError("snapshot must consume items directly")
+
+        def __len__(self) -> int:
+            raise AssertionError("snapshot must not trust caller length")
+
+        def items(self) -> Any:
+            index = 0
+            while True:
+                self.yielded += 1
+                yield f"k{index}", index
+                index += 1
+
+    value = Unbounded()
+    with pytest.raises(canonicalize.CanonicalizationError) as captured:
+        canonicalize.canonical_json(value)
+    assert _error_code(captured) == "too_many_object_keys"
+    assert value.yielded == canonicalize.MAX_OBJECT_KEYS + 1
 
 
 def test_absent_object_values_are_omitted_but_null_is_preserved(
@@ -902,3 +963,16 @@ def test_reference_cli_is_vector_only_and_has_no_transport_surface() -> None:
     assert "--check-vectors" in text
     for forbidden in ("httpx", "requests", "urllib.request", "socket", "/v1/decide"):
         assert forbidden not in text
+
+
+def test_reference_and_package_are_distinct_synced_implementations() -> None:
+    reference = importlib.import_module(REFERENCE_MODULE)
+    package = importlib.import_module("palonexus._canonicalize")
+
+    assert reference.main is not package.main
+    assert reference.canonical_json is not package.canonical_json
+    assert reference.__file__ != package.__file__
+    assert reference.VECTORS == VECTORS
+    for vector in VECTORS.glob("*.json"):
+        payload = json.loads(vector.read_text())
+        assert payload

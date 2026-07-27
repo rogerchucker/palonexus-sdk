@@ -116,3 +116,9 @@ python/src/palonexus/py.typed,rogerchucker/palonexus-sdk,WORKTREE,python/src/pal
 python/tests/test_models_errors.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/test_models_errors.py,PaloNexus,yes,new,MIT,rogerchucker
 python/LICENSE,rogerchucker/palonexus-sdk,WORKTREE,python/LICENSE,PaloNexus,yes,new,MIT,rogerchucker
 python/tests/test_task1_package.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/test_task1_package.py,PaloNexus,yes,new,MIT,rogerchucker
+python/tests/test_context_protocol.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/test_context_protocol.py,PaloNexus,yes,new,MIT,rogerchucker
+python/src/palonexus/_canonicalize.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/_canonicalize.py,PaloNexus,yes,new,MIT,rogerchucker
+python/src/palonexus/context.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/context.py,PaloNexus,yes,new,MIT,rogerchucker
+python/src/palonexus/protocol.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/protocol.py,PaloNexus,yes,new,MIT,rogerchucker
+python/tests/test_context_protocol_hardening.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/test_context_protocol_hardening.py,PaloNexus,yes,new,MIT,rogerchucker
+scripts/sync_python_canonicalizer.py,rogerchucker/palonexus-sdk,WORKTREE,scripts/sync_python_canonicalizer.py,PaloNexus,yes,new,MIT,rogerchucker

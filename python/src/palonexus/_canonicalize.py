@@ -1,4 +1,6 @@
 # SPDX-License-Identifier: MIT
+# Generated from protocol/reference/canonicalize.py
+# Source-SHA256: 51ddd3c9885c561141416a8b7fd19eedbaf35b3a8c95fed3235ee88971313b94
 """Protocol-v1 canonicalization shared by the SDK and golden-vector reference.
 
 This module generates and checks the protocol vectors; it is not an SDK client
@@ -29,7 +31,12 @@ import idna
 import idna.core as idna_core
 import unicodedata2 as unicode_data
 
-VECTORS = Path(__file__).parents[1] / "test-vectors" / "canonicalization"
+VECTORS = (
+    Path(__file__).parents[3]
+    / "protocol"
+    / "test-vectors"
+    / "canonicalization"
+)
 UNICODE_VERSION: Final = "15.1.0"
 IDNA_VERSION: Final = "3.18"
 MAX_INPUT_BYTES: Final = 65_536
