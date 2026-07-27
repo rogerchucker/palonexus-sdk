@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"io"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -45,6 +46,24 @@ type testAuthority struct {
 type fixedResolver []net.IPAddr
 
 func (r fixedResolver) LookupIPAddr(context.Context, string) ([]net.IPAddr, error) { return r, nil }
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) { return f(request) }
+
+type partialErrorReader struct {
+	document []byte
+	read     bool
+}
+
+func (r *partialErrorReader) Read(buffer []byte) (int, error) {
+	if r.read {
+		return 0, errors.New("injected body read failure")
+	}
+	r.read = true
+	n := copy(buffer, r.document)
+	return n, errors.New("injected body read failure")
+}
 
 func (a testAuthority) AuthorizeDiscard(_ context.Context, binding Binding, authority p.DiscardAuthorityType) error {
 	if authority == p.DiscardAuthorityTypeAuthenticatedUser && binding.Subject == a.subject {
@@ -245,6 +264,61 @@ func TestHTTPTransportIsStrictBoundedAndRedactsAuthorization(t *testing.T) {
 	}
 	if err != nil && strings.Contains(err.Error(), "super-secret") {
 		t.Fatalf("secret leaked: %v", err)
+	}
+}
+
+func TestHTTPTransportRetriesAmbiguousPartialAcknowledgement(t *testing.T) {
+	record := pending()
+	hash, err := evidenceHash(record)
+	if err != nil {
+		t.Fatal(err)
+	}
+	document, _ := json.Marshal(p.ReconciliationAcknowledgement{
+		ReceiptID: "receipt_01J5ABCDEFGHJKMNPQRSTVWXY0", ReconciliationID: record.ReconciliationID,
+		EvidenceHash: hash, AcknowledgedAt: p.RFC3339Timestamp(t0.Add(3 * time.Second).Format(time.RFC3339)),
+	})
+	calls := 0
+	transport := &HTTPTransport{
+		endpoint: "https://api.example/reconcile",
+		client: &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			calls++
+			var body io.ReadCloser
+			if calls == 1 {
+				body = io.NopCloser(&partialErrorReader{document: document[:len(document)/2]})
+			} else {
+				body = io.NopCloser(bytes.NewReader(document))
+			}
+			return &http.Response{StatusCode: http.StatusOK, Header: http.Header{"Content-Type": []string{"application/json"}}, Body: body}, nil
+		})},
+		token:   func(context.Context) ([]byte, error) { return []byte("token"), nil },
+		binding: b1, clientID: record.ClientID, clock: func() time.Time { return t0.Add(4 * time.Second) },
+	}
+	if _, err = transport.Send(context.Background(), record); !errors.Is(err, ErrTransport) {
+		t.Fatalf("partial 2xx was not transient: %v", err)
+	}
+	receipt, err := transport.Send(context.Background(), record)
+	if err != nil || receipt.ack.ReconciliationID != record.ReconciliationID || calls != 2 {
+		t.Fatalf("identical retry not acknowledged: %#v %v calls=%d", receipt, err, calls)
+	}
+}
+
+func TestHTTPTransportTokenProviderClassification(t *testing.T) {
+	record := pending()
+	base := HTTPTransport{endpoint: "https://api.example", client: http.DefaultClient, binding: b1, clientID: record.ClientID, clock: time.Now}
+	base.token = func(context.Context) ([]byte, error) { return nil, errors.New("keystore unavailable") }
+	if _, err := base.Send(context.Background(), record); !errors.Is(err, ErrTransport) {
+		t.Fatalf("provider failure not transient: %v", err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	base.token = func(context.Context) ([]byte, error) { return nil, errors.New("provider observed cancellation") }
+	if _, err := base.Send(ctx, record); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancellation lost: %v", err)
+	}
+	base.token = func(context.Context) ([]byte, error) { return []byte("bad\nvalue"), nil }
+	var delivery *DeliveryError
+	if _, err := base.Send(context.Background(), record); !errors.As(err, &delivery) || delivery.Class != DeliveryAuthentication {
+		t.Fatalf("invalid credential not authentication failure: %v", err)
 	}
 }
 
@@ -937,7 +1011,7 @@ func TestRootReplacementPreventsOldAndNewHandlesBothCommitting(t *testing.T) {
 	}
 }
 
-func TestEnqueueCapacityAndFaultLeaveNoOrphanCheckpoint(t *testing.T) {
+func TestEnqueueCapacityAndFaultRecoverAtomically(t *testing.T) {
 	root := queueRoot(t)
 	tooSmall := Config{Root: root, MaxRecords: 8, MaxBytes: transitionReserveBytes + 128}
 	q, err := Open(tooSmall)
@@ -962,10 +1036,82 @@ func TestEnqueueCapacityAndFaultLeaveNoOrphanCheckpoint(t *testing.T) {
 	if err = q.Enqueue(context.Background(), b1, pending()); err == nil {
 		t.Fatal("fault ignored")
 	}
-	if _, err = os.Stat(filepath.Join(root, checkpointName(pending().BatchID))); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("fault orphan checkpoint: %v", err)
-	}
 	_ = q.Close()
+	q, err = Open(config)
+	if err != nil {
+		t.Fatalf("recover journal: %v", err)
+	}
+	defer q.Close()
+	if got, getErr := q.Get(context.Background(), b1, pending().ReconciliationID); getErr != nil ||
+		got.ReconciliationID != pending().ReconciliationID {
+		t.Fatalf("recover enqueue: %#v, %v", got, getErr)
+	}
+}
+
+func TestDiscardedLaterSequencePermanentlyBlocksEarlierDiscard(t *testing.T) {
+	root := queueRoot(t)
+	config := Config{Root: root, MaxRecords: 8, MaxBytes: 1 << 20, Authority: testAuthority{subject: b1.Subject}}
+	q, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, final := batchRecord(0, '0'), batchRecord(1, '1')
+	if err = q.Enqueue(context.Background(), b1, first); err != nil {
+		t.Fatal(err)
+	}
+	if err = q.Enqueue(context.Background(), b1, final); err != nil {
+		t.Fatal(err)
+	}
+	if _, err = q.Discard(context.Background(), b1, final.ReconciliationID, t0.Add(time.Second),
+		p.DiscardAuthorityTypeAuthenticatedUser, "user_requested"); err != nil {
+		t.Fatalf("discard final: %v", err)
+	}
+	if _, err = q.Discard(context.Background(), b1, first.ReconciliationID, t0.Add(2*time.Second),
+		p.DiscardAuthorityTypeAuthenticatedUser, "user_requested"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("earlier discard accepted: %v", err)
+	}
+	if err = q.Close(); err != nil {
+		t.Fatal(err)
+	}
+	q, err = Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	if _, err = q.Discard(context.Background(), b1, first.ReconciliationID, t0.Add(3*time.Second),
+		p.DiscardAuthorityTypeAuthenticatedUser, "user_requested"); !errors.Is(err, ErrConflict) {
+		t.Fatalf("earlier discard accepted after restart: %v", err)
+	}
+}
+
+func TestImmutableRootLockCannotBeBypassedByReplacingMetadataLock(t *testing.T) {
+	root := queueRoot(t)
+	q, err := Open(Config{Root: root, MaxRecords: 8, MaxBytes: 1 << 20})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	rootFD, err := unix.Open(root, unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Close(rootFD)
+	if err = unix.Flock(rootFD, unix.LOCK_EX|unix.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	defer unix.Flock(rootFD, unix.LOCK_UN)
+	lockPath := filepath.Join(root, ".queue.lock")
+	if err = os.Remove(lockPath); err != nil {
+		t.Fatal(err)
+	}
+	if err = os.WriteFile(lockPath, []byte("replacement"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	if err = q.Enqueue(ctx, b1, pending()); !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("replaceable metadata lock bypassed root inode lock: %v", err)
+	}
 }
 
 func TestQueueRejectsHardlinkFIFOAndUnsafeControlFiles(t *testing.T) {

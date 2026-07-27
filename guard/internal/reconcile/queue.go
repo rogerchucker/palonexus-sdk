@@ -20,18 +20,19 @@ import (
 )
 
 var (
-	ErrNotFound     = errors.New("reconciliation record not found")
-	ErrNotReady     = errors.New("reconciliation record is not ready")
-	ErrConflict     = errors.New("reconciliation idempotency conflict")
-	ErrCorrupt      = errors.New("reconciliation queue is corrupt")
-	ErrUnsafePath   = errors.New("unsafe reconciliation queue path")
-	ErrUnsafeRecord = errors.New("unsafe reconciliation record")
-	ErrQueueFull    = errors.New("reconciliation queue capacity exceeded")
-	ErrClosed       = errors.New("reconciliation queue is closed")
-	ErrTransport    = errors.New("reconciliation transport unavailable")
-	ErrRejected     = errors.New("reconciliation upload rejected")
-	ErrUnauthorized = errors.New("reconciliation authority required")
-	ErrAttemptLimit = errors.New("reconciliation attempt limit reached")
+	ErrNotFound                = errors.New("reconciliation record not found")
+	ErrNotReady                = errors.New("reconciliation record is not ready")
+	ErrConflict                = errors.New("reconciliation idempotency conflict")
+	ErrCorrupt                 = errors.New("reconciliation queue is corrupt")
+	ErrUnsafePath              = errors.New("unsafe reconciliation queue path")
+	ErrUnsafeRecord            = errors.New("unsafe reconciliation record")
+	ErrQueueFull               = errors.New("reconciliation queue capacity exceeded")
+	ErrClosed                  = errors.New("reconciliation queue is closed")
+	ErrTransport               = errors.New("reconciliation transport unavailable")
+	ErrRejected                = errors.New("reconciliation upload rejected")
+	ErrUnauthorized            = errors.New("reconciliation authority required")
+	ErrAttemptLimit            = errors.New("reconciliation attempt limit reached")
+	ErrDurabilityIndeterminate = errors.New("reconciliation durability indeterminate")
 )
 
 const (
@@ -186,8 +187,11 @@ func (q *Queue) Acknowledge(ctx context.Context, b Binding, id p.ReconciliationI
 		if errors.Is(err, ErrConflict) {
 			class = DeliveryConflict
 		}
-		_ = q.impl.hold(ctx, b, id, class)
-		return result, &DeliveryError{Class: class}
+		deliveryErr := &DeliveryError{Class: class}
+		if holdErr := q.impl.hold(ctx, b, id, class); holdErr != nil {
+			return result, errors.Join(deliveryErr, holdErr)
+		}
+		return result, deliveryErr
 	}
 	return result, err
 }

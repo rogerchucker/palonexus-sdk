@@ -140,7 +140,14 @@ func (t *HTTPTransport) Send(ctx context.Context, record p.ReconciliationRecord)
 		return VerifiedReceipt{}, &DeliveryError{Class: DeliveryRejected}
 	}
 	token, err := t.token(ctx)
-	if err != nil || len(token) == 0 || bytes.ContainsAny(token, "\r\n") || len(token) > 8192 {
+	if err != nil {
+		wipe(token)
+		if ctxErr := ctx.Err(); ctxErr != nil {
+			return VerifiedReceipt{}, ctxErr
+		}
+		return VerifiedReceipt{}, &DeliveryError{Class: DeliveryTransient}
+	}
+	if len(token) == 0 || bytes.ContainsAny(token, "\r\n") || len(token) > 8192 {
 		wipe(token)
 		return VerifiedReceipt{}, &DeliveryError{Class: DeliveryAuthentication}
 	}
@@ -181,7 +188,13 @@ func (t *HTTPTransport) Send(ctx context.Context, record p.ReconciliationRecord)
 		return VerifiedReceipt{}, &DeliveryError{Class: DeliveryRejected}
 	}
 	document, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
-	if err != nil || len(document) > maxResponseBytes {
+	if err != nil {
+		// A 2xx response whose body could not be read completely may have
+		// contained the acknowledgement. Treat it as ambiguous acknowledgement
+		// loss so the identical reconciliation/evidence is retried.
+		return VerifiedReceipt{}, &DeliveryError{Class: DeliveryTransient}
+	}
+	if len(document) > maxResponseBytes {
 		return VerifiedReceipt{}, &DeliveryError{Class: DeliveryRejected}
 	}
 	var public p.ReconciliationAcknowledgement
