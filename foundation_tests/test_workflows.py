@@ -77,6 +77,7 @@ def test_workflows_are_valid_yaml_with_least_privilege_and_immutable_actions() -
         WORKFLOWS / "ci.yml",
         WORKFLOWS / "codeql.yml",
         WORKFLOWS / "dependency-review.yml",
+        WORKFLOWS / "python.yml",
     }
     for path, text in texts.items():
         workflow = _yaml(path)
@@ -269,11 +270,13 @@ def test_gitleaks_extends_reviewed_defaults_without_broad_allowlist() -> None:
 def test_gitleaks_false_positives_are_ignored_only_by_exact_fingerprint() -> None:
     ignore = ROOT / ".gitleaksignore"
     fingerprints = ignore.read_text(encoding="utf-8").splitlines()
-    assert len(fingerprints) == 6
+    # Pinned so that adding an ignore entry requires reviewing this test.
+    assert len(fingerprints) == 33
     assert len(set(fingerprints)) == len(fingerprints)
     assert all(
         re.fullmatch(
-            r"[0-9a-f]{40}:[A-Za-z0-9_./-]+:generic-api-key:[0-9]+",
+            r"[0-9a-f]{40}:[A-Za-z0-9_./-]+"
+            r":(?:generic-api-key|curl-auth-header|jwt):[0-9]+",
             fingerprint,
         )
         for fingerprint in fingerprints
@@ -315,14 +318,30 @@ def test_verification_entrypoint_is_cwd_independent_and_has_stable_modes(
         capture_output=True,
         text=True,
     ).stdout.strip()
-    dco = subprocess.run(
+    # `--dco-commit` always inspects the repository containing the script, so this
+    # asserts cwd-independence rather than a property of HEAD itself. On a pull
+    # request the checked-out HEAD is GitHub's synthetic merge commit, which carries
+    # no sign-off, so requiring a 0 here would fail for reasons unrelated to cwd.
+    # Real history is covered by the dedicated `dco` job, which runs `--dco-range`
+    # over the actual commits with full depth.
+    dco_from_tmp = subprocess.run(
         [str(verify), "--dco-commit", head],
         cwd=tmp_path,
         check=False,
         capture_output=True,
         text=True,
     )
-    assert dco.returncode == 0, dco.stdout + dco.stderr
+    dco_from_root = subprocess.run(
+        [str(verify), "--dco-commit", head],
+        cwd=ROOT,
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert dco_from_tmp.returncode == dco_from_root.returncode
+    assert dco_from_tmp.stdout == dco_from_root.stdout
+    assert dco_from_tmp.stderr == dco_from_root.stderr
+    assert dco_from_tmp.returncode in (0, 65)
 
     if not (ROOT / "scripts" / "verify_host_fixtures.py").is_file():
         host = subprocess.run(

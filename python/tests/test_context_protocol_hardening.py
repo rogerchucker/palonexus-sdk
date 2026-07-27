@@ -29,8 +29,7 @@ from palonexus import (
 from palonexus.context import _MonotonicIdentifierGenerator, current_task
 
 
-def _test_builder(
-) -> ActionRequestBuilder:
+def _test_builder() -> ActionRequestBuilder:
     return ActionRequestBuilder(
         adapter_id="python-sdk",
         adapter_version="0.2.0-alpha.1",
@@ -356,9 +355,7 @@ def test_resume_requires_fresh_normalization_and_exact_prior_identity() -> None:
     )
 
     assert resumed.request.causation_id == "dec_01J5ABCDEFGHJKMNPQRSTVWXY3"
-    assert resumed.request.resume_from_approval_id == (
-        "apr_01J5ABCDEFGHJKMNPQRSTVWXY2"
-    )
+    assert resumed.request.resume_from_approval_id == ("apr_01J5ABCDEFGHJKMNPQRSTVWXY2")
     assert resumed.request.action_id == original.request.action_id
     assert resumed.request.correlation_id == original.request.correlation_id
     assert resumed.request.task == original.request.task
