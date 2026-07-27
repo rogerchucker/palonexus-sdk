@@ -99,6 +99,15 @@ class _Server(ThreadingHTTPServer):
     def serve_bounded(self) -> None:
         self.serve_forever(poll_interval=0.01)
 
+    def handle_error(
+        self,
+        request: object,
+        client_address: object,
+    ) -> None:
+        """Expected test-client disconnects never write tracebacks to stderr."""
+
+        del request, client_address
+
 
 class _Handler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
@@ -108,14 +117,17 @@ class _Handler(BaseHTTPRequestHandler):
         del format, args
 
     def _send(self, status: int, body: bytes = b"") -> None:
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "close")
-        self.end_headers()
-        if body:
-            self.wfile.write(body)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            self.end_headers()
+            if body:
+                self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError, OSError):
+            return
 
     def do_GET(self) -> None:
         self._send(405)

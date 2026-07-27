@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import asyncio
 import concurrent.futures
+import contextlib
+import io
 import json
 import socket
 import threading
@@ -18,6 +20,7 @@ import httpx
 import pytest
 from palonexus import (
     ActionRequestBuilder,
+    ApprovalExpired,
     AsyncAuthorizationClient,
     AuthorizationClient,
     AuthorizationUnavailable,
@@ -229,6 +232,57 @@ def test_approval_creation_is_bound_to_issued_decision_and_request() -> None:
         )
 
 
+def test_exact_approval_create_replays_after_decision_approval_expiry() -> None:
+    clock = FrozenClock("2026-07-25T20:00:00Z")
+    scripted = ScriptedEngine(
+        ScriptedEngine.approval_required(),
+        ScriptedEngine.approval_required(),
+        testing_only=True,
+        clock=clock,
+    )
+    transport = FakeTransport(scripted, testing_only=True)
+    value = request()
+    decision = transport.decide(value, client_scope_hash=scope(value))
+    assert decision.approval is not None
+    kwargs = {
+        "decision_id": str(decision.decision_id),
+        "authoritative_scope_hash": str(decision.authoritative_scope_hash),
+        "approval_id": str(decision.approval.approval_id),
+    }
+    created = transport.request_approval(value, **kwargs)
+    clock.advance(901)
+    assert transport.request_approval(value, **kwargs) is created
+
+    other = request(key="authz_01J5ABCDEFGHJKMNPQRSTVWXY9")
+    other_decision = transport.decide(other, client_scope_hash=scope(other))
+    assert other_decision.approval is not None
+    clock.advance(901)
+    with pytest.raises(ApprovalExpired):
+        transport.request_approval(
+            other,
+            decision_id=str(other_decision.decision_id),
+            authoritative_scope_hash=str(other_decision.authoritative_scope_hash),
+            approval_id=str(other_decision.approval.approval_id),
+        )
+
+
+def test_rejected_approval_create_is_not_recorded() -> None:
+    scripted = engine(ScriptedEngine.approval_required())
+    transport = FakeTransport(scripted, testing_only=True)
+    value = request()
+    decision = transport.decide(value, client_scope_hash=scope(value))
+    before = scripted.recorded_calls
+    assert decision.approval is not None
+    with pytest.raises(IdempotencyConflict):
+        transport.request_approval(
+            value,
+            decision_id=str(decision.decision_id),
+            authoritative_scope_hash="sha256:" + "f" * 64,
+            approval_id=str(decision.approval.approval_id),
+        )
+    assert scripted.recorded_calls == before
+
+
 @pytest.mark.parametrize(
     ("status", "reviewer"),
     [
@@ -261,7 +315,8 @@ def test_every_approval_terminal_state_has_one_exact_transition(
     assert str(terminal.status) == status
     assert terminal.action_id == pending.action_id
     assert terminal.authoritative_scope_hash == pending.authoritative_scope_hash
-    with pytest.raises(IdempotencyConflict):
+    expected_error = ApprovalExpired if status == "expired" else IdempotencyConflict
+    with pytest.raises(expected_error):
         scripted.resolve_approval(
             str(pending.approval_id),
             status="cancelled",
@@ -318,6 +373,50 @@ def test_resolution_idempotency_replays_and_conflicts_globally() -> None:
             status="denied",
             reviewer_ref="subject:test-reviewer",
             resolution_idempotency_key="approval_01J5ABCDEFGHJKMNPQRSTVWXY5",
+        )
+
+
+def test_expiry_transition_is_atomic_idempotent_and_precedes_resolution() -> None:
+    clock = FrozenClock("2026-07-25T20:00:00Z")
+    scripted = ScriptedEngine(
+        ScriptedEngine.approval_required(),
+        testing_only=True,
+        clock=clock,
+    )
+    transport = FakeTransport(scripted, testing_only=True)
+    value = request()
+    decision = transport.decide(value, client_scope_hash=scope(value))
+    assert decision.approval is not None
+    pending = transport.request_approval(
+        value,
+        decision_id=str(decision.decision_id),
+        authoritative_scope_hash=str(decision.authoritative_scope_hash),
+        approval_id=str(decision.approval.approval_id),
+    )
+    clock.advance(900)
+    results: list[wire.ApprovalRecord] = []
+    barrier = threading.Barrier(3)
+
+    def observe() -> None:
+        barrier.wait()
+        results.append(transport.get_approval(str(pending.approval_id)))
+
+    observers = [threading.Thread(target=observe) for _ in range(2)]
+    for observer in observers:
+        observer.start()
+    barrier.wait()
+    for observer in observers:
+        observer.join()
+    first, second = results
+    assert first is second
+    assert str(first.status) == "expired"
+    assert first.resolution_idempotency_key is not None
+    with pytest.raises(ApprovalExpired):
+        scripted.resolve_approval(
+            str(pending.approval_id),
+            status="approved",
+            reviewer_ref="subject:test-reviewer",
+            resolution_idempotency_key="approval_01J5ABCDEFGHJKMNPQRSTVWXY9",
         )
 
 
@@ -696,6 +795,70 @@ def test_hostile_frozen_clock_id_and_cancel_inputs_do_not_escape() -> None:
     assert cancel_caught.value.__context__ is None
 
 
+def test_direct_engine_decide_failure_has_no_secret_package_locals() -> None:
+    def hostile_id() -> str:
+        raise RuntimeError(_HOSTILE_SECRET)
+
+    scripted = ScriptedEngine(
+        ScriptedEngine.allow(),
+        testing_only=True,
+        id_source=hostile_id,
+    )
+    with pytest.raises(InvalidRequest) as caught:
+        scripted.decide(request(), client_scope_hash=scope(request()))
+    rendered = "".join(
+        traceback.TracebackException.from_exception(
+            caught.value, capture_locals=True
+        ).format()
+    )
+    assert _HOSTILE_SECRET not in rendered
+    assert "resource%22" not in rendered
+
+
+def test_async_cancelled_approval_create_does_not_record_or_mutate() -> None:
+    async def scenario() -> None:
+        entered = threading.Event()
+        release = threading.Event()
+        clock = FrozenClock("2026-07-25T20:00:00Z")
+
+        def blocking_clock() -> datetime:
+            entered.set()
+            release.wait()
+            return clock()
+
+        scripted = ScriptedEngine(
+            ScriptedEngine.approval_required(),
+            testing_only=True,
+            clock=clock,
+        )
+        value = request()
+        decision = scripted.decide(value, client_scope_hash=scope(value))
+        assert decision.approval is not None
+        scripted._clock = blocking_clock
+        before = scripted.recorded_calls
+        transport = AsyncFakeTransport(scripted, testing_only=True)
+        task = asyncio.create_task(
+            transport.request_approval(
+                value,
+                decision_id=str(decision.decision_id),
+                authoritative_scope_hash=str(decision.authoritative_scope_hash),
+                approval_id=str(decision.approval.approval_id),
+            )
+        )
+        await asyncio.to_thread(entered.wait)
+        task.cancel()
+        releaser = threading.Timer(0.01, release.set)
+        releaser.start()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        releaser.join()
+        assert scripted.recorded_calls == before
+        with pytest.raises(AuthorizationUnavailable):
+            scripted.get_approval(str(decision.approval.approval_id))
+
+    asyncio.run(scenario())
+
+
 def test_mock_server_sanitizes_engine_callback_failures() -> None:
     def hostile_clock() -> datetime:
         raise RuntimeError(_HOSTILE_SECRET)
@@ -778,6 +941,36 @@ def test_mock_server_closes_half_open_and_slow_connections_within_bound() -> Non
         server.close()
         for connection in sockets:
             connection.close()
+
+
+def test_mock_server_disconnect_stress_is_silent_and_leak_free() -> None:
+    before = {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("palonexus-mock")
+    }
+    stderr = io.StringIO()
+    with contextlib.redirect_stderr(stderr):
+        for _ in range(40):
+            server = MockDecisionServer(
+                engine(ScriptedEngine.allow()),
+                testing_only=True,
+                connection_timeout=0.05,
+            ).start()
+            connection = socket.create_connection((server.host, server.port))
+            connection.sendall(
+                b"POST /v1/authorization/decisions HTTP/1.1\r\n"
+                b"Host: 127.0.0.1\r\nContent-Type: application/json\r\n"
+                b"Content-Length: 100\r\n\r\n{}"
+            )
+            connection.close()
+            server.close()
+    assert stderr.getvalue() == ""
+    assert {
+        thread.ident
+        for thread in threading.enumerate()
+        if thread.name.startswith("palonexus-mock")
+    } == before
 
 
 def test_testing_package_has_no_embedded_policy_or_private_environment_names() -> None:
