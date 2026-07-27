@@ -6,12 +6,12 @@ package socket
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"net"
 	"os"
-	"strconv"
 	"strings"
 	"syscall"
 
@@ -145,19 +145,19 @@ func chmodAt(dir *os.File, name string, mode uint32) error {
 	return unix.Fchmodat(int(dir.Fd()), name, mode, 0)
 }
 
-func acquireServerLock(dir *os.File, name string) (*os.File, *fileIdentity, error) {
+func acquireServerLock(dir *os.File, name string) (*os.File, fileIdentity, error) {
 	fd, err := unix.Openat(
 		int(dir.Fd()), name,
 		unix.O_RDWR|unix.O_CREAT|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK,
 		0o600,
 	)
 	if err != nil {
-		return nil, nil, fmt.Errorf("socket: open lifecycle lock: %w", err)
+		return nil, fileIdentity{}, fmt.Errorf("socket: open lifecycle lock: %w", err)
 	}
 	lock := os.NewFile(uintptr(fd), name)
-	fail := func(err error) (*os.File, *fileIdentity, error) {
+	fail := func(err error) (*os.File, fileIdentity, error) {
 		_ = lock.Close()
-		return nil, nil, err
+		return nil, fileIdentity{}, err
 	}
 	info, err := lock.Stat()
 	if err != nil || !info.Mode().IsRegular() {
@@ -176,51 +176,31 @@ func acquireServerLock(dir *os.File, name string) (*os.File, *fileIdentity, erro
 		}
 		return fail(fmt.Errorf("socket: lock lifecycle: %w", err))
 	}
-	record, err := readLockIdentity(lock)
+	identity, err := identityFromFile(lock)
 	if err != nil {
 		_ = unix.Flock(fd, unix.LOCK_UN)
 		return fail(err)
 	}
-	return lock, record, nil
+	return lock, identity, nil
 }
 
-func readLockIdentity(lock *os.File) (*fileIdentity, error) {
-	var document [128]byte
-	count, err := lock.ReadAt(document[:], 0)
-	if err != nil && !errors.Is(err, io.EOF) {
-		return nil, fmt.Errorf("socket: read lifecycle record: %w", err)
-	}
-	text := strings.TrimSpace(string(document[:count]))
-	if text == "" {
-		return nil, nil
-	}
-	fields := strings.Fields(text)
-	if len(fields) != 3 || fields[0] != "v1" {
-		return nil, errors.New("socket: invalid lifecycle record")
-	}
-	device, err := strconv.ParseUint(fields[1], 16, 64)
+func identityFromFile(file *os.File) (fileIdentity, error) {
+	info, err := file.Stat()
 	if err != nil {
-		return nil, errors.New("socket: invalid lifecycle record")
+		return fileIdentity{}, err
 	}
-	inode, err := strconv.ParseUint(fields[2], 16, 64)
-	if err != nil {
-		return nil, errors.New("socket: invalid lifecycle record")
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fileIdentity{}, errors.New("socket: unavailable file identity")
 	}
-	return &fileIdentity{device: device, inode: inode}, nil
+	return fileIdentity{device: uint64(stat.Dev), inode: uint64(stat.Ino)}, nil
 }
 
-func writeLockIdentity(lock *os.File, identity *fileIdentity) error {
-	if err := lock.Truncate(0); err != nil {
-		return fmt.Errorf("socket: truncate lifecycle record: %w", err)
-	}
-	if identity != nil {
-		document := []byte(fmt.Sprintf("v1 %x %x\n", identity.device, identity.inode))
-		if _, err := lock.WriteAt(document, 0); err != nil {
-			return fmt.Errorf("socket: write lifecycle record: %w", err)
-		}
-	}
-	if err := lock.Sync(); err != nil {
-		return fmt.Errorf("socket: sync lifecycle record: %w", err)
+func verifyLockPath(dir *os.File, name string, identity fileIdentity) error {
+	node, err := inspectAt(dir, name)
+	if err != nil || node.identity != identity || node.mode&unix.S_IFMT != unix.S_IFREG ||
+		node.uid != currentUID() || node.mode&0o777 != 0o600 {
+		return errors.New("socket: lifecycle lock pathname was replaced")
 	}
 	return nil
 }
@@ -234,7 +214,154 @@ func releaseServerLock(lock *os.File) error {
 	return closeErr
 }
 
+const maxLifecycleRecord = 1024
+
+func readLifecycleRecord(dir *os.File, name string) (*lifecycleRecord, error) {
+	fd, err := unix.Openat(
+		int(dir.Fd()), name,
+		unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK,
+		0,
+	)
+	if errors.Is(err, unix.ENOENT) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, fmt.Errorf("socket: open lifecycle journal: %w", err)
+	}
+	file := os.NewFile(uintptr(fd), name)
+	defer file.Close()
+	info, err := file.Stat()
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 ||
+		info.Size() < 2 || info.Size() > maxLifecycleRecord {
+		return nil, errors.New("socket: invalid lifecycle journal inode")
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok || stat.Uid != currentUID() {
+		return nil, errors.New("socket: lifecycle journal has wrong owner")
+	}
+	document := make([]byte, info.Size())
+	if _, err := io.ReadFull(file, document); err != nil {
+		return nil, fmt.Errorf("socket: read lifecycle journal: %w", err)
+	}
+	decoder := json.NewDecoder(strings.NewReader(string(document)))
+	decoder.DisallowUnknownFields()
+	var record lifecycleRecord
+	if err := decoder.Decode(&record); err != nil || decoder.Decode(&struct{}{}) != io.EOF ||
+		record.validate() != nil {
+		return nil, errors.New("socket: corrupt lifecycle journal")
+	}
+	return &record, nil
+}
+
+func writeLifecycleRecord(
+	dir *os.File,
+	name string,
+	record lifecycleRecord,
+	fault func(string),
+) error {
+	if err := record.validate(); err != nil {
+		return err
+	}
+	document, err := json.Marshal(record)
+	if err != nil || len(document) > maxLifecycleRecord {
+		return errors.New("socket: invalid lifecycle journal")
+	}
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return fmt.Errorf("socket: lifecycle temp nonce: %w", err)
+	}
+	tempName := "." + name + ".tmp-" + hex.EncodeToString(nonce[:])
+	fd, err := unix.Openat(
+		int(dir.Fd()), tempName,
+		unix.O_WRONLY|unix.O_CREAT|unix.O_EXCL|unix.O_CLOEXEC|unix.O_NOFOLLOW,
+		0o600,
+	)
+	if err != nil {
+		return fmt.Errorf("socket: create lifecycle temp: %w", err)
+	}
+	temp := os.NewFile(uintptr(fd), tempName)
+	tempIdentity, identityErr := identityFromFile(temp)
+	if err := temp.Chmod(0o600); err != nil {
+		_ = temp.Close()
+		if identityErr == nil {
+			_ = removeOwnedRegularAt(dir, tempName, tempIdentity)
+		}
+		return fmt.Errorf("socket: restrict lifecycle temp: %w", err)
+	}
+	cleanup := func() {
+		_ = temp.Close()
+		if identityErr == nil {
+			_ = removeOwnedRegularAt(dir, tempName, tempIdentity)
+		}
+	}
+	if fault != nil {
+		fault("journal_before_write")
+	}
+	if err := writeAllFile(temp, document); err != nil {
+		cleanup()
+		return err
+	}
+	if fault != nil {
+		fault("journal_after_write")
+	}
+	if err := temp.Sync(); err != nil {
+		cleanup()
+		return fmt.Errorf("socket: sync lifecycle temp: %w", err)
+	}
+	if fault != nil {
+		fault("journal_after_fsync")
+	}
+	if err := temp.Close(); err != nil {
+		cleanup()
+		return fmt.Errorf("socket: close lifecycle temp: %w", err)
+	}
+	if fault != nil {
+		fault("journal_before_rename")
+	}
+	if err := unix.Renameat(int(dir.Fd()), tempName, int(dir.Fd()), name); err != nil {
+		cleanup()
+		return fmt.Errorf("socket: commit lifecycle journal: %w", err)
+	}
+	if fault != nil {
+		fault("journal_after_rename")
+	}
+	if err := dir.Sync(); err != nil {
+		return fmt.Errorf("socket: sync lifecycle journal directory: %w", err)
+	}
+	if fault != nil {
+		fault("journal_after_dirsync")
+	}
+	return nil
+}
+
+func writeAllFile(file *os.File, document []byte) error {
+	for len(document) != 0 {
+		count, err := file.Write(document)
+		if err != nil {
+			return fmt.Errorf("socket: write lifecycle temp: %w", err)
+		}
+		if count == 0 {
+			return errors.New("socket: short lifecycle write")
+		}
+		document = document[count:]
+	}
+	return nil
+}
+
 func removeOwnedAt(dir *os.File, name string, expected fileIdentity) error {
+	return removeOwnedModeAt(dir, name, expected, unix.S_IFSOCK)
+}
+
+func removeOwnedRegularAt(dir *os.File, name string, expected fileIdentity) error {
+	return removeOwnedModeAt(dir, name, expected, unix.S_IFREG)
+}
+
+func removeOwnedModeAt(
+	dir *os.File,
+	name string,
+	expected fileIdentity,
+	expectedMode uint32,
+) error {
 	var nonce [16]byte
 	if _, err := rand.Read(nonce[:]); err != nil {
 		return fmt.Errorf("socket: cleanup nonce: %w", err)
@@ -253,7 +380,7 @@ func removeOwnedAt(dir *os.File, name string, expected fileIdentity) error {
 		return fmt.Errorf("socket: inspect quarantined target: %w", err)
 	}
 	if uint64(stat.Dev) != expected.device || uint64(stat.Ino) != expected.inode ||
-		stat.Mode&unix.S_IFMT != unix.S_IFSOCK {
+		uint32(stat.Mode)&unix.S_IFMT != expectedMode {
 		restoreErr := renameNoReplace(dirfd, quarantine, name)
 		if restoreErr != nil {
 			return fmt.Errorf("socket: path replaced; replacement preserved as %s", quarantine)

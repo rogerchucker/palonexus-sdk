@@ -11,6 +11,7 @@ import (
 	"errors"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"sync"
 	"syscall"
@@ -633,6 +634,7 @@ func TestActiveSocketAndStaleReplacementAreNeverRemoved(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	defer active.Close()
 	if _, err := New(cfg); err == nil {
 		t.Fatal("second server replaced an active listener")
 	}
@@ -653,5 +655,159 @@ func TestActiveSocketAndStaleReplacementAreNeverRemoved(t *testing.T) {
 	}
 	if data, err := os.ReadFile(active.Path()); err != nil || string(data) != "replacement" {
 		t.Fatalf("replacement was removed: %q, %v", data, err)
+	}
+}
+
+func TestImmutableLockRecordIsNeverTruncated(t *testing.T) {
+	root, err := os.MkdirTemp("", "pn-lock-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	dir := filepath.Join(root, "run")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	lockPath := filepath.Join(dir, "."+DefaultSocketName+".lock")
+	const sentinel = "immutable-lock-inode\n"
+	if err := os.WriteFile(lockPath, []byte(sentinel), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	srv, err := New(Config{RuntimeDir: dir, Handler: echoHandler})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+	data, err := os.ReadFile(lockPath)
+	if err != nil || string(data) != sentinel {
+		t.Fatalf("lock record was mutated: %q, %v", data, err)
+	}
+}
+
+func TestCopiedLockAndJournalCannotDeleteActiveListener(t *testing.T) {
+	root, err := os.MkdirTemp("", "pn-copy-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer os.RemoveAll(root)
+	dir := filepath.Join(root, "run")
+	cfg := Config{RuntimeDir: dir, Handler: echoHandler, IOTimeout: 50 * time.Millisecond}
+	active, err := New(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer active.Close()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	go func() { _ = active.Serve(ctx) }()
+	_ = exchange(t, active.Path(), `{"schemaVersion":"1"}`+"\n")
+
+	lockPath := filepath.Join(dir, "."+DefaultSocketName+".lock")
+	if err := os.Remove(lockPath); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(lockPath, []byte("copied lock\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if replacement, err := New(cfg); err == nil {
+		_ = replacement.Close()
+		t.Fatal("copied lock and journal deleted an active listener")
+	}
+	_ = exchange(t, active.Path(), `{"schemaVersion":"1"}`+"\n")
+}
+
+func TestLifecycleChallengeIsPeerBoundAndNeverReachesHandler(t *testing.T) {
+	called := make(chan struct{}, 1)
+	_, path := startTestServer(t, func(c *Config) {
+		c.IOTimeout = 50 * time.Millisecond
+		c.Handler = func(context.Context, []byte) ([]byte, error) {
+			called <- struct{}{}
+			return []byte(`{"schemaVersion":"1"}`), nil
+		}
+	})
+	if result := probeGuard(path, 50*time.Millisecond); result != probeActive {
+		t.Fatalf("same-UID challenge was not answered: %v", result)
+	}
+	select {
+	case <-called:
+		t.Fatal("internal challenge reached the normal request handler")
+	default:
+	}
+
+	_, mismatchedPath := startTestServer(t, func(c *Config) {
+		c.IOTimeout = 50 * time.Millisecond
+		c.peerUID = func(net.Conn) (uint32, error) {
+			return uint32(os.Getuid()) + 1, nil
+		}
+	})
+	if result := probeGuard(mismatchedPath, 50*time.Millisecond); result == probeActive {
+		t.Fatal("challenge ignored peer UID")
+	}
+}
+
+func TestLifecycleCrashHelper(t *testing.T) {
+	point := os.Getenv("PALONEXUS_SOCKET_CRASH_POINT")
+	if point == "" {
+		return
+	}
+	cfg := Config{
+		RuntimeDir: os.Getenv("PALONEXUS_SOCKET_CRASH_DIR"),
+		Handler:    echoHandler,
+		IOTimeout:  100 * time.Millisecond,
+		fault: func(actual string) {
+			if actual == point {
+				process, _ := os.FindProcess(os.Getpid())
+				_ = process.Kill()
+			}
+		},
+	}
+	_, _ = New(cfg)
+	t.Fatalf("fault point %q was not reached", point)
+}
+
+func TestSIGKILLAtLifecycleBoundariesRecoversOnReopen(t *testing.T) {
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	points := []string{
+		"journal_before_write",
+		"journal_after_write",
+		"journal_after_fsync",
+		"journal_before_rename",
+		"journal_after_rename",
+		"journal_after_dirsync",
+		"before_publish",
+		"after_publish",
+		"after_publish_dirsync",
+	}
+	for _, point := range points {
+		t.Run(point, func(t *testing.T) {
+			root, err := os.MkdirTemp("", "pn-kill-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer os.RemoveAll(root)
+			dir := filepath.Join(root, "run")
+			command := exec.Command(executable, "-test.run=^TestLifecycleCrashHelper$")
+			command.Env = append(os.Environ(),
+				"PALONEXUS_SOCKET_CRASH_POINT="+point,
+				"PALONEXUS_SOCKET_CRASH_DIR="+dir,
+			)
+			if err := command.Run(); err == nil {
+				t.Fatalf("helper was not killed at %s", point)
+			}
+			cfg := Config{
+				RuntimeDir: dir, Handler: echoHandler,
+				IOTimeout: 100 * time.Millisecond,
+			}
+			restarted, err := New(cfg)
+			if err != nil {
+				t.Fatalf("reopen failed after %s: %v", point, err)
+			}
+			if err := restarted.Close(); err != nil {
+				t.Fatalf("cleanup failed after %s: %v", point, err)
+			}
+		})
 	}
 }

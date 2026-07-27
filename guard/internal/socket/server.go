@@ -16,6 +16,7 @@ import (
 	"os"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/rogerchucker/palonexus-sdk/guard/pkg/protocol"
@@ -48,12 +49,17 @@ type Config struct {
 	onClosing func()
 	// beforeListenerProof exercises replacement after anchored publication.
 	beforeListenerProof func(string)
+	// fault is a test-only crash seam at durable lifecycle boundaries.
+	fault func(string)
 }
 
 type Server struct {
 	listener *net.UnixListener
 	dir      *os.File
 	lock     *os.File
+	lockName string
+	lockID   fileIdentity
+	journal  string
 	dirInfo  os.FileInfo
 	path     string
 	boundID  fileIdentity
@@ -64,6 +70,40 @@ type Server struct {
 	wg        sync.WaitGroup
 	acceptMu  sync.Mutex
 	closing   bool
+}
+
+type lifecycleRecord struct {
+	Version   int    `json:"version"`
+	Phase     string `json:"phase"`
+	StageName string `json:"stageName,omitempty"`
+	FinalName string `json:"finalName"`
+	Device    uint64 `json:"device,omitempty"`
+	Inode     uint64 `json:"inode,omitempty"`
+}
+
+func (record lifecycleRecord) validate() error {
+	if record.Version != 1 || filepath.Base(record.FinalName) != record.FinalName ||
+		record.FinalName == "." {
+		return errors.New("socket: invalid lifecycle journal")
+	}
+	switch record.Phase {
+	case "clean":
+		if record.StageName != "" || record.Device != 0 || record.Inode != 0 {
+			return errors.New("socket: invalid clean lifecycle journal")
+		}
+	case "staged", "published":
+		if filepath.Base(record.StageName) != record.StageName ||
+			record.StageName == "." || record.Device == 0 || record.Inode == 0 {
+			return errors.New("socket: invalid active lifecycle journal")
+		}
+	default:
+		return errors.New("socket: invalid lifecycle phase")
+	}
+	return nil
+}
+
+func cleanLifecycle(finalName string) lifecycleRecord {
+	return lifecycleRecord{Version: 1, Phase: "clean", FinalName: finalName}
 }
 
 func New(cfg Config) (*Server, error) {
@@ -100,8 +140,14 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	lockName := "." + cfg.SocketName + ".lock"
-	lock, staleIdentity, err := acquireServerLock(dir, lockName)
+	journalName := "." + cfg.SocketName + ".lifecycle"
+	lock, lockID, err := acquireServerLock(dir, lockName)
 	if err != nil {
+		_ = dir.Close()
+		return nil, err
+	}
+	if err := verifyLockPath(dir, lockName, lockID); err != nil {
+		_ = releaseServerLock(lock)
 		_ = dir.Close()
 		return nil, err
 	}
@@ -111,26 +157,14 @@ func New(cfg Config) (*Server, error) {
 		return nil, err
 	}
 	path := filepath.Join(cfg.RuntimeDir, cfg.SocketName)
-	existing, inspectErr := inspectAt(dir, cfg.SocketName)
-	switch {
-	case inspectErr == nil:
-		if !ownedStaleSocket(existing, staleIdentity) {
-			return fail(errors.New("socket: path already exists and is not owned stale state"))
-		}
-		if err := removeOwnedAt(dir, cfg.SocketName, existing.identity); err != nil {
-			return fail(err)
-		}
-		if err := writeLockIdentity(lock, nil); err != nil {
-			return fail(err)
-		}
-	case errors.Is(inspectErr, os.ErrNotExist):
-		if staleIdentity != nil {
-			if err := writeLockIdentity(lock, nil); err != nil {
-				return fail(err)
-			}
-		}
-	default:
-		return fail(fmt.Errorf("socket: inspect path: %w", inspectErr))
+	record, err := readLifecycleRecord(dir, journalName)
+	if err != nil {
+		return fail(err)
+	}
+	if err := recoverLifecycle(
+		cfg, dir, dirInfo, lockName, lockID, journalName, record,
+	); err != nil {
+		return fail(err)
 	}
 	if err := verifyRuntimeDir(dir, cfg.RuntimeDir, dirInfo); err != nil {
 		return fail(err)
@@ -173,7 +207,9 @@ func New(cfg Config) (*Server, error) {
 		if boundID != (fileIdentity{}) {
 			_ = removeOwnedAt(dir, publishedName, boundID)
 		}
-		_ = writeLockIdentity(lock, nil)
+		_ = writeLifecycleRecord(
+			dir, journalName, cleanLifecycle(cfg.SocketName), nil,
+		)
 		return fail(err)
 	}
 	staged, err := inspectAt(dir, stageName)
@@ -185,18 +221,53 @@ func New(cfg Config) (*Server, error) {
 	if err := chmodAt(dir, stageName, 0o600); err != nil {
 		return cleanupListener(fmt.Errorf("socket: restrict permissions: %w", err))
 	}
+	staged, err = inspectAt(dir, stageName)
+	if err != nil || !securePublishedSocket(staged, boundID) {
+		return cleanupListener(errors.New("socket: staged listener security mismatch"))
+	}
+	stagedRecord := lifecycleRecord{
+		Version: 1, Phase: "staged", StageName: stageName,
+		FinalName: cfg.SocketName, Device: boundID.device, Inode: boundID.inode,
+	}
+	if err := verifyLockPath(dir, lockName, lockID); err != nil {
+		return cleanupListener(err)
+	}
+	if err := writeLifecycleRecord(
+		dir, journalName, stagedRecord, cfg.fault,
+	); err != nil {
+		return cleanupListener(err)
+	}
+	if err := verifyLockPath(dir, lockName, lockID); err != nil {
+		return cleanupListener(err)
+	}
+	if cfg.fault != nil {
+		cfg.fault("before_publish")
+	}
 	if err := renameNoReplace(int(dir.Fd()), stageName, cfg.SocketName); err != nil {
 		return cleanupListener(fmt.Errorf("socket: publish listener: %w", err))
 	}
 	publishedName = cfg.SocketName
+	if cfg.fault != nil {
+		cfg.fault("after_publish")
+	}
 	if err := dir.Sync(); err != nil {
 		return cleanupListener(fmt.Errorf("socket: sync published listener: %w", err))
+	}
+	if cfg.fault != nil {
+		cfg.fault("after_publish_dirsync")
 	}
 	published, err := inspectAt(dir, cfg.SocketName)
 	if err != nil || !securePublishedSocket(published, boundID) {
 		return cleanupListener(errors.New("socket: published listener identity mismatch"))
 	}
-	if err := writeLockIdentity(lock, &boundID); err != nil {
+	publishedRecord := stagedRecord
+	publishedRecord.Phase = "published"
+	if err := verifyLockPath(dir, lockName, lockID); err != nil {
+		return cleanupListener(err)
+	}
+	if err := writeLifecycleRecord(
+		dir, journalName, publishedRecord, cfg.fault,
+	); err != nil {
 		return cleanupListener(err)
 	}
 	if err := verifyRuntimeDir(dir, cfg.RuntimeDir, dirInfo); err != nil {
@@ -212,8 +283,12 @@ func New(cfg Config) (*Server, error) {
 	if err != nil || !securePublishedSocket(finalNode, boundID) {
 		return cleanupListener(errors.New("socket: listener path changed after proof"))
 	}
+	if err := verifyLockPath(dir, lockName, lockID); err != nil {
+		return cleanupListener(err)
+	}
 	return &Server{
-		listener: listener, dir: dir, lock: lock, dirInfo: dirInfo, path: path,
+		listener: listener, dir: dir, lock: lock, lockName: lockName,
+		lockID: lockID, journal: journalName, dirInfo: dirInfo, path: path,
 		boundID: boundID, cfg: cfg,
 	}, nil
 }
@@ -231,6 +306,154 @@ func unixSocketMode() uint32 { return 0o140000 }
 func ownedStaleSocket(node nodeInfo, record *fileIdentity) bool {
 	return record != nil && node.identity == *record &&
 		securePublishedSocket(node, *record)
+}
+
+type probeResult int
+
+const (
+	probeRefused probeResult = iota
+	probeActive
+	probeAmbiguous
+)
+
+func recoverLifecycle(
+	cfg Config,
+	dir *os.File,
+	dirInfo os.FileInfo,
+	lockName string,
+	lockID fileIdentity,
+	journalName string,
+	record *lifecycleRecord,
+) error {
+	if record == nil {
+		if _, err := inspectAt(dir, cfg.SocketName); err == nil {
+			return errors.New("socket: unjournaled socket path exists")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("socket: inspect unjournaled path: %w", err)
+		}
+		return writeLifecycleRecord(
+			dir, journalName, cleanLifecycle(cfg.SocketName), nil,
+		)
+	}
+	if record.FinalName != cfg.SocketName {
+		return errors.New("socket: lifecycle journal targets another socket")
+	}
+	if record.Phase == "clean" {
+		if _, err := inspectAt(dir, cfg.SocketName); err == nil {
+			return errors.New("socket: socket path exists without active lifecycle intent")
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("socket: inspect clean path: %w", err)
+		}
+		return nil
+	}
+	expected := fileIdentity{device: record.Device, inode: record.Inode}
+	type candidate struct {
+		name string
+		node nodeInfo
+	}
+	var candidates []candidate
+	for _, name := range []string{record.StageName, record.FinalName} {
+		node, err := inspectAt(dir, name)
+		if err == nil {
+			if node.identity != expected {
+				return errors.New("socket: lifecycle pathname inode mismatch")
+			}
+			candidates = append(candidates, candidate{name: name, node: node})
+		} else if !errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("socket: inspect lifecycle candidate: %w", err)
+		}
+	}
+	if len(candidates) == 0 {
+		return writeLifecycleRecord(
+			dir, journalName, cleanLifecycle(cfg.SocketName), nil,
+		)
+	}
+	if len(candidates) != 1 || !securePublishedSocket(candidates[0].node, expected) {
+		return errors.New("socket: ambiguous lifecycle candidates")
+	}
+	if err := verifyRuntimeDir(dir, cfg.RuntimeDir, dirInfo); err != nil {
+		return err
+	}
+	if err := verifyLockPath(dir, lockName, lockID); err != nil {
+		return err
+	}
+	path := filepath.Join(cfg.RuntimeDir, candidates[0].name)
+	if probeGuard(path, cfg.IOTimeout) != probeRefused {
+		return errors.New("socket: lifecycle candidate may still be active")
+	}
+	if err := verifyRuntimeDir(dir, cfg.RuntimeDir, dirInfo); err != nil {
+		return err
+	}
+	if err := verifyLockPath(dir, lockName, lockID); err != nil {
+		return err
+	}
+	current, err := inspectAt(dir, candidates[0].name)
+	if err != nil || !securePublishedSocket(current, expected) {
+		return errors.New("socket: lifecycle candidate changed after active probe")
+	}
+	if err := removeOwnedAt(dir, candidates[0].name, expected); err != nil {
+		return err
+	}
+	return writeLifecycleRecord(
+		dir, journalName, cleanLifecycle(cfg.SocketName), nil,
+	)
+}
+
+const challengeField = "_palonexusGuardChallenge"
+
+func probeGuard(path string, timeout time.Duration) probeResult {
+	if timeout <= 0 || timeout > time.Second {
+		timeout = time.Second
+	}
+	var nonce [32]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return probeAmbiguous
+	}
+	value := base64.RawURLEncoding.EncodeToString(nonce[:])
+	request, _ := json.Marshal(map[string]string{challengeField: value})
+	request = append(request, '\n')
+	conn, err := net.DialTimeout("unix", path, timeout)
+	if err != nil {
+		var operation *net.OpError
+		if errors.As(err, &operation) && errors.Is(operation.Err, syscall.ECONNREFUSED) {
+			return probeRefused
+		}
+		return probeAmbiguous
+	}
+	defer conn.Close()
+	_ = conn.SetDeadline(time.Now().Add(timeout))
+	if _, err := conn.Write(request); err != nil {
+		return probeAmbiguous
+	}
+	response, err := bufio.NewReaderSize(conn, 256).ReadBytes('\n')
+	if err != nil || len(response) > 256 || !bytes.Equal(response, request) {
+		return probeAmbiguous
+	}
+	return probeActive
+}
+
+func challengeResponse(frame []byte) ([]byte, bool) {
+	if len(frame) < 2 || len(frame) > 256 || frame[len(frame)-1] != '\n' {
+		return nil, false
+	}
+	object, err := decodeTopLevelObject(frame[:len(frame)-1])
+	if err != nil || len(object) != 1 {
+		return nil, false
+	}
+	raw, ok := object[challengeField]
+	if !ok {
+		return nil, false
+	}
+	var value string
+	if json.Unmarshal(raw, &value) != nil {
+		return nil, false
+	}
+	nonce, err := base64.RawURLEncoding.DecodeString(value)
+	if err != nil || len(nonce) != 32 {
+		return nil, false
+	}
+	response, _ := json.Marshal(map[string]string{challengeField: value})
+	return append(response, '\n'), true
 }
 
 func securePublishedSocket(node nodeInfo, identity fileIdentity) bool {
@@ -360,6 +583,10 @@ func (s *Server) handle(parent context.Context, conn *net.UnixConn) {
 	frame, err := readFrame(reader, s.cfg.MaxRequestBytes)
 	if err != nil {
 		s.write(conn, failure(protocol.ProtocolErrorCodeInvalidRequest, false))
+		return
+	}
+	if response, ok := challengeResponse(frame); ok {
+		s.write(conn, response)
 		return
 	}
 	ctx, cancel := context.WithTimeout(parent, s.cfg.RequestTimeout)
@@ -526,14 +753,19 @@ func (s *Server) Close() error {
 		s.acceptMu.Unlock()
 		s.wg.Wait()
 		runtimeErr := verifyRuntimeDir(s.dir, filepath.Dir(s.path), s.dirInfo)
-		if err := removeOwnedAt(s.dir, filepath.Base(s.path), s.boundID); err != nil {
+		lockErr := verifyLockPath(s.dir, s.lockName, s.lockID)
+		if lockErr != nil {
+			s.closeErr = lockErr
+		} else if err := removeOwnedAt(s.dir, filepath.Base(s.path), s.boundID); err != nil {
 			s.closeErr = err
 		} else if runtimeErr != nil {
 			s.closeErr = runtimeErr
 		} else if listenErr != nil && !errors.Is(listenErr, net.ErrClosed) {
 			s.closeErr = listenErr
 		}
-		if err := writeLockIdentity(s.lock, nil); s.closeErr == nil && err != nil {
+		if err := writeLifecycleRecord(
+			s.dir, s.journal, cleanLifecycle(filepath.Base(s.path)), nil,
+		); s.closeErr == nil && err != nil {
 			s.closeErr = err
 		}
 		if err := releaseServerLock(s.lock); s.closeErr == nil && err != nil {

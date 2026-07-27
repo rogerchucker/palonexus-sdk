@@ -23,7 +23,10 @@ func peerUID(net.Conn) (uint32, error) {
 	return 0, errors.New("socket: Unix peer credentials are unsupported on this platform")
 }
 
-type fileIdentity struct{}
+type fileIdentity struct {
+	device uint64
+	inode  uint64
+}
 type nodeInfo struct {
 	identity fileIdentity
 	mode     uint32
@@ -46,11 +49,11 @@ func chmodAt(*os.File, string, uint32) error {
 	return errors.New("socket: Unix chmod is unsupported on this platform")
 }
 
-func acquireServerLock(*os.File, string) (*os.File, *fileIdentity, error) {
-	return nil, nil, errors.New("socket: Unix locking is unsupported on this platform")
+func acquireServerLock(*os.File, string) (*os.File, fileIdentity, error) {
+	return nil, fileIdentity{}, errors.New("socket: Unix locking is unsupported on this platform")
 }
 
-func writeLockIdentity(*os.File, *fileIdentity) error {
+func verifyLockPath(*os.File, string, fileIdentity) error {
 	return errors.New("socket: Unix locking is unsupported on this platform")
 }
 
@@ -60,4 +63,12 @@ func releaseServerLock(*os.File) error {
 
 func renameNoReplace(int, string, string) error {
 	return errors.New("socket: Unix rename is unsupported on this platform")
+}
+
+func readLifecycleRecord(*os.File, string) (*lifecycleRecord, error) {
+	return nil, errors.New("socket: Unix lifecycle journal is unsupported on this platform")
+}
+
+func writeLifecycleRecord(*os.File, string, lifecycleRecord, func(string)) error {
+	return errors.New("socket: Unix lifecycle journal is unsupported on this platform")
 }
