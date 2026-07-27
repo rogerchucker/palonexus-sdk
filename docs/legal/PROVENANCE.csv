@@ -152,3 +152,8 @@ python/src/palonexus/testing/__init__.py,rogerchucker/palonexus-sdk,WORKTREE,pyt
 python/src/palonexus/testing/fake_transport.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/testing/fake_transport.py,PaloNexus,yes,new,MIT,rogerchucker
 python/src/palonexus/testing/mock_server.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/testing/mock_server.py,PaloNexus,yes,new,MIT,rogerchucker
 python/tests/test_testing_tools.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/test_testing_tools.py,PaloNexus,yes,new,MIT,rogerchucker
+python/src/palonexus/integrations/__init__.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/integrations/__init__.py,PaloNexus,yes,new,MIT,rogerchucker
+python/src/palonexus/integrations/langchain.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/integrations/langchain.py,PaloNexus,yes,new,MIT,rogerchucker
+python/tests/integrations/test_langchain.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/integrations/test_langchain.py,PaloNexus,yes,new,MIT,rogerchucker
+examples/langchain/main.py,rogerchucker/palonexus-sdk,WORKTREE,examples/langchain/main.py,PaloNexus,yes,new,MIT,rogerchucker
+examples/langchain/README.md,rogerchucker/palonexus-sdk,WORKTREE,examples/langchain/README.md,PaloNexus,yes,new,MIT,rogerchucker

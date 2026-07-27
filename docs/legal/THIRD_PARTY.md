@@ -64,8 +64,10 @@ locked distribution without contacting the network.
 | attrs | 26.1.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | certifi | 2026.7.22 | MPL-2.0 | reviewed | Retain notices; disclose modifications to covered files | None identified | PyPI |
 | cffi | 2.1.0 | MIT-0 | reviewed | Retain supplied license | None supplied | PyPI |
+| charset-normalizer | 3.4.9 | MIT | reviewed | Retain notices | None identified | PyPI |
 | colorama | 0.4.6 | BSD-3-Clause | reviewed | Retain notices | None identified | PyPI |
 | cryptography | 46.0.7 | Apache-2.0 OR BSD-3-Clause | reviewed | Retain supplied licenses | None supplied | PyPI |
+| distro | 1.9.0 | Apache-2.0 | reviewed | Retain supplied license | None supplied | PyPI |
 | hatch-vcs | 0.5.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | hatchling | 1.31.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | h11 | 0.16.0 | MIT | reviewed | Retain notices | None identified | PyPI |
@@ -75,9 +77,21 @@ locked distribution without contacting the network.
 | iniconfig | 2.3.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | jsonschema | 4.26.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | jsonschema-specifications | 2025.9.1 | MIT | reviewed | Retain notices | None identified | PyPI |
+| jsonpatch | 1.33 | BSD-3-Clause | reviewed | Retain notices | None identified | PyPI |
+| jsonpointer | 3.1.1 | BSD-3-Clause | reviewed | Retain notices | None identified | PyPI |
+| langchain | 1.3.14 | MIT | reviewed | Retain notices | None identified | PyPI |
+| langchain-core | 1.5.1 | MIT | reviewed | Retain notices | None identified | PyPI |
+| langchain-protocol | 0.0.18 | MIT | reviewed | Retain notices | None identified | PyPI |
+| langgraph | 1.2.9 | MIT | reviewed | Retain notices | None identified | PyPI |
+| langgraph-checkpoint | 4.1.1 | MIT | reviewed | Retain notices | None identified | PyPI |
+| langgraph-prebuilt | 1.1.0 | MIT | reviewed | Retain notices | None identified | PyPI |
+| langgraph-sdk | 0.4.2 | MIT | reviewed | Retain notices | None identified | PyPI |
+| langsmith | 0.10.10 | MIT | reviewed | Retain notices | None identified | PyPI |
 | librt | 0.13.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | mypy | 2.3.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | mypy-extensions | 1.1.0 | MIT | reviewed | Retain notices | None identified | PyPI |
+| orjson | 3.11.9 | MPL-2.0 AND (Apache-2.0 OR MIT) | reviewed | Retain supplied licenses; disclose modifications to covered files | None supplied | PyPI |
+| ormsgpack | 1.12.2 | Apache-2.0 OR MIT | reviewed | Retain supplied licenses | None supplied | PyPI |
 | packaging | 26.2 | Apache-2.0 OR BSD-2-Clause | reviewed | Retain notices | Include supplied NOTICE | PyPI |
 | pathspec | 1.1.1 | MPL-2.0 | reviewed | Retain notices; disclose modifications to covered files | None identified | PyPI |
 | pluggy | 1.6.0 | MIT | reviewed | Retain notices | None identified | PyPI |
@@ -88,15 +102,24 @@ locked distribution without contacting the network.
 | pytest | 9.1.1 | MIT | reviewed | Retain notices | None identified | PyPI |
 | pyyaml | 6.0.3 | MIT | reviewed | Retain notices | None identified | PyPI |
 | referencing | 0.37.0 | MIT | reviewed | Retain notices | None identified | PyPI |
+| requests | 2.34.2 | Apache-2.0 | reviewed | Retain supplied license and notices | Include supplied NOTICE | PyPI |
+| requests-toolbelt | 1.0.0 | Apache-2.0 | reviewed | Retain supplied license | None supplied | PyPI |
 | rpds-py | 2026.6.3 | MIT | reviewed | Retain notices | None identified | PyPI |
 | ruff | 0.16.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | setuptools | 83.0.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | setuptools-scm | 10.2.1 | MIT | reviewed | Retain notices | None identified | PyPI |
+| sniffio | 1.3.1 | MIT OR Apache-2.0 | reviewed | Retain supplied licenses | None supplied | PyPI |
+| tenacity | 9.1.4 | Apache-2.0 | reviewed | Retain supplied license | None supplied | PyPI |
 | trove-classifiers | 2026.6.1.19 | Apache-2.0 | reviewed | Retain notices | Include supplied NOTICE | PyPI |
 | typing-extensions | 4.16.0 | PSF-2.0 | reviewed | Retain notices | None identified | PyPI |
 | typing-inspection | 0.4.2 | MIT | reviewed | Retain notices | None identified | PyPI |
 | unicodedata2 | 15.1.0 | Apache-2.0 | reviewed | Retain license and notices | None supplied | PyPI |
+| urllib3 | 2.7.0 | MIT | reviewed | Retain notices | None identified | PyPI |
+| uuid-utils | 0.17.0 | BSD-3-Clause | reviewed | Retain notices | None identified | PyPI |
 | vcs-versioning | 2.2.2 | MIT | reviewed | Retain notices | None identified | PyPI |
+| websockets | 15.0.1 | BSD-3-Clause | reviewed | Retain notices | None identified | PyPI |
+| xxhash | 3.8.1 | BSD-2-Clause | reviewed | Retain notices | None identified | PyPI |
+| zstandard | 0.25.0 | BSD-3-Clause | reviewed | Retain notices | None identified | PyPI |
 <!-- dependency-inventory:end -->
 
 ## CI-only tools and actions

@@ -50,6 +50,12 @@ Repository = "https://github.com/rogerchucker/palonexus-sdk"
 Issues = "https://github.com/rogerchucker/palonexus-sdk/issues"
 Changelog = "https://github.com/rogerchucker/palonexus-sdk/blob/main/CHANGELOG.md"
 
+[project.optional-dependencies]
+langchain = [
+    "langchain>=1,<2",
+    "langchain-core>=1,<2",
+]
+
 [tool.hatch.version]
 source = "vcs"
 
