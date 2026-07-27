@@ -9,6 +9,12 @@ from .did import (
     sign_ed25519,
     verify_ed25519,
 )
+from .oidc import (
+    OIDCVerificationFailed,
+    OIDCVerifier,
+    OIDCVerifierConfig,
+    VerifiedOIDCIdentity,
+)
 from .vc import (
     MemoryReplayStore,
     ReplayStore,
@@ -28,6 +34,9 @@ from .vc import (
 __all__ = [
     "DidKey",
     "IdentityVerificationFailed",
+    "OIDCVerificationFailed",
+    "OIDCVerifier",
+    "OIDCVerifierConfig",
     "MemoryReplayStore",
     "ReplayStore",
     "RevocationLookup",
@@ -35,6 +44,7 @@ __all__ = [
     "VerifiedCredential",
     "VerifiedDelegation",
     "VerifiedPresentation",
+    "VerifiedOIDCIdentity",
     "create_delegation",
     "create_verifiable_credential",
     "create_verifiable_presentation",
