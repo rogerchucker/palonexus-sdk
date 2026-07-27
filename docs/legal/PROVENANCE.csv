@@ -168,3 +168,6 @@ examples/python-basic/README.md,rogerchucker/palonexus-sdk,WORKTREE,examples/pyt
 examples/python-async/main.py,rogerchucker/palonexus-sdk,WORKTREE,examples/python-async/main.py,PaloNexus,yes,new,MIT,rogerchucker
 examples/python-async/README.md,rogerchucker/palonexus-sdk,WORKTREE,examples/python-async/README.md,PaloNexus,yes,new,MIT,rogerchucker
 python/tests/test_examples.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/test_examples.py,PaloNexus,yes,new,MIT,rogerchucker
+.github/workflows/python.yml,rogerchucker/palonexus-sdk,WORKTREE,.github/workflows/python.yml,PaloNexus,yes,new,MIT,rogerchucker
+python/tests/test_package_metadata.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/test_package_metadata.py,PaloNexus,yes,new,MIT,rogerchucker
+scripts/verify_python_artifacts.py,rogerchucker/palonexus-sdk,WORKTREE,scripts/verify_python_artifacts.py,PaloNexus,yes,new,MIT,rogerchucker

@@ -47,6 +47,7 @@ dependencies = [
 [project.urls]
 Homepage = "https://github.com/rogerchucker/palonexus-sdk"
 Repository = "https://github.com/rogerchucker/palonexus-sdk"
+Documentation = "https://github.com/rogerchucker/palonexus-sdk#readme"
 Issues = "https://github.com/rogerchucker/palonexus-sdk/issues"
 Changelog = "https://github.com/rogerchucker/palonexus-sdk/blob/main/CHANGELOG.md"
 
@@ -76,3 +77,10 @@ version-file = "src/palonexus/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/palonexus"]
+
+[tool.hatch.build.targets.sdist]
+include = [
+  "LICENSE",
+  "pyproject.toml",
+  "src/palonexus",
+]
