@@ -80,7 +80,12 @@ class IdentityVerificationFailed(Exception):
 
 
 def _capture[T](operation: Callable[[], T]) -> T | object:
-    """Discard an entire unsafe exception graph and return only a sentinel."""
+    """Capture explicit control flow; discard every other failure graph.
+
+    Exception groups are intentionally opaque failures. A group is not itself
+    one of the four direct control-flow types, even when a nested member is, so
+    the whole group is sanitized instead of partially propagated.
+    """
 
     try:
         return operation()
@@ -94,7 +99,7 @@ def _capture[T](operation: Callable[[], T]) -> T | object:
         error.__cause__ = None
         error.__context__ = None
         return _ControlFlow(error)
-    except Exception:
+    except BaseException:
         return _FAILED
 
 

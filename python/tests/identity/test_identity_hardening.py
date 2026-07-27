@@ -473,7 +473,7 @@ class _CancellationStore:
 
     def __init__(
         self,
-        cancellation: asyncio.CancelledError,
+        cancellation: BaseException,
         *,
         cancel_on: str,
     ) -> None:
@@ -771,3 +771,142 @@ def test_generator_exit_is_not_converted_to_identity_failure() -> None:
             tenant_id=TENANT,
             key_id="generator-exit",
         )
+
+
+class _HostileBaseException(BaseException):
+    pass
+
+
+def _assert_sanitized_base_exception(
+    operation: Callable[[], object],
+    *needles: str,
+) -> None:
+    with pytest.raises(IdentityVerificationFailed) as captured:
+        operation()
+    _assert_secret_unreachable(captured.value, *needles)
+
+
+@pytest.mark.parametrize("fail_on", ["store", "load", "lease"])
+def test_custom_base_exception_from_key_store_is_sanitized(fail_on: str) -> None:
+    hostile = _HostileBaseException("LEAK-hostile-base")
+    store = _CancellationStore(hostile, cancel_on=fail_on)
+    operation: Callable[[], object]
+    if fail_on == "store":
+        operation = partial(
+            generate_ed25519_key,
+            key_store=store,
+            tenant_id="LEAK-hostile-tenant",
+            key_id="hostile",
+        )
+    else:
+        key = generate_ed25519_key(
+            key_store=store.inner,
+            tenant_id=TENANT,
+            key_id="hostile",
+        )
+        operation = partial(
+            sign_ed25519,
+            b"LEAK-hostile-message",
+            key_store=store,
+            tenant_id=TENANT,
+            key_id="hostile",
+            expected_did=key.did,
+        )
+    _assert_sanitized_base_exception(
+        operation,
+        "LEAK-hostile-base",
+        "LEAK-hostile-tenant",
+        "LEAK-hostile-message",
+    )
+
+
+def test_custom_base_exception_from_revocation_and_replay_is_sanitized() -> None:
+    class HostileRevocation:
+        def is_revoked(self, credential_id: str) -> bool:
+            del credential_id
+            raise _HostileBaseException("LEAK-hostile-revocation")
+
+    with EphemeralKeyStore(testing_only=True) as store:
+        credential, _ = _issued_token(store)
+    _assert_sanitized_base_exception(
+        partial(
+            verify_verifiable_credential,
+            credential,
+            expected_audience="control-plane",
+            now=NOW,
+            revocation_lookup=HostileRevocation(),
+        ),
+        credential,
+        "LEAK-hostile-revocation",
+    )
+
+    class HostileReplay:
+        def check_and_record(
+            self,
+            replay_id: str,
+            *,
+            expires_at: datetime,
+            now: datetime,
+        ) -> bool:
+            del replay_id, expires_at, now
+            raise _HostileBaseException("LEAK-hostile-replay")
+
+    with EphemeralKeyStore(testing_only=True) as store:
+        holder = generate_ed25519_key(
+            key_store=store,
+            tenant_id=TENANT,
+            key_id="hostile-holder",
+        )
+        credential, _ = _issued_token(
+            store,
+            key_id="hostile-issuer",
+            expires_at=NOW + timedelta(minutes=2),
+        )
+        presentation = create_verifiable_presentation(
+            key_store=store,
+            tenant_id=TENANT,
+            key_id="hostile-holder",
+            holder=holder.did,
+            credentials=(credential,),
+            audience="control-plane",
+            challenge="hostile-challenge",
+            presentation_id="urn:uuid:hostile-presentation",
+            issued_at=NOW,
+            expires_at=NOW + timedelta(minutes=1),
+        )
+    _assert_sanitized_base_exception(
+        partial(
+            verify_verifiable_presentation,
+            presentation,
+            expected_audience="control-plane",
+            expected_challenge="hostile-challenge",
+            now=NOW,
+            revocation_lookup=StaticRevocationLookup(),
+            replay_store=HostileReplay(),
+        ),
+        presentation,
+        "LEAK-hostile-replay",
+    )
+
+
+def test_base_exception_group_is_sanitized_as_one_opaque_failure() -> None:
+    grouped = BaseExceptionGroup(
+        "LEAK-hostile-group",
+        [
+            asyncio.CancelledError("LEAK-nested-cancellation"),
+            _HostileBaseException("LEAK-nested-base"),
+        ],
+    )
+    store = _CancellationStore(grouped, cancel_on="store")
+    _assert_sanitized_base_exception(
+        partial(
+            generate_ed25519_key,
+            key_store=store,
+            tenant_id="LEAK-group-tenant",
+            key_id="grouped",
+        ),
+        "LEAK-hostile-group",
+        "LEAK-nested-cancellation",
+        "LEAK-nested-base",
+        "LEAK-group-tenant",
+    )
