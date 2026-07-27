@@ -51,13 +51,24 @@ type batchCheckpoint struct {
 	digest               [32]byte
 }
 
+type batchTransaction struct {
+	Version             int             `json:"version"`
+	RecordName          string          `json:"recordName"`
+	CheckpointName      string          `json:"checkpointName"`
+	OldRecordDigest     string          `json:"oldRecordDigest"`
+	OldCheckpointDigest string          `json:"oldCheckpointDigest"`
+	NewEnvelope         diskEnvelope    `json:"newEnvelope"`
+	NewCheckpoint       batchCheckpoint `json:"newCheckpoint"`
+}
+
 type unixQueue struct {
-	rootFD    int
-	root      string
-	config    Config
-	lifecycle sync.RWMutex
-	mu        sync.Mutex
-	closed    bool
+	rootFD                 int
+	root                   string
+	config                 Config
+	lifecycle              sync.RWMutex
+	mu                     sync.Mutex
+	closed                 bool
+	afterTransactionRecord func() error
 }
 
 func openQueue(config Config) (queueImpl, error) {
@@ -70,6 +81,9 @@ func openQueue(config Config) (queueImpl, error) {
 	}
 	q := &unixQueue{rootFD: fd, root: config.Root, config: config}
 	if err := q.withLock(context.Background(), func() error {
+		if err := q.recoverTransactions(context.Background()); err != nil {
+			return err
+		}
 		if err := q.validateAll(); err != nil {
 			return err
 		}
@@ -250,6 +264,9 @@ func isQuarantineName(name string) bool {
 		validHex(name[len(".quarantine-"):len(".quarantine-")+64]) &&
 		validHex(name[len(".quarantine-")+65:])
 }
+func isTransactionName(name string) bool {
+	return len(name) == len(".txn-")+32 && strings.HasPrefix(name, ".txn-") && validHex(name[len(".txn-"):])
+}
 
 func validHex(value string) bool {
 	_, err := hex.DecodeString(value)
@@ -319,14 +336,21 @@ func (q *unixQueue) validateEnqueueSequence(ctx context.Context, b Binding, reco
 	} else if err != nil {
 		return err
 	}
-	items, err := q.boundRecords(b)
+	names, err := q.names()
 	if err != nil {
 		return err
 	}
 	maxSequence := p.JSONInteger(-1)
-	for _, item := range items {
+	for _, name := range names {
+		item, readErr := q.read(name)
+		if readErr != nil {
+			return readErr
+		}
 		if item.Record.BatchID != record.BatchID {
 			continue
+		}
+		if item.TenantHash != hashBinding(b, true) || item.SubjectHash != hashBinding(b, false) {
+			return ErrConflict
 		}
 		if item.Record.State == p.ReconciliationStateDiscarded {
 			return ErrConflict
@@ -372,38 +396,6 @@ func (q *unixQueue) get(ctx context.Context, b Binding, id p.ReconciliationID) (
 		return nil
 	})
 	return result, err
-}
-
-func (q *unixQueue) advanceCheckpoint(ctx context.Context, b Binding, record p.ReconciliationRecord) error {
-	return q.withLock(ctx, func() error {
-		env, err := q.read(recordName(record.ReconciliationID))
-		if err != nil {
-			return err
-		}
-		if env.TenantHash != hashBinding(b, true) || env.SubjectHash != hashBinding(b, false) ||
-			env.Record.State != p.ReconciliationStateAcknowledged {
-			return ErrConflict
-		}
-		checkpoint, err := q.readCheckpoint(record.BatchID)
-		if err != nil {
-			return err
-		}
-		key := strconv.FormatInt(int64(record.BatchSequence), 10)
-		entry := checkpointEntry{ReconciliationID: record.ReconciliationID, EvidenceHash: env.EvidenceHash}
-		if record.BatchSequence < checkpoint.ExpectedNextSequence {
-			if checkpoint.CompletedPrefix[key] != entry {
-				return ErrConflict
-			}
-			return nil
-		}
-		if record.BatchSequence != checkpoint.ExpectedNextSequence {
-			return ErrConflict
-		}
-		previous := checkpoint
-		checkpoint.CompletedPrefix[key] = entry
-		checkpoint.ExpectedNextSequence++
-		return q.writeCheckpoint(ctx, checkpoint, &previous)
-	})
 }
 
 func (q *unixQueue) reconcileCheckpoints(ctx context.Context) error {
@@ -726,7 +718,14 @@ func (q *unixQueue) fail(ctx context.Context, b Binding, id p.ReconciliationID, 
 
 func (q *unixQueue) ack(ctx context.Context, b Binding, id p.ReconciliationID, receipt Receipt) (p.ReconciliationRecord, error) {
 	var result p.ReconciliationRecord
-	err := q.transition(ctx, b, id, func(env diskEnvelope) (p.ReconciliationRecord, error) {
+	err := q.withLock(ctx, func() error {
+		env, err := q.read(recordName(id))
+		if err != nil {
+			return err
+		}
+		if env.TenantHash != hashBinding(b, true) || env.SubjectHash != hashBinding(b, false) {
+			return ErrNotFound
+		}
 		r := env.Record
 		if r.State == p.ReconciliationStateAcknowledged {
 			if r.Acknowledgement != nil &&
@@ -737,32 +736,62 @@ func (q *unixQueue) ack(ctx context.Context, b Binding, id p.ReconciliationID, r
 				receipt.Tenant == b.Tenant && receipt.ClientID == r.ClientID &&
 				!receipt.VerifiedAt.IsZero() && !timeMust(&receipt.AcknowledgedAt).After(receipt.VerifiedAt) {
 				result = r
-				return r, nil
+				return q.ensureCheckpointEntry(ctx, env)
 			}
-			return r, ErrConflict
+			return ErrConflict
 		}
 		if r.State != p.ReconciliationStateSending || receipt.Tenant != b.Tenant || receipt.ClientID != r.ClientID ||
 			receipt.ReconciliationID != r.ReconciliationID || receipt.EvidenceHash != env.EvidenceHash {
-			return r, ErrRejected
+			return ErrRejected
 		}
 		at, err := parseTime(receipt.AcknowledgedAt)
 		if err != nil || receipt.VerifiedAt.IsZero() || at.After(receipt.VerifiedAt) ||
 			at.Before(timeMust(r.LastAttemptAt)) {
-			return r, ErrRejected
+			return ErrRejected
 		}
 		r.State = p.ReconciliationStateAcknowledged
 		r.AcknowledgedAt = &receipt.AcknowledgedAt
 		r.Acknowledgement = &p.ReconciliationAcknowledgement{ReceiptID: receipt.ReceiptID, ReconciliationID: receipt.ReconciliationID, EvidenceHash: receipt.EvidenceHash, AcknowledgedAt: receipt.AcknowledgedAt}
 		result = r
-		return r, nil
+		if _, err := validateRecord(r, q.config.MaxRecordBytes); err != nil {
+			return err
+		}
+		checkpoint, err := q.readCheckpoint(r.BatchID)
+		if err != nil {
+			return err
+		}
+		if r.BatchSequence != checkpoint.ExpectedNextSequence {
+			return ErrConflict
+		}
+		key := strconv.FormatInt(int64(r.BatchSequence), 10)
+		checkpoint.CompletedPrefix[key] = checkpointEntry{ReconciliationID: r.ReconciliationID, EvidenceHash: env.EvidenceHash}
+		checkpoint.ExpectedNextSequence++
+		env.Record = r
+		return q.commitBatchTransaction(ctx, env, checkpoint)
 	})
+	return result, err
+}
+
+func (q *unixQueue) ensureCheckpointEntry(ctx context.Context, env diskEnvelope) error {
+	checkpoint, err := q.readCheckpoint(env.Record.BatchID)
 	if err != nil {
-		return result, err
+		return err
 	}
-	if err := q.advanceCheckpoint(ctx, b, result); err != nil {
-		return result, err
+	key := strconv.FormatInt(int64(env.Record.BatchSequence), 10)
+	entry := checkpointEntry{ReconciliationID: env.Record.ReconciliationID, EvidenceHash: env.EvidenceHash}
+	if env.Record.BatchSequence < checkpoint.ExpectedNextSequence {
+		if checkpoint.CompletedPrefix[key] != entry {
+			return ErrConflict
+		}
+		return nil
 	}
-	return result, nil
+	if env.Record.BatchSequence != checkpoint.ExpectedNextSequence {
+		return ErrConflict
+	}
+	previous := checkpoint
+	checkpoint.CompletedPrefix[key] = entry
+	checkpoint.ExpectedNextSequence++
+	return q.writeCheckpoint(ctx, checkpoint, &previous)
 }
 
 func (q *unixQueue) discard(ctx context.Context, b Binding, id p.ReconciliationID, now time.Time, authority p.DiscardAuthorityType, reason string, _ bool) (p.ReconciliationRecord, error) {
@@ -937,7 +966,7 @@ func (q *unixQueue) names() ([]string, error) {
 	}
 	var records []string
 	for _, name := range names {
-		if name == ".queue.lock" || isTempName(name) || isQuarantineName(name) || isCheckpointName(name) {
+		if name == ".queue.lock" || isTempName(name) || isQuarantineName(name) || isCheckpointName(name) || isTransactionName(name) {
 			continue
 		}
 		if !isRecordName(name) {
@@ -962,7 +991,7 @@ func (q *unixQueue) entries() ([]string, error) {
 	}
 	file := os.NewFile(uintptr(dup), "queue")
 	defer file.Close()
-	limit := q.config.MaxRecords*2 + 35
+	limit := q.config.MaxRecords*2 + 67
 	names, err := file.Readdirnames(limit)
 	if err != nil && !errors.Is(err, io.EOF) {
 		return nil, ErrUnsafePath
@@ -983,7 +1012,7 @@ func (q *unixQueue) usage() (int, int64, error) {
 		if n == ".queue.lock" || isTempName(n) {
 			continue
 		}
-		if !isRecordName(n) && !isQuarantineName(n) && !isCheckpointName(n) {
+		if !isRecordName(n) && !isQuarantineName(n) && !isCheckpointName(n) && !isTransactionName(n) {
 			return 0, 0, ErrCorrupt
 		}
 		var st unix.Stat_t
@@ -1025,8 +1054,14 @@ func (q *unixQueue) validateAll() error {
 			}
 			continue
 		}
+		if isTransactionName(n) {
+			return ErrCorrupt
+		}
 		if isCheckpointName(n) {
 			if _, err := q.readCheckpointByName(n); err != nil {
+				if errors.Is(err, ErrCorrupt) {
+					_ = q.quarantine(n)
+				}
 				return err
 			}
 			continue
@@ -1198,6 +1233,152 @@ func (q *unixQueue) writeCheckpoint(ctx context.Context, checkpoint batchCheckpo
 		expected = &diskEnvelope{dev: previous.dev, ino: previous.ino, digest: previous.digest}
 	}
 	return q.atomicWrite(ctx, checkpointName(checkpoint.BatchID), wire, expected)
+}
+
+func (q *unixQueue) commitBatchTransaction(ctx context.Context, env diskEnvelope, checkpoint batchCheckpoint) error {
+	var token [16]byte
+	if _, err := rand.Read(token[:]); err != nil {
+		return ErrUnsafePath
+	}
+	name := ".txn-" + hex.EncodeToString(token[:])
+	transaction := batchTransaction{
+		Version: envelopeVersion, RecordName: recordName(env.Record.ReconciliationID),
+		CheckpointName:      checkpointName(checkpoint.BatchID),
+		OldRecordDigest:     hex.EncodeToString(env.digest[:]),
+		OldCheckpointDigest: hex.EncodeToString(checkpoint.digest[:]),
+		NewEnvelope:         env, NewCheckpoint: checkpoint,
+	}
+	document, err := json.Marshal(transaction)
+	if err != nil || int64(len(document)) > q.config.MaxBytes {
+		return ErrQueueFull
+	}
+	if err := q.atomicWrite(ctx, name, document, nil); err != nil {
+		return err
+	}
+	return q.applyTransaction(ctx, name, transaction)
+}
+
+func (q *unixQueue) recoverTransactions(ctx context.Context) error {
+	entries, err := q.entries()
+	if err != nil {
+		return err
+	}
+	count := 0
+	for _, name := range entries {
+		if !isTransactionName(name) {
+			continue
+		}
+		count++
+		if count > 32 {
+			return ErrQueueFull
+		}
+		document, readErr := q.readSafeFile(name, q.config.MaxBytes)
+		if readErr != nil {
+			if errors.Is(readErr, ErrCorrupt) {
+				_ = q.quarantine(name)
+			}
+			return readErr
+		}
+		var transaction batchTransaction
+		decoder := json.NewDecoder(bytes.NewReader(document))
+		decoder.DisallowUnknownFields()
+		if decoder.Decode(&transaction) != nil || decoder.Decode(&struct{}{}) != io.EOF || transaction.Version != envelopeVersion {
+			_ = q.quarantine(name)
+			return ErrCorrupt
+		}
+		if err := q.applyTransaction(ctx, name, transaction); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func (q *unixQueue) applyTransaction(ctx context.Context, name string, transaction batchTransaction) error {
+	if !isRecordName(transaction.RecordName) || !isCheckpointName(transaction.CheckpointName) ||
+		recordName(transaction.NewEnvelope.Record.ReconciliationID) != transaction.RecordName ||
+		checkpointName(transaction.NewCheckpoint.BatchID) != transaction.CheckpointName ||
+		len(transaction.OldRecordDigest) != 64 || len(transaction.OldCheckpointDigest) != 64 {
+		return ErrCorrupt
+	}
+	if _, err := validateRecord(transaction.NewEnvelope.Record, q.config.MaxRecordBytes); err != nil {
+		return ErrCorrupt
+	}
+	hash, err := evidenceHash(transaction.NewEnvelope.Record)
+	if err != nil || hash != transaction.NewEnvelope.EvidenceHash {
+		return ErrCorrupt
+	}
+	recordWire, err := json.Marshal(transaction.NewEnvelope)
+	if err != nil {
+		return ErrCorrupt
+	}
+	checkpointWire, err := json.Marshal(transaction.NewCheckpoint)
+	if err != nil {
+		return ErrCorrupt
+	}
+	current, err := q.read(transaction.RecordName)
+	newRecordDigest := sha256.Sum256(recordWire)
+	if err != nil {
+		return err
+	}
+	if current.digest != newRecordDigest {
+		if hex.EncodeToString(current.digest[:]) != transaction.OldRecordDigest {
+			return ErrConflict
+		}
+		if err := q.atomicWrite(ctx, transaction.RecordName, recordWire, &current); err != nil {
+			return err
+		}
+	}
+	if q.afterTransactionRecord != nil {
+		if err := q.afterTransactionRecord(); err != nil {
+			return err
+		}
+	}
+	currentCheckpoint, err := q.readCheckpointByName(transaction.CheckpointName)
+	newCheckpointDigest := sha256.Sum256(checkpointWire)
+	if err != nil {
+		return err
+	}
+	if currentCheckpoint.digest != newCheckpointDigest {
+		if hex.EncodeToString(currentCheckpoint.digest[:]) != transaction.OldCheckpointDigest {
+			return ErrConflict
+		}
+		expected := diskEnvelope{dev: currentCheckpoint.dev, ino: currentCheckpoint.ino, digest: currentCheckpoint.digest}
+		if err := q.atomicWrite(ctx, transaction.CheckpointName, checkpointWire, &expected); err != nil {
+			return err
+		}
+	}
+	var st unix.Stat_t
+	if unix.Fstatat(q.rootFD, name, &st, unix.AT_SYMLINK_NOFOLLOW) != nil || st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 {
+		return ErrUnsafePath
+	}
+	if unix.Unlinkat(q.rootFD, name, 0) != nil || unix.Fsync(q.rootFD) != nil {
+		return ErrUnsafePath
+	}
+	return nil
+}
+
+func (q *unixQueue) readSafeFile(name string, maximum int64) ([]byte, error) {
+	fd, err := unix.Openat(q.rootFD, name, unix.O_RDONLY|unix.O_CLOEXEC|unix.O_NOFOLLOW|unix.O_NONBLOCK, 0)
+	if err != nil {
+		return nil, ErrUnsafePath
+	}
+	defer unix.Close(fd)
+	if err := validateRegular(fd, 0o600); err != nil {
+		return nil, err
+	}
+	var st unix.Stat_t
+	if unix.Fstat(fd, &st) != nil || st.Size <= 0 || st.Size > maximum {
+		return nil, ErrCorrupt
+	}
+	document := make([]byte, int(st.Size))
+	for offset := 0; offset < len(document); {
+		n, readErr := unix.Read(fd, document[offset:])
+		if readErr != nil || n == 0 {
+			return nil, ErrCorrupt
+		}
+		offset += n
+	}
+	return document, nil
 }
 
 func (q *unixQueue) atomicWrite(ctx context.Context, name string, document []byte, expected *diskEnvelope) error {

@@ -584,6 +584,44 @@ func TestOrderedBatchCheckpointRejectsGapsAndResumesPrunedPrefix(t *testing.T) {
 	}
 }
 
+func TestAckTransactionRecoversCrashBetweenRecordAndCheckpoint(t *testing.T) {
+	root := queueRoot(t)
+	config := Config{Root: root, MaxRecords: 8, MaxBytes: 1 << 20}
+	q, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := pending()
+	if err := q.Enqueue(context.Background(), b1, record); err != nil {
+		t.Fatal(err)
+	}
+	sending, err := q.Claim(context.Background(), b1, t0.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := NewReceipt(sending, "receipt_01J5ABCDEFGHJKMNPQRSTVWXY0", t0.Add(2*time.Second), b1, sending.ClientID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	impl := q.impl.(*unixQueue)
+	impl.afterTransactionRecord = func() error { return errors.New("simulated crash") }
+	if _, err = q.Acknowledge(context.Background(), b1, sending.ReconciliationID, receipt); err == nil {
+		t.Fatal("fault did not interrupt transaction")
+	}
+	if err := q.Close(); err != nil {
+		t.Fatal(err)
+	}
+	q, err = Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer q.Close()
+	recovered, err := q.Get(context.Background(), b1, record.ReconciliationID)
+	if err != nil || recovered.State != p.ReconciliationStateAcknowledged {
+		t.Fatalf("transaction not recovered: %v %+v", err, recovered)
+	}
+}
+
 func TestPermanentDeliveryErrorIsHeldUntilAuthorizedManualRetry(t *testing.T) {
 	q, err := Open(Config{Root: queueRoot(t), MaxRecords: 8, MaxBytes: 1 << 20, Authority: testAuthority{subject: b1.Subject}})
 	if err != nil {
