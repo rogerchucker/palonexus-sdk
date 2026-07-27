@@ -16,9 +16,16 @@ build-backend = "hatchling.build"
 name = "palonexus"
 dynamic = ["version"]
 description = "Python SDK for the PaloNexus agent control plane"
-readme = "../README.md"
+readme = { text = """
+# PaloNexus Python SDK
+
+Typed, fail-closed authorization models and clients for the PaloNexus agent
+control plane. Documentation and examples are maintained in the public
+[PaloNexus SDK repository](https://github.com/rogerchucker/palonexus-sdk).
+""", content-type = "text/markdown" }
 requires-python = ">=3.12"
 license = "MIT"
+license-files = ["LICENSE"]
 authors = [
   { name = "PaloNexus maintainers" },
 ]
@@ -28,6 +35,9 @@ classifiers = [
   "Programming Language :: Python :: 3",
   "Programming Language :: Python :: 3.12",
   "Programming Language :: Python :: 3.13",
+]
+dependencies = [
+  "pydantic>=2.13.4,<3",
 ]
 
 [project.urls]
@@ -48,7 +58,3 @@ version-file = "src/palonexus/_version.py"
 
 [tool.hatch.build.targets.wheel]
 packages = ["src/palonexus"]
-
-# The distribution metadata is established before package sources are added.
-[tool.uv]
-package = false

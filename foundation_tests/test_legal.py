@@ -362,6 +362,38 @@ def test_verifier_fails_closed_on_unsupported_dependency_sources(
     assert message in result.stdout
 
 
+def test_verifier_accepts_the_declared_uv_workspace_editable(tmp_path: Path) -> None:
+    repository = _legal_fixture(
+        tmp_path,
+        pyproject='[project]\nname="palonexus"\nlicense="MIT"\n',
+    )
+    (repository / "pyproject.toml").write_text(
+        '[tool.uv.workspace]\nmembers=["python"]\n',
+        encoding="utf-8",
+    )
+    (repository / "uv.lock").write_text(
+        'version=1\n[[package]]\nname="palonexus"\nsource={editable="python"}\n',
+        encoding="utf-8",
+    )
+
+    result = _run_verifier(repository)
+
+    assert "unsupported locked dependency source: palonexus" not in result.stdout
+
+
+def test_verifier_rejects_an_undeclared_editable_lock_source(tmp_path: Path) -> None:
+    repository = _legal_fixture(tmp_path)
+    (repository / "uv.lock").write_text(
+        'version=1\n[[package]]\nname="untrusted"\nsource={editable="../outside"}\n',
+        encoding="utf-8",
+    )
+
+    result = _run_verifier(repository)
+
+    assert result.returncode == 1
+    assert "unsupported locked dependency source: untrusted" in result.stdout
+
+
 @pytest.mark.parametrize(
     "destination",
     [

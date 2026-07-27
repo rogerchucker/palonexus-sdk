@@ -7,6 +7,7 @@ dev = [
   "hatchling>=1.27",
   "idna==3.18",
   "jsonschema>=4.25",
+  "mypy==2.3.0",
   "pytest>=8.4",
   "pyyaml==6.0.3",
   "ruff>=0.12",
@@ -16,6 +17,16 @@ dev = [
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["foundation_tests", "protocol/tests", "python/tests"]
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+
+[[tool.mypy.overrides]]
+# Generated DTOs are checked by deterministic generation and protocol suites.
+# Handwritten SDK modules remain under strict mypy.
+module = "palonexus._generated.*"
+ignore_errors = true
 
 [tool.palonexus.protocol-generation]
 generator-version = "2"

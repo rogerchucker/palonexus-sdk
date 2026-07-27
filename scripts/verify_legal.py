@@ -761,6 +761,48 @@ def _locked_artifacts(package: dict[str, object]) -> list[dict[str, object]]:
     return artifacts
 
 
+def _workspace_editables(errors: list[str]) -> dict[str, str]:
+    """Return exact ``uv`` workspace paths mapped to their project names."""
+
+    root_manifest = ROOT / "pyproject.toml"
+    if not root_manifest.is_file():
+        return {}
+    try:
+        root_data = tomllib.loads(root_manifest.read_text(encoding="utf-8"))
+    except (OSError, tomllib.TOMLDecodeError):
+        return {}
+    tool = root_data.get("tool", {})
+    uv = tool.get("uv", {}) if isinstance(tool, dict) else {}
+    workspace = uv.get("workspace", {}) if isinstance(uv, dict) else {}
+    members = workspace.get("members", []) if isinstance(workspace, dict) else []
+    if not isinstance(members, list):
+        errors.append("invalid uv workspace members")
+        return {}
+
+    editables: dict[str, str] = {}
+    for member in members:
+        if not isinstance(member, str) or _safe_relative(member) is None:
+            errors.append(f"unsupported uv workspace member: {member!r}")
+            continue
+        member_path = ROOT / member
+        manifest = member_path / "pyproject.toml"
+        if member_path.is_symlink() or manifest.is_symlink():
+            errors.append(f"workspace member symlink is not allowed: {member}")
+            continue
+        try:
+            member_data = tomllib.loads(manifest.read_text(encoding="utf-8"))
+        except (OSError, tomllib.TOMLDecodeError):
+            errors.append(f"cannot read uv workspace member: {member}")
+            continue
+        project = member_data.get("project", {})
+        name = project.get("name") if isinstance(project, dict) else None
+        if not isinstance(name, str) or _requirement_name(name) is None:
+            errors.append(f"uv workspace member has invalid project name: {member}")
+            continue
+        editables[member] = name.lower().replace("_", "-")
+    return editables
+
+
 def _manifest_dependencies(errors: list[str]) -> dict[str, str]:
     requirements_by_name: dict[str, str] = {}
     constraints_by_name: dict[str, list[str]] = {}
@@ -895,6 +937,7 @@ def _manifest_dependencies(errors: list[str]) -> dict[str, str]:
     dependencies = dict(requirements_by_name)
     locked_names: set[str] = set()
     locked_graph: dict[str, set[str]] = {}
+    workspace_editables = _workspace_editables(errors)
     lock = ROOT / "uv.lock"
     if lock.is_file():
         try:
@@ -955,6 +998,23 @@ def _manifest_dependencies(errors: list[str]) -> dict[str, str]:
                             if isinstance(dependency, dict)
                             and isinstance(dependency.get("name"), str)
                         }
+                elif "editable" in source:
+                    editable = source.get("editable")
+                    name = package.get("name")
+                    normalized_name = (
+                        name.lower().replace("_", "-")
+                        if isinstance(name, str)
+                        else None
+                    )
+                    if (
+                        not isinstance(editable, str)
+                        or workspace_editables.get(editable) != normalized_name
+                        or set(source) != {"editable"}
+                    ):
+                        errors.append(
+                            "unsupported locked dependency source: "
+                            f"{package.get('name')}"
+                        )
                 elif "virtual" not in source:
                     errors.append(
                         f"unsupported locked dependency source: {package.get('name')}"

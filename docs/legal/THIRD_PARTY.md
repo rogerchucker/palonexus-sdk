@@ -57,6 +57,8 @@ locked distribution without contacting the network.
 <!-- dependency-inventory:start -->
 | Dependency | Version | License | Review status | Obligations | Notice | Source |
 | --- | --- | --- | --- | --- | --- | --- |
+| annotated-types | 0.8.0 | MIT | reviewed | Retain notices | None identified | PyPI |
+| ast-serialize | 0.6.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | attrs | 26.1.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | colorama | 0.4.6 | BSD-3-Clause | reviewed | Retain notices | None identified | PyPI |
 | hatch-vcs | 0.5.0 | MIT | reviewed | Retain notices | None identified | PyPI |
@@ -65,9 +67,14 @@ locked distribution without contacting the network.
 | iniconfig | 2.3.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | jsonschema | 4.26.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | jsonschema-specifications | 2025.9.1 | MIT | reviewed | Retain notices | None identified | PyPI |
+| librt | 0.13.0 | MIT | reviewed | Retain notices | None identified | PyPI |
+| mypy | 2.3.0 | MIT | reviewed | Retain notices | None identified | PyPI |
+| mypy-extensions | 1.1.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | packaging | 26.2 | Apache-2.0 OR BSD-2-Clause | reviewed | Retain notices | Include supplied NOTICE | PyPI |
 | pathspec | 1.1.1 | MPL-2.0 | reviewed | Retain notices; disclose modifications to covered files | None identified | PyPI |
 | pluggy | 1.6.0 | MIT | reviewed | Retain notices | None identified | PyPI |
+| pydantic | 2.13.4 | MIT | reviewed | Retain notices | None identified | PyPI |
+| pydantic-core | 2.46.4 | MIT | reviewed | Retain notices | None identified | PyPI |
 | pygments | 2.20.0 | BSD-2-Clause | reviewed | Retain notices | None identified | PyPI |
 | pytest | 9.1.1 | MIT | reviewed | Retain notices | None identified | PyPI |
 | pyyaml | 6.0.3 | MIT | reviewed | Retain notices | None identified | PyPI |
@@ -78,6 +85,7 @@ locked distribution without contacting the network.
 | setuptools-scm | 10.2.1 | MIT | reviewed | Retain notices | None identified | PyPI |
 | trove-classifiers | 2026.6.1.19 | Apache-2.0 | reviewed | Retain notices | Include supplied NOTICE | PyPI |
 | typing-extensions | 4.16.0 | PSF-2.0 | reviewed | Retain notices | None identified | PyPI |
+| typing-inspection | 0.4.2 | MIT | reviewed | Retain notices | None identified | PyPI |
 | unicodedata2 | 15.1.0 | Apache-2.0 | reviewed | Retain license and notices | None supplied | PyPI |
 | vcs-versioning | 2.2.2 | MIT | reviewed | Retain notices | None identified | PyPI |
 <!-- dependency-inventory:end -->

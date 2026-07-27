@@ -11,3 +11,4 @@ coverage/
 *.out
 *.test
 .worktrees/
+/python/src/palonexus/_version.py
