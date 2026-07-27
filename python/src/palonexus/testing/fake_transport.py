@@ -13,6 +13,7 @@ from collections import deque
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
+from functools import partial
 from types import MappingProxyType
 from typing import Any, Final, Literal, Never, cast
 
@@ -136,6 +137,42 @@ class _ResolutionBinding:
     result: wire.ApprovalRecord
 
 
+@dataclass(frozen=True, slots=True)
+class _WorkerOutcome:
+    state: Literal["NOT_COMMITTED_CANCELLED", "COMMITTED"]
+    result: object | None = None
+
+
+class _CommitGate:
+    __slots__ = ("_cancelled", "_lock", "_outcome")
+
+    def __init__(self) -> None:
+        self._cancelled = False
+        self._lock = threading.Lock()
+        self._outcome: _WorkerOutcome | None = None
+
+    def cancel(self) -> _WorkerOutcome | None:
+        with self._lock:
+            if self._outcome is not None:
+                return self._outcome
+            self._cancelled = True
+            self._outcome = _WorkerOutcome("NOT_COMMITTED_CANCELLED")
+            return self._outcome
+
+    def commit(self, mutation: Callable[[], object]) -> object:
+        with self._lock:
+            if self._cancelled:
+                raise concurrent.futures.CancelledError from None
+            result = mutation()
+            self._outcome = _WorkerOutcome("COMMITTED", result)
+            return result
+
+    @property
+    def outcome(self) -> _WorkerOutcome | None:
+        with self._lock:
+            return self._outcome
+
+
 _CONTROL_EXCEPTIONS = (
     KeyboardInterrupt,
     SystemExit,
@@ -176,6 +213,8 @@ class ScriptedEngine:
 
     __slots__ = (
         "_approvals",
+        "_after_commit",
+        "_before_commit",
         "_calls",
         "_clock",
         "_closed",
@@ -198,6 +237,8 @@ class ScriptedEngine:
         id_source: Callable[[], str] | None = None,
         idempotency_capacity: int = 256,
         idempotency_ttl: float = 300.0,
+        before_commit: Callable[[str], None] | None = None,
+        after_commit: Callable[[str], None] | None = None,
     ) -> None:
         if testing_only is not True:
             raise ValueError("testing_only=True is required")
@@ -211,6 +252,8 @@ class ScriptedEngine:
         ):
             _invalid()
         self._clock = clock or (lambda: datetime.now(UTC))
+        self._before_commit = before_commit
+        self._after_commit = after_commit
         self._id_source = id_source
         self._idempotency_capacity = idempotency_capacity
         self._idempotency_ttl = idempotency_ttl
@@ -223,6 +266,19 @@ class ScriptedEngine:
         self._lock = threading.RLock()
         self._sequence = 0
         self._closed = False
+
+    def _commit(
+        self,
+        operation: str,
+        mutation: Callable[[], object],
+        gate: _CommitGate | None,
+    ) -> object:
+        if self._before_commit is not None:
+            self._before_commit(operation)
+        result = mutation() if gate is None else gate.commit(mutation)
+        if self._after_commit is not None:
+            self._after_commit(operation)
+        return result
 
     @staticmethod
     def allow(*, reason_code: str = "testing_scripted_allow") -> _Outcome:
@@ -470,6 +526,7 @@ class ScriptedEngine:
         client_scope_hash: str,
         deadline: float | None = None,
         cancelled: Callable[[], bool] | None = None,
+        _commit_gate: _CommitGate | None = None,
     ) -> wire.AuthorizationDecision:
         failure: BaseException | None = None
         try:
@@ -478,10 +535,11 @@ class ScriptedEngine:
                 client_scope_hash=client_scope_hash,
                 deadline=deadline,
                 cancelled=cancelled,
+                _commit_gate=_commit_gate,
             )
         except BaseException as error:
             failure = _safe_failure(error)
-        del request, client_scope_hash, deadline, cancelled
+        del request, client_scope_hash, deadline, cancelled, _commit_gate
         assert failure is not None
         raise failure from None
 
@@ -492,6 +550,7 @@ class ScriptedEngine:
         client_scope_hash: str,
         deadline: float | None = None,
         cancelled: Callable[[], bool] | None = None,
+        _commit_gate: _CommitGate | None = None,
     ) -> wire.AuthorizationDecision:
         self._check_control(deadline=deadline, cancelled=cancelled)
         try:
@@ -510,14 +569,21 @@ class ScriptedEngine:
             start_now = self._now()
             self._purge_expired(start_now)
             prior = self._idempotency.get(key)
-            self._record(request, client_scope_hash, request_hash)
             if prior is not None:
                 if prior.request_hash != request_hash:
                     raise IdempotencyConflict(
                         request_id=request.request_id,
                         correlation_id=request.correlation_id,
                     ) from None
-                return prior.result
+
+                def replay() -> object:
+                    self._record(request, client_scope_hash, request_hash)
+                    return prior.result
+
+                return cast(
+                    wire.AuthorizationDecision,
+                    self._commit("decide", replay, _commit_gate),
+                )
             if len(self._idempotency) >= self._idempotency_capacity:
                 raise AuthorizationUnavailable(
                     request_id=request.request_id,
@@ -528,7 +594,7 @@ class ScriptedEngine:
                     request_id=request.request_id,
                     correlation_id=request.correlation_id,
                 ) from None
-            outcome = self._outcomes.popleft()
+            outcome = self._outcomes[0]
             # Serialize scripted consumption and insertion so concurrent reuse of
             # one idempotency key cannot consume two outcomes.
             while outcome.kind == "delay":
@@ -538,35 +604,47 @@ class ScriptedEngine:
                 assert outcome.nested is not None
                 outcome = outcome.nested
             completion_now = self._now()
-            result = self._decision(outcome, request, client_scope_hash, completion_now)
-            if (
-                result.approval is not None
-                and len(self._decision_bindings) >= self._idempotency_capacity
-            ):
-                raise AuthorizationUnavailable(
-                    request_id=request.request_id,
-                    correlation_id=request.correlation_id,
-                ) from None
-            self._idempotency[key] = _IdempotencyEntry(
-                request_hash=request_hash,
-                result=result,
-                expires_at=completion_now + timedelta(seconds=self._idempotency_ttl),
-            )
-            if result.approval is not None:
-                self._decision_bindings[str(result.decision_id)] = _ApprovalBinding(
-                    request_hash=request_hash,
-                    action_id=str(request.action_id),
-                    request_id=str(request.request_id),
-                    correlation_id=str(request.correlation_id),
-                    client_scope_hash=client_scope_hash,
-                    authoritative_scope_hash=str(result.authoritative_scope_hash),
-                    decision_id=str(result.decision_id),
-                    approval_id=str(result.approval.approval_id),
-                    approval_expires_at=datetime.fromisoformat(
-                        str(result.approval.expires_at).replace("Z", "+00:00")
-                    ),
+
+            def commit_decision() -> object:
+                self._outcomes.popleft()
+                result = self._decision(
+                    outcome, request, client_scope_hash, completion_now
                 )
-            return result
+                if (
+                    result.approval is not None
+                    and len(self._decision_bindings) >= self._idempotency_capacity
+                ):
+                    raise AuthorizationUnavailable(
+                        request_id=request.request_id,
+                        correlation_id=request.correlation_id,
+                    ) from None
+                self._record(request, client_scope_hash, request_hash)
+                self._idempotency[key] = _IdempotencyEntry(
+                    request_hash=request_hash,
+                    result=result,
+                    expires_at=completion_now
+                    + timedelta(seconds=self._idempotency_ttl),
+                )
+                if result.approval is not None:
+                    self._decision_bindings[str(result.decision_id)] = _ApprovalBinding(
+                        request_hash=request_hash,
+                        action_id=str(request.action_id),
+                        request_id=str(request.request_id),
+                        correlation_id=str(request.correlation_id),
+                        client_scope_hash=client_scope_hash,
+                        authoritative_scope_hash=str(result.authoritative_scope_hash),
+                        decision_id=str(result.decision_id),
+                        approval_id=str(result.approval.approval_id),
+                        approval_expires_at=datetime.fromisoformat(
+                            str(result.approval.expires_at).replace("Z", "+00:00")
+                        ),
+                    )
+                return result
+
+            return cast(
+                wire.AuthorizationDecision,
+                self._commit("decide", commit_decision, _commit_gate),
+            )
 
     def request_approval(
         self,
@@ -577,6 +655,7 @@ class ScriptedEngine:
         approval_id: str,
         deadline: float | None = None,
         cancelled: Callable[[], bool] | None = None,
+        _commit_gate: _CommitGate | None = None,
     ) -> wire.ApprovalRecord:
         failure: BaseException | None = None
         try:
@@ -587,6 +666,7 @@ class ScriptedEngine:
                 approval_id=approval_id,
                 deadline=deadline,
                 cancelled=cancelled,
+                _commit_gate=_commit_gate,
             )
         except BaseException as error:
             failure = _safe_failure(error)
@@ -597,6 +677,7 @@ class ScriptedEngine:
             approval_id,
             deadline,
             cancelled,
+            _commit_gate,
         )
         assert failure is not None
         raise failure from None
@@ -610,6 +691,7 @@ class ScriptedEngine:
         approval_id: str,
         deadline: float | None = None,
         cancelled: Callable[[], bool] | None = None,
+        _commit_gate: _CommitGate | None = None,
     ) -> wire.ApprovalRecord:
         self._check_control(deadline=deadline, cancelled=cancelled)
         failed = False
@@ -650,7 +732,14 @@ class ScriptedEngine:
             assert binding is not None
             existing = self._approvals.get(checked_approval_id)
             if existing is not None:
-                return existing
+                return cast(
+                    wire.ApprovalRecord,
+                    self._commit(
+                        "request_approval",
+                        lambda: existing,
+                        _commit_gate,
+                    ),
+                )
             now = self._now()
             self._check_control(deadline=deadline, cancelled=cancelled)
             if binding.approval_expires_at <= now:
@@ -664,30 +753,40 @@ class ScriptedEngine:
                     request_id=request.request_id,
                     correlation_id=request.correlation_id,
                 ) from None
-            document: dict[str, wire.JSONValue] = {
-                "schemaVersion": "1",
-                "approvalId": binding.approval_id,
-                "actionId": binding.action_id,
-                "correlationId": binding.correlation_id,
-                "authoritativeScopeHash": binding.authoritative_scope_hash,
-                "status": "pending",
-                "requestedAt": _timestamp(now),
-                "expiresAt": _timestamp(binding.approval_expires_at),
-                "requesterRef": "subject:testing-requester",
-                "authorizationDecisionId": binding.decision_id,
-                "creationAuditRef": self._new_id("audit"),
-            }
-            record = wire.parse_approval(document)
-            self._check_control(deadline=deadline, cancelled=cancelled)
-            self._record(request, binding.client_scope_hash, request_hash)
-            self._calls[-1] = RecordedCall(
-                operation="request_approval",
-                request=self._calls[-1].request,
-                canonical_request_hash=request_hash,
-                client_scope_hash=binding.client_scope_hash,
+
+            def commit_approval() -> object:
+                document: dict[str, wire.JSONValue] = {
+                    "schemaVersion": "1",
+                    "approvalId": binding.approval_id,
+                    "actionId": binding.action_id,
+                    "correlationId": binding.correlation_id,
+                    "authoritativeScopeHash": binding.authoritative_scope_hash,
+                    "status": "pending",
+                    "requestedAt": _timestamp(now),
+                    "expiresAt": _timestamp(binding.approval_expires_at),
+                    "requesterRef": "subject:testing-requester",
+                    "authorizationDecisionId": binding.decision_id,
+                    "creationAuditRef": self._new_id("audit"),
+                }
+                record = wire.parse_approval(document)
+                self._record(request, binding.client_scope_hash, request_hash)
+                self._calls[-1] = RecordedCall(
+                    operation="request_approval",
+                    request=self._calls[-1].request,
+                    canonical_request_hash=request_hash,
+                    client_scope_hash=binding.client_scope_hash,
+                )
+                self._approvals[checked_approval_id] = record
+                return record
+
+            return cast(
+                wire.ApprovalRecord,
+                self._commit(
+                    "request_approval",
+                    commit_approval,
+                    _commit_gate,
+                ),
             )
-            self._approvals[checked_approval_id] = record
-            return record
 
     def get_approval(
         self,
@@ -695,6 +794,7 @@ class ScriptedEngine:
         *,
         deadline: float | None = None,
         cancelled: Callable[[], bool] | None = None,
+        _commit_gate: _CommitGate | None = None,
     ) -> wire.ApprovalRecord:
         failure: BaseException | None = None
         try:
@@ -702,10 +802,11 @@ class ScriptedEngine:
                 approval_id,
                 deadline=deadline,
                 cancelled=cancelled,
+                _commit_gate=_commit_gate,
             )
         except BaseException as error:
             failure = _safe_failure(error)
-        del approval_id, deadline, cancelled
+        del approval_id, deadline, cancelled, _commit_gate
         assert failure is not None
         raise failure from None
 
@@ -715,6 +816,7 @@ class ScriptedEngine:
         *,
         deadline: float | None = None,
         cancelled: Callable[[], bool] | None = None,
+        _commit_gate: _CommitGate | None = None,
     ) -> wire.ApprovalRecord:
         self._check_control(deadline=deadline, cancelled=cancelled)
         with self._lock:
@@ -728,20 +830,28 @@ class ScriptedEngine:
             expiry = datetime.fromisoformat(
                 str(record.expires_at).replace("Z", "+00:00")
             )
-            if str(record.status) == "pending" and now >= expiry:
-                record = self._expire_locked(record, now=now)
             approval_hash = (
                 "sha256:" + hashlib.sha256(approval_id.encode("utf-8")).hexdigest()
             )
-            self._calls.append(
-                RecordedCall(
-                    operation="get_approval",
-                    request=MappingProxyType({"approvalId": approval_id}),
-                    canonical_request_hash=approval_hash,
-                    client_scope_hash="",
+
+            def commit_get() -> object:
+                current = record
+                if str(current.status) == "pending" and now >= expiry:
+                    current = self._expire_locked(current, now=now)
+                self._calls.append(
+                    RecordedCall(
+                        operation="get_approval",
+                        request=MappingProxyType({"approvalId": approval_id}),
+                        canonical_request_hash=approval_hash,
+                        client_scope_hash="",
+                    )
                 )
+                return current
+
+            return cast(
+                wire.ApprovalRecord,
+                self._commit("get_approval", commit_get, _commit_gate),
             )
-            return record
 
     def _resolve(
         self,
@@ -969,6 +1079,45 @@ class AsyncFakeTransport:
             raise ValueError("testing_only=True and a ScriptedEngine are required")
         self._engine = engine
 
+    @staticmethod
+    async def _run_linearized(
+        call: Callable[[], object],
+        gate: _CommitGate,
+        cancel_signal: Callable[[], None],
+    ) -> object:
+        def worker_call() -> _WorkerOutcome:
+            try:
+                result = call()
+            except concurrent.futures.CancelledError:
+                return gate.outcome or _WorkerOutcome("NOT_COMMITTED_CANCELLED")
+            return gate.outcome or _WorkerOutcome("COMMITTED", result)
+
+        worker = asyncio.create_task(asyncio.to_thread(worker_call))
+        cancellation: asyncio.CancelledError | None = None
+        try:
+            outcome = await asyncio.shield(worker)
+        except asyncio.CancelledError as error:
+            cancellation = error
+            cancel_signal()
+            gate.cancel()
+            current = asyncio.current_task()
+            if current is not None:
+                current.uncancel()
+            while True:
+                try:
+                    outcome = await asyncio.shield(worker)
+                    break
+                except asyncio.CancelledError:
+                    cancel_signal()
+                    gate.cancel()
+                    if current is not None:
+                        current.uncancel()
+        if outcome.state == "COMMITTED":
+            return outcome.result
+        if cancellation is None:
+            cancellation = asyncio.CancelledError()
+        raise _clean_control(cancellation)
+
     async def decide(
         self, request: wire.ActionRequest, **kwargs: Any
     ) -> wire.AuthorizationDecision:
@@ -983,26 +1132,28 @@ class AsyncFakeTransport:
             return bool(caller_cancelled())
 
         kwargs["cancelled"] = cancelled
-        worker = asyncio.create_task(
-            asyncio.to_thread(
-                FakeTransport(self._engine, testing_only=True).decide,
-                request,
-                **kwargs,
-            )
-        )
+        gate = _CommitGate()
+        kwargs["_commit_gate"] = gate
         failure: BaseException | None = None
         try:
-            return await asyncio.shield(worker)
+            return cast(
+                wire.AuthorizationDecision,
+                await self._run_linearized(
+                    partial(
+                        FakeTransport(self._engine, testing_only=True).decide,
+                        request,
+                        **kwargs,
+                    ),
+                    gate,
+                    stop.set,
+                ),
+            )
         except asyncio.CancelledError as error:
             stop.set()
-            try:
-                await worker
-            except BaseException:
-                pass
             failure = _clean_control(error)
         except BaseException as error:
             failure = _safe_failure(error)
-        del request, kwargs, worker
+        del request, kwargs, gate
         assert failure is not None
         raise failure from None
 
@@ -1020,26 +1171,28 @@ class AsyncFakeTransport:
             return bool(caller_cancelled())
 
         kwargs["cancelled"] = cancelled
-        worker = asyncio.create_task(
-            asyncio.to_thread(
-                FakeTransport(self._engine, testing_only=True).request_approval,
-                request,
-                **kwargs,
-            )
-        )
+        gate = _CommitGate()
+        kwargs["_commit_gate"] = gate
         failure: BaseException | None = None
         try:
-            return await asyncio.shield(worker)
+            return cast(
+                wire.ApprovalRecord,
+                await self._run_linearized(
+                    partial(
+                        FakeTransport(self._engine, testing_only=True).request_approval,
+                        request,
+                        **kwargs,
+                    ),
+                    gate,
+                    stop.set,
+                ),
+            )
         except asyncio.CancelledError as error:
             stop.set()
-            try:
-                await worker
-            except BaseException:
-                pass
             failure = _clean_control(error)
         except BaseException as error:
             failure = _safe_failure(error)
-        del request, kwargs, worker
+        del request, kwargs, gate
         assert failure is not None
         raise failure from None
 
@@ -1057,26 +1210,28 @@ class AsyncFakeTransport:
             return bool(caller_cancelled())
 
         kwargs["cancelled"] = cancelled
-        worker = asyncio.create_task(
-            asyncio.to_thread(
-                FakeTransport(self._engine, testing_only=True).get_approval,
-                approval_id,
-                **kwargs,
-            )
-        )
+        gate = _CommitGate()
+        kwargs["_commit_gate"] = gate
         failure: BaseException | None = None
         try:
-            return await asyncio.shield(worker)
+            return cast(
+                wire.ApprovalRecord,
+                await self._run_linearized(
+                    partial(
+                        FakeTransport(self._engine, testing_only=True).get_approval,
+                        approval_id,
+                        **kwargs,
+                    ),
+                    gate,
+                    stop.set,
+                ),
+            )
         except asyncio.CancelledError as error:
             stop.set()
-            try:
-                await worker
-            except BaseException:
-                pass
             failure = _clean_control(error)
         except BaseException as error:
             failure = _safe_failure(error)
-        del approval_id, kwargs, worker
+        del approval_id, kwargs, gate
         assert failure is not None
         raise failure from None
 

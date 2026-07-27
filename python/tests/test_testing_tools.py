@@ -699,7 +699,12 @@ def test_async_cancellation_drains_delayed_worker() -> None:
             await task
         different = request(key="authz_01J5ABCDEFGHJKMNPQRSTVWXY9")
         result = await transport.decide(different, client_scope_hash=scope(different))
-        assert str(result.outcome) == "deny"
+        assert str(result.outcome) == "allow"
+        last = request(key="authz_01J5ABCDEFGHJKMNPQRSTVWXYA")
+        assert (
+            str((await transport.decide(last, client_scope_hash=scope(last))).outcome)
+            == "deny"
+        )
 
     asyncio.run(scenario())
 
@@ -857,6 +862,162 @@ def test_async_cancelled_approval_create_does_not_record_or_mutate() -> None:
             scripted.get_approval(str(decision.approval.approval_id))
 
     asyncio.run(scenario())
+
+
+def test_async_decide_cancellation_and_commit_are_linearized() -> None:
+    async def cancellation_wins() -> None:
+        at_commit = threading.Event()
+        release_commit = threading.Event()
+
+        def before_commit(operation: str) -> None:
+            if operation == "decide":
+                at_commit.set()
+                release_commit.wait()
+
+        scripted = ScriptedEngine(
+            ScriptedEngine.allow(),
+            testing_only=True,
+            before_commit=before_commit,
+        )
+        transport = AsyncFakeTransport(scripted, testing_only=True)
+        value = request()
+        task = asyncio.create_task(
+            transport.decide(value, client_scope_hash=scope(value))
+        )
+        await asyncio.to_thread(at_commit.wait)
+        task.cancel("cancel-wins")
+        await asyncio.sleep(0)
+        release_commit.set()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert caught.value.args == ("cancel-wins",)
+        assert scripted.recorded_calls == ()
+        assert (
+            str(
+                FakeTransport(scripted, testing_only=True)
+                .decide(value, client_scope_hash=scope(value))
+                .outcome
+            )
+            == "allow"
+        )
+
+    async def commit_wins() -> None:
+        at_commit = threading.Event()
+        release_commit = threading.Event()
+        committed = threading.Event()
+        release_worker = threading.Event()
+
+        def before_commit(operation: str) -> None:
+            if operation == "decide":
+                at_commit.set()
+                release_commit.wait()
+
+        def after_commit(operation: str) -> None:
+            if operation == "decide":
+                committed.set()
+                release_worker.wait()
+
+        scripted = ScriptedEngine(
+            ScriptedEngine.allow(),
+            testing_only=True,
+            before_commit=before_commit,
+            after_commit=after_commit,
+        )
+        transport = AsyncFakeTransport(scripted, testing_only=True)
+        value = request()
+        task = asyncio.create_task(
+            transport.decide(value, client_scope_hash=scope(value))
+        )
+        await asyncio.to_thread(at_commit.wait)
+        release_commit.set()
+        await asyncio.to_thread(committed.wait)
+        task.cancel("too-late")
+        await asyncio.sleep(0)
+        release_worker.set()
+        result = await task
+        assert str(result.outcome) == "allow"
+        assert len(scripted.recorded_calls) == 1
+
+    asyncio.run(cancellation_wins())
+    asyncio.run(commit_wins())
+
+
+def test_async_expiry_cancellation_and_commit_are_linearized() -> None:
+    def prepared() -> tuple[ScriptedEngine, FrozenClock, str]:
+        clock = FrozenClock("2026-07-25T20:00:00Z")
+        scripted = ScriptedEngine(
+            ScriptedEngine.approval_required(),
+            testing_only=True,
+            clock=clock,
+        )
+        value = request()
+        decision = scripted.decide(value, client_scope_hash=scope(value))
+        assert decision.approval is not None
+        pending = scripted.request_approval(
+            value,
+            decision_id=str(decision.decision_id),
+            authoritative_scope_hash=str(decision.authoritative_scope_hash),
+            approval_id=str(decision.approval.approval_id),
+        )
+        clock.advance(900)
+        return scripted, clock, str(pending.approval_id)
+
+    async def cancellation_wins() -> None:
+        scripted, _, approval_id = prepared()
+        before = scripted.recorded_calls
+        at_commit = threading.Event()
+        release_commit = threading.Event()
+
+        def before_commit(operation: str) -> None:
+            if operation == "get_approval":
+                at_commit.set()
+                release_commit.wait()
+
+        scripted._before_commit = before_commit
+        task = asyncio.create_task(
+            AsyncFakeTransport(scripted, testing_only=True).get_approval(approval_id)
+        )
+        await asyncio.to_thread(at_commit.wait)
+        task.cancel("expiry-cancelled")
+        await asyncio.sleep(0)
+        release_commit.set()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert scripted.recorded_calls == before
+        assert str(scripted.get_approval(approval_id).status) == "expired"
+
+    async def commit_wins() -> None:
+        scripted, _, approval_id = prepared()
+        at_commit = threading.Event()
+        release_commit = threading.Event()
+        committed = threading.Event()
+        release_worker = threading.Event()
+
+        def before_commit(operation: str) -> None:
+            if operation == "get_approval":
+                at_commit.set()
+                release_commit.wait()
+
+        def after_commit(operation: str) -> None:
+            if operation == "get_approval":
+                committed.set()
+                release_worker.wait()
+
+        scripted._before_commit = before_commit
+        scripted._after_commit = after_commit
+        task = asyncio.create_task(
+            AsyncFakeTransport(scripted, testing_only=True).get_approval(approval_id)
+        )
+        await asyncio.to_thread(at_commit.wait)
+        release_commit.set()
+        await asyncio.to_thread(committed.wait)
+        task.cancel("expiry-too-late")
+        await asyncio.sleep(0)
+        release_worker.set()
+        assert str((await task).status) == "expired"
+
+    asyncio.run(cancellation_wins())
+    asyncio.run(commit_wins())
 
 
 def test_mock_server_sanitizes_engine_callback_failures() -> None:
