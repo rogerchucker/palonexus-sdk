@@ -163,3 +163,8 @@ examples/langgraph/main.py,rogerchucker/palonexus-sdk,WORKTREE,examples/langgrap
 python/src/palonexus/integrations/deepagents.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/integrations/deepagents.py,PaloNexus,yes,new,MIT,rogerchucker
 python/tests/integrations/test_deepagents.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/integrations/test_deepagents.py,PaloNexus,yes,new,MIT,rogerchucker
 examples/deepagents/main.py,rogerchucker/palonexus-sdk,WORKTREE,examples/deepagents/main.py,PaloNexus,yes,new,MIT,rogerchucker
+examples/python-basic/main.py,rogerchucker/palonexus-sdk,WORKTREE,examples/python-basic/main.py,PaloNexus,yes,new,MIT,rogerchucker
+examples/python-basic/README.md,rogerchucker/palonexus-sdk,WORKTREE,examples/python-basic/README.md,PaloNexus,yes,new,MIT,rogerchucker
+examples/python-async/main.py,rogerchucker/palonexus-sdk,WORKTREE,examples/python-async/main.py,PaloNexus,yes,new,MIT,rogerchucker
+examples/python-async/README.md,rogerchucker/palonexus-sdk,WORKTREE,examples/python-async/README.md,PaloNexus,yes,new,MIT,rogerchucker
+python/tests/test_examples.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/test_examples.py,PaloNexus,yes,new,MIT,rogerchucker
