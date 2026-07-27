@@ -147,3 +147,4 @@ python/tests/identity/test_identity_hardening.py,rogerchucker/palonexus-sdk,WORK
 python/src/palonexus/identity/oidc.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/identity/oidc.py,PaloNexus,yes,new,MIT,rogerchucker
 python/tests/identity/test_oidc.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/identity/test_oidc.py,PaloNexus,yes,new,MIT,rogerchucker
 python/tests/identity/test_oidc_review.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/identity/test_oidc_review.py,PaloNexus,yes,new,MIT,rogerchucker
+python/tests/identity/test_oidc_review2.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/identity/test_oidc_review2.py,PaloNexus,yes,new,MIT,rogerchucker

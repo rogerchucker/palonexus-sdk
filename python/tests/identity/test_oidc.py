@@ -84,13 +84,17 @@ def _token(
     payload: dict[str, object] = {
         "iss": ISSUER,
         "sub": "agent-7",
-        "aud": AUDIENCE,
+        "aud": ["palonexus-client", AUDIENCE],
+        "azp": "palonexus-client",
         "iat": int(NOW.timestamp()),
         "nbf": int((NOW - timedelta(seconds=1)).timestamp()),
         "exp": int((NOW + timedelta(minutes=5)).timestamp()),
         "jti": "token-7",
     }
     payload.update(claims or {})
+    for name in tuple(payload):
+        if payload[name] is None:
+            del payload[name]
     first = _b64(json.dumps(protected, separators=(",", ":"), sort_keys=True).encode())
     second = _b64(json.dumps(payload, separators=(",", ":"), sort_keys=True).encode())
     signature = key.sign(
@@ -146,7 +150,8 @@ def _algorithm_token(key: object, algorithm: str) -> str:
     claims = {
         "iss": ISSUER,
         "sub": "agent-7",
-        "aud": AUDIENCE,
+        "aud": ["palonexus-client", AUDIENCE],
+        "azp": "palonexus-client",
         "iat": int(NOW.timestamp()),
         "nbf": int((NOW - timedelta(seconds=1)).timestamp()),
         "exp": int((NOW + timedelta(minutes=5)).timestamp()),
@@ -216,6 +221,7 @@ def _config(**changes: object) -> OIDCVerifierConfig:
         "algorithms": ("RS256",),
         "discovery_url": DISCOVERY,
         "cache_ttl_seconds": 60,
+        "max_unknown_rotation_delay_seconds": 30,
         "leeway_seconds": 2,
     }
     values.update(changes)
@@ -243,8 +249,8 @@ def test_discovery_and_verified_identity_are_explicit_and_immutable(
 
     assert identity.issuer == ISSUER
     assert identity.subject == "agent-7"
-    assert identity.audiences == (AUDIENCE,)
-    assert identity.authorized_party is None
+    assert identity.audiences == ("palonexus-client", AUDIENCE)
+    assert identity.authorized_party == "palonexus-client"
     assert identity.token_id == "token-7"
     assert identity.claims["sub"] == "agent-7"
     assert copy.deepcopy(identity) is identity
@@ -713,7 +719,11 @@ def test_multi_audience_azp_binds_distinct_client_id(
             _token(
                 signing_key,
                 claims={
-                    "aud": [AUDIENCE, "another-resource"],
+                    "aud": [
+                        "palonexus-client",
+                        AUDIENCE,
+                        "another-resource",
+                    ],
                     "azp": "palonexus-client",
                 },
             )
@@ -723,7 +733,10 @@ def test_multi_audience_azp_binds_distinct_client_id(
             verifier.verify(
                 _token(
                     signing_key,
-                    claims={"aud": [AUDIENCE, "other"], "azp": AUDIENCE},
+                    claims={
+                        "aud": ["palonexus-client", AUDIENCE, "other"],
+                        "azp": AUDIENCE,
+                    },
                 )
             )
 
@@ -799,3 +812,104 @@ def test_numeric_date_boundaries(signing_key: rsa.RSAPrivateKey) -> None:
                         claims={claim: int((NOW + timedelta(seconds=3)).timestamp())},
                     )
                 )
+
+
+def test_client_id_is_always_an_id_token_audience(
+    signing_key: rsa.RSAPrivateKey,
+) -> None:
+    with _verifier(ScriptedOIDC([_jwk(signing_key)])) as verifier:
+        for claims in (
+            {"aud": AUDIENCE, "azp": None},
+            {"aud": [AUDIENCE, "other"], "azp": "palonexus-client"},
+            {
+                "aud": ["palonexus-client", AUDIENCE],
+                "azp": None,
+            },
+        ):
+            with pytest.raises(OIDCVerificationFailed):
+                verifier.verify(_token(signing_key, claims=claims))
+
+    with _verifier(
+        ScriptedOIDC([_jwk(signing_key)]),
+        audiences=("palonexus-client",),
+    ) as verifier:
+        identity = verifier.verify(
+            _token(
+                signing_key,
+                claims={"aud": "palonexus-client", "azp": None},
+            )
+        )
+    assert identity.audiences == ("palonexus-client",)
+
+
+def test_unknown_kid_recovers_within_configured_proactive_horizon(
+    signing_key: rsa.RSAPrivateKey,
+) -> None:
+    current = [NOW]
+    rotated = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+    service = ScriptedOIDC([_jwk(signing_key)])
+    verifier = OIDCVerifier(
+        _config(
+            cache_ttl_seconds=60,
+            max_unknown_rotation_delay_seconds=2,
+            refresh_cooldown_seconds=30,
+        ),
+        transport=httpx.MockTransport(service),
+        testing_only=True,
+        clock=lambda: current[0],
+    )
+    with verifier:
+        verifier.verify(_token(signing_key))
+        with pytest.raises(OIDCVerificationFailed):
+            verifier.verify(_token(signing_key, kid="attacker-kid"))
+        service.keys = [_jwk(rotated, kid="rotated")]
+        with pytest.raises(OIDCVerificationFailed):
+            verifier.verify(_token(rotated, kid="rotated"))
+        current[0] += timedelta(seconds=2)
+        assert verifier.verify(_token(rotated, kid="rotated")).subject == "agent-7"
+    assert service.jwks_calls == 3
+
+
+def test_valid_discovery_then_unavailable_jwks_is_opaque(
+    signing_key: rsa.RSAPrivateKey,
+) -> None:
+    calls: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        calls.append(str(request.url))
+        if str(request.url) == DISCOVERY:
+            return httpx.Response(
+                200,
+                headers={"content-type": "application/json"},
+                json={"issuer": ISSUER, "jwks_uri": JWKS},
+            )
+        raise httpx.ConnectError("LEAK-jwks-secret")
+
+    verifier = OIDCVerifier(
+        _config(),
+        transport=httpx.MockTransport(handler),
+        testing_only=True,
+        clock=lambda: NOW,
+    )
+    with verifier, pytest.raises(OIDCVerificationFailed) as captured:
+        verifier.verify(_token(signing_key))
+    assert calls == [DISCOVERY, JWKS]
+    assert "LEAK" not in repr(captured.value)
+    assert captured.value.__cause__ is None
+    assert captured.value.__context__ is None
+
+
+def test_key_ops_is_exactly_verify_when_present(
+    signing_key: rsa.RSAPrivateKey,
+) -> None:
+    for operations in (
+        ["verify", "encrypt"],
+        ["verify", "sign"],
+        ["encrypt"],
+        [],
+    ):
+        with _verifier(
+            ScriptedOIDC([_jwk(signing_key, key_ops=operations)])
+        ) as verifier:
+            with pytest.raises(OIDCVerificationFailed):
+                verifier.verify(_token(signing_key))

@@ -80,6 +80,8 @@ def test_dns_is_resolved_for_each_fetch_and_rebinding_fails_closed() -> None:
             return result
 
     class Connection:
+        sock = None
+
         def request(self, *_: object, **__: object) -> None:
             return None
 

@@ -9,9 +9,11 @@ import http.client
 import ipaddress
 import json
 import math
+import queue
 import socket
 import ssl
 import threading
+import time
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
@@ -36,6 +38,7 @@ _MAX_STRING_BYTES = 16_384
 _MAX_HEADERS = 64
 _MAX_HEADER_BYTES = 16_384
 _MAX_NEGATIVE_CACHE = 128
+_MAX_FETCH_WORKERS = 4
 _P256_ORDER = 0xFFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551
 _B64URL = frozenset("ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_")
 
@@ -214,23 +217,32 @@ class _PinnedHTTPSConnection(http.client.HTTPConnection):
         self._approved_addresses = approved_addresses
 
     def connect(self) -> None:
-        raw = socket.create_connection(
+        raw: socket.socket | None = socket.create_connection(
             (self._pinned_address, self.port),
             self.timeout,
         )
+        secured: ssl.SSLSocket | None = None
         try:
+            if raw is None:  # pragma: no cover - construction invariant
+                raise RuntimeError
             PinnedHTTPSMetadataFetcher.validate_connected_peer(
                 cast(tuple[object, ...], raw.getpeername())[0],
                 self._approved_addresses,
             )
             secured = self._context.wrap_socket(raw, server_hostname=self.host)
+            raw = None
             PinnedHTTPSMetadataFetcher.validate_connected_peer(
                 cast(tuple[object, ...], secured.getpeername())[0],
                 self._approved_addresses,
             )
         except BaseException:
-            raw.close()
+            if secured is not None:
+                secured.close()
+            elif raw is not None:
+                raw.close()
             raise
+        if secured is None:  # pragma: no cover - ownership invariant
+            raise RuntimeError
         self.sock = secured
 
 
@@ -244,6 +256,8 @@ class PinnedHTTPSMetadataFetcher:
         "_lock",
         "_resolver",
         "_timeout",
+        "_worker_slots",
+        "_active",
     )
 
     def __init__(
@@ -266,6 +280,8 @@ class PinnedHTTPSMetadataFetcher:
         self._context = ssl_context or ssl.create_default_context()
         self._connection_factory = connection_factory or _PinnedHTTPSConnection
         self._lock = threading.Lock()
+        self._worker_slots = threading.BoundedSemaphore(_MAX_FETCH_WORKERS)
+        self._active: dict[object, http.client.HTTPConnection] = {}
         if (
             self._context.verify_mode != ssl.CERT_REQUIRED
             or not self._context.check_hostname
@@ -288,18 +304,81 @@ class PinnedHTTPSMetadataFetcher:
         _checked(result)
 
     def fetch_json(self, url: str, maximum: int) -> dict[str, object]:
-        operation = partial(self._fetch_json_locked, url, maximum)
+        operation = partial(self._fetch_with_deadline, url, maximum)
         result = _capture(operation)
         del operation, url
         return _checked(result)
 
-    def _fetch_json_locked(self, url: str, maximum: int) -> dict[str, object]:
+    def _fetch_with_deadline(
+        self,
+        url: str,
+        maximum: int,
+    ) -> dict[str, object]:
         with self._lock:
-            return self._fetch_json(url, maximum)
+            if self._closed:
+                raise ValueError
+        if not self._worker_slots.acquire(blocking=False):
+            raise TimeoutError
+        deadline = time.monotonic() + self._timeout
+        token = object()
+        results: queue.Queue[dict[str, object] | _WorkerFailure] = queue.Queue(
+            maxsize=1
+        )
+        worker = threading.Thread(
+            target=self._worker,
+            args=(url, maximum, deadline, token, results),
+            name="palonexus-oidc-metadata",
+            daemon=True,
+        )
+        try:
+            worker.start()
+        except BaseException:
+            self._worker_slots.release()
+            raise
+        try:
+            item = results.get(timeout=max(0.0, deadline - time.monotonic()))
+        except queue.Empty:
+            self._close_active(token)
+            raise TimeoutError from None
+        except BaseException:
+            self._close_active(token)
+            raise
+        if isinstance(item, _WorkerFailure):
+            raise item.error
+        return item
 
-    def _fetch_json(self, url: str, maximum: int) -> dict[str, object]:
-        if self._closed:
-            raise ValueError
+    def _worker(
+        self,
+        url: str,
+        maximum: int,
+        deadline: float,
+        token: object,
+        results: queue.Queue[dict[str, object] | _WorkerFailure],
+    ) -> None:
+        try:
+            value: dict[str, object] | _WorkerFailure = self._fetch_json(
+                url,
+                maximum,
+                deadline,
+                token,
+            )
+        except BaseException as error:
+            value = _WorkerFailure(error)
+        try:
+            results.put_nowait(value)
+        except queue.Full:
+            pass
+        finally:
+            self._worker_slots.release()
+
+    def _fetch_json(
+        self,
+        url: str,
+        maximum: int,
+        deadline: float,
+        token: object,
+    ) -> dict[str, object]:
+        _remaining(deadline)
         split = urlsplit(_url(url))
         host = cast(str, split.hostname)
         port = split.port or 443
@@ -325,18 +404,61 @@ class PinnedHTTPSMetadataFetcher:
                 raise ValueError
             raw_addresses.append(sockaddr[0])
         approved = _validated_addresses(tuple(raw_addresses))
-        pinned = approved[0]
-        connection = self._connection_factory(
-            host,
-            port,
-            pinned,
-            timeout=self._timeout,
-            context=self._context,
-            approved_addresses=approved,
-        )
+        with self._lock:
+            if self._closed:
+                raise ValueError
         authority = host if port == 443 else f"{host}:{port}"
         target = split.path or "/"
+        last_network_error: BaseException | None = None
+        for pinned in approved:
+            remaining = _remaining(deadline)
+            connection = self._connection_factory(
+                host,
+                port,
+                pinned,
+                timeout=remaining,
+                context=self._context,
+                approved_addresses=approved,
+            )
+            with self._lock:
+                if self._closed:
+                    _close_suppressing(connection)
+                    raise ValueError
+                self._active[token] = connection
+            try:
+                return self._request_address(
+                    connection,
+                    authority=authority,
+                    target=target,
+                    maximum=maximum,
+                    deadline=deadline,
+                )
+            except (
+                OSError,
+                TimeoutError,
+                ssl.SSLError,
+                http.client.HTTPException,
+            ) as error:
+                last_network_error = error
+            finally:
+                with self._lock:
+                    self._active.pop(token, None)
+        if last_network_error is not None:
+            raise last_network_error
+        raise ValueError
+
+    def _request_address(
+        self,
+        connection: http.client.HTTPConnection,
+        *,
+        authority: str,
+        target: str,
+        maximum: int,
+        deadline: float,
+    ) -> dict[str, object]:
+        primary: BaseException | None = None
         try:
+            connection.timeout = _remaining(deadline)
             connection.request(
                 "GET",
                 target,
@@ -347,7 +469,9 @@ class PinnedHTTPSMetadataFetcher:
                     "Connection": "close",
                 },
             )
+            _set_socket_deadline(connection, deadline)
             response = connection.getresponse()
+            _set_socket_deadline(connection, deadline)
             if response.status != 200:
                 raise ValueError
             headers = response.getheaders()
@@ -373,15 +497,60 @@ class PinnedHTTPSMetadataFetcher:
             if declared is not None and int(declared) > maximum:
                 raise ValueError
             body = response.read(maximum + 1)
+            _remaining(deadline)
             if len(body) > maximum or response.read(1):
                 raise ValueError
             return _json_object(body)
+        except BaseException as error:
+            primary = error
+            raise
         finally:
-            connection.close()
+            if primary is None:
+                connection.close()
+            else:
+                _close_suppressing(connection)
 
     def close(self) -> None:
         with self._lock:
             self._closed = True
+            active = tuple(self._active.values())
+        for connection in active:
+            _close_suppressing(connection)
+
+    def _close_active(self, token: object) -> None:
+        with self._lock:
+            connection = self._active.get(token)
+        if connection is not None:
+            _close_suppressing(connection)
+
+
+class _WorkerFailure:
+    __slots__ = ("error",)
+
+    def __init__(self, error: BaseException) -> None:
+        self.error = error
+
+
+def _remaining(deadline: float) -> float:
+    value = deadline - time.monotonic()
+    if value <= 0:
+        raise TimeoutError
+    return value
+
+
+def _set_socket_deadline(
+    connection: http.client.HTTPConnection,
+    deadline: float,
+) -> None:
+    if connection.sock is not None:
+        connection.sock.settimeout(_remaining(deadline))
+
+
+def _close_suppressing(connection: http.client.HTTPConnection) -> None:
+    try:
+        connection.close()
+    except BaseException:
+        pass
 
 
 def _validated_addresses(addresses: object) -> tuple[str, ...]:
@@ -452,7 +621,15 @@ def _string_tuple(value: object, *, maximum: int = 16) -> tuple[str, ...]:
 
 @dataclass(frozen=True, slots=True, init=False)
 class OIDCVerifierConfig:
-    """Immutable verifier policy; all trust anchors are caller supplied."""
+    """Immutable verifier policy; all trust anchors are caller supplied.
+
+    ``max_unknown_rotation_delay_seconds`` bounds cached-key staleness while
+    metadata remains reachable and verification attempts continue. Unknown
+    key IDs cannot safely be distinguished from attacker input before a JWKS
+    fetch, so one globally rate-limited unknown-key lane is complemented by
+    this proactive cache horizon. Known-key signature rotation has a separate
+    reserved refresh lane.
+    """
 
     issuer: str
     audiences: tuple[str, ...]
@@ -470,6 +647,7 @@ class OIDCVerifierConfig:
     allow_missing_kid: bool
     refresh_cooldown_seconds: int
     failure_backoff_seconds: int
+    max_unknown_rotation_delay_seconds: int
 
     def __init__(
         self,
@@ -490,6 +668,7 @@ class OIDCVerifierConfig:
         allow_missing_kid: bool = False,
         refresh_cooldown_seconds: int = 30,
         failure_backoff_seconds: int = 5,
+        max_unknown_rotation_delay_seconds: int = 300,
     ) -> None:
         operation = partial(
             _validate_config,
@@ -509,6 +688,7 @@ class OIDCVerifierConfig:
             allow_missing_kid,
             refresh_cooldown_seconds,
             failure_backoff_seconds,
+            max_unknown_rotation_delay_seconds,
         )
         result = _capture(operation)
         del (
@@ -549,6 +729,7 @@ def _validate_config(
     allow_missing_kid: object,
     refresh_cooldown_seconds: object,
     failure_backoff_seconds: object,
+    max_unknown_rotation_delay_seconds: object,
 ) -> tuple[object, ...]:
     normalized_issuer = _url(issuer)
     expected_audiences = _string_tuple(audiences)
@@ -591,6 +772,8 @@ def _validate_config(
         or not 1 <= refresh_cooldown_seconds <= 3600
         or type(failure_backoff_seconds) is not int
         or not 1 <= failure_backoff_seconds <= 300
+        or type(max_unknown_rotation_delay_seconds) is not int
+        or not 1 <= max_unknown_rotation_delay_seconds <= 3600
     ):
         raise ValueError
     return (
@@ -610,6 +793,7 @@ def _validate_config(
         allow_missing_kid,
         refresh_cooldown_seconds,
         failure_backoff_seconds,
+        max_unknown_rotation_delay_seconds,
     )
 
 
@@ -740,7 +924,7 @@ class OIDCVerifier:
         self._clock = clock
         self._lock = threading.Lock()
         self._cache: _Cache | None = None
-        self._negative: dict[tuple[str, str], datetime] = {}
+        self._negative: dict[tuple[str, str, int], datetime] = {}
         self._forced_refresh_until: dict[str, datetime] = {}
         self._refresh_backoff_until: datetime | None = None
         self._closed = False
@@ -889,7 +1073,11 @@ class OIDCVerifier:
                 and selected is not rejected
             ):
                 return selected
-            negative_key = (reason, kid or "[missing]")
+            negative_key = (
+                reason,
+                kid or "[missing]",
+                0 if current is None else current.generation,
+            )
             if force:
                 retry_at = self._negative.get(negative_key)
                 if retry_at is not None and now < retry_at:
@@ -924,7 +1112,10 @@ class OIDCVerifier:
                 keys=keys,
                 expires_at=now
                 + __import__("datetime").timedelta(
-                    seconds=self._config.cache_ttl_seconds
+                    seconds=min(
+                        self._config.cache_ttl_seconds,
+                        self._config.max_unknown_rotation_delay_seconds,
+                    )
                 ),
                 generation=generation,
             )
@@ -938,12 +1129,13 @@ class OIDCVerifier:
 
     def _record_negative(
         self,
-        key: tuple[str, str],
+        key: tuple[str, str, int],
         now: datetime,
     ) -> None:
         expired = [name for name, expiry in self._negative.items() if expiry <= now]
         for name in expired:
             del self._negative[name]
+        self._negative.pop(key, None)
         while len(self._negative) >= _MAX_NEGATIVE_CACHE:
             del self._negative[next(iter(self._negative))]
         self._negative[key] = now + __import__("datetime").timedelta(
@@ -1115,17 +1307,7 @@ def _parse_jwks(
         else:
             selected_algorithms = (algorithm_value,)
         operations = jwk.get("key_ops")
-        if operations is not None and (
-            type(operations) is not list
-            or not operations
-            or len(operations) > 8
-            or any(type(item) is not str for item in operations)
-            or "verify" not in operations
-            or any(
-                item in {"sign", "decrypt", "unwrapKey", "deriveKey", "deriveBits"}
-                for item in operations
-            )
-        ):
+        if operations is not None and operations != ["verify"]:
             continue
         raw_kid = jwk.get("kid")
         kid = None if raw_kid is None else _required_string(jwk, "kid")
@@ -1252,7 +1434,7 @@ def _validate_claims(
     else:
         raise ValueError
     intersection = set(audiences) & set(config.audiences)
-    if not intersection:
+    if config.client_id not in audiences or not intersection:
         raise ValueError
     azp = claims.get("azp")
     if len(audiences) > 1:
