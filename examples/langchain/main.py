@@ -5,7 +5,6 @@ from __future__ import annotations
 
 from typing import Any
 
-from langchain.agents import create_agent
 from langchain_core.language_models.fake_chat_models import (
     FakeMessagesListChatModel,
 )
@@ -18,6 +17,7 @@ from palonexus.integrations.langchain import (
     LangChainApprovalRequired,
     LangChainAuthorizationContext,
     PaloNexusLangChainMiddleware,
+    create_authorized_agent,
 )
 from palonexus.testing import FakeTransport, ScriptedEngine
 
@@ -42,6 +42,7 @@ TASK_CONTEXT = LangChainAuthorizationContext(
         session_id="session_01J5ABCDEFGHJKMNPQRSTVWXY2",
     ),
     correlation_id="corr_01J5ABCDEFGHJKMNPQRSTVWXY8",
+    model_policy_key="offline-model",
 )
 
 
@@ -64,9 +65,10 @@ def middleware(
             else {}
         ),
         model_policies={
-            "fake-messages-list-chat-model": LangChainActionPolicy(
+            "offline-model": LangChainActionPolicy(
                 service="offline-model",
                 side_effect="external",
+                model_name="offline-model",
             )
         },
     )
@@ -89,8 +91,9 @@ def main() -> None:
         ScriptedEngine.allow(),
         testing_only=True,
     )
-    agent = create_agent(
+    agent = create_authorized_agent(
         model=OfflineToolModel(
+            name="offline-model",
             responses=[
                 AIMessage(
                     content="",
@@ -104,10 +107,10 @@ def main() -> None:
                     ],
                 ),
                 AIMessage(content="done"),
-            ]
+            ],
         ),
         tools=[read_inventory],
-        middleware=[middleware(allowed, include_tool=True)],
+        authorization=middleware(allowed, include_tool=True),
         context_schema=LangChainAuthorizationContext,
     )
     agent.invoke(
@@ -119,10 +122,13 @@ def main() -> None:
     print("LANGCHAIN_ALLOW_EXECUTED_ONCE")
 
     denied = ScriptedEngine(ScriptedEngine.deny(), testing_only=True)
-    denied_agent = create_agent(
-        model=OfflineToolModel(responses=[AIMessage(content="unreachable")]),
+    denied_agent = create_authorized_agent(
+        model=OfflineToolModel(
+            responses=[AIMessage(content="unreachable")],
+            name="offline-model",
+        ),
         tools=[],
-        middleware=[middleware(denied, include_tool=False)],
+        authorization=middleware(denied, include_tool=False),
         context_schema=LangChainAuthorizationContext,
     )
     try:
@@ -139,10 +145,13 @@ def main() -> None:
         ScriptedEngine.approval_required(),
         testing_only=True,
     )
-    approval_agent = create_agent(
-        model=OfflineToolModel(responses=[AIMessage(content="unreachable")]),
+    approval_agent = create_authorized_agent(
+        model=OfflineToolModel(
+            responses=[AIMessage(content="unreachable")],
+            name="offline-model",
+        ),
         tools=[],
-        middleware=[middleware(approval, include_tool=False)],
+        authorization=middleware(approval, include_tool=False),
         context_schema=LangChainAuthorizationContext,
     )
     try:

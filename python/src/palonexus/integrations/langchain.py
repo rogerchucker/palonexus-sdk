@@ -10,11 +10,10 @@ PaloNexus LangGraph integration for checkpointed resume semantics.
 from __future__ import annotations
 
 import contextvars
-import hashlib
-import json
+import inspect
 import math
 import time
-from collections.abc import Awaitable, Callable, Mapping
+from collections.abc import Awaitable, Callable, Mapping, Sequence
 from dataclasses import dataclass
 from types import MappingProxyType
 from typing import Any, Literal, Protocol, TypeVar, cast, runtime_checkable
@@ -27,13 +26,13 @@ from ..errors import (
     PaloNexusError,
     PolicyDenied,
 )
-from ..models import ActionTarget, TaskContext
+from ..models import ActionTarget, DecisionOutcome, TaskContext
 from ..protocol import ActionRequestBuilder
-from ..redaction import Redactor
 from . import MissingIntegrationDependency
 
 try:
     import langchain
+    from langchain.agents import create_agent
     from langchain.agents.middleware import (
         AgentMiddleware,
         ModelRequest,
@@ -85,6 +84,9 @@ class LangChainApprovalRequired(_LangChainCompatible, ApprovalRequired):
 class SyncAuthorizationClientProtocol(Protocol):
     """Public client surface consumed by synchronous middleware."""
 
+    @property
+    def authorization_client_kind(self) -> Literal["sync"]: ...
+
     def authorize(
         self,
         attempt: Any,
@@ -97,6 +99,9 @@ class SyncAuthorizationClientProtocol(Protocol):
 @runtime_checkable
 class AsyncAuthorizationClientProtocol(Protocol):
     """Public client surface consumed by asynchronous middleware."""
+
+    @property
+    def authorization_client_kind(self) -> Literal["async"]: ...
 
     async def authorize(
         self,
@@ -113,6 +118,7 @@ class LangChainActionPolicy:
 
     service: str
     side_effect: SideEffect
+    model_name: str | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -121,6 +127,14 @@ class LangChainActionPolicy:
             or len(self.service) > 128
             or type(self.side_effect) is not str
             or self.side_effect not in _SIDE_EFFECTS
+            or (
+                self.model_name is not None
+                and (
+                    type(self.model_name) is not str
+                    or not self.model_name
+                    or len(self.model_name) > 256
+                )
+            )
         ):
             raise InvalidRequest() from None
 
@@ -136,6 +150,7 @@ class LangChainAuthorizationContext:
 
     task: TaskContext
     correlation_id: str
+    model_policy_key: str
     tenant_ref: str | None = None
     actor_ref: str | None = None
     deadline: float | None = None
@@ -155,6 +170,12 @@ class LangChainAuthorizationContext:
             raise InvalidRequest() from None
         if type(self.correlation_id) is not str:
             raise InvalidRequest() from None
+        if (
+            type(self.model_policy_key) is not str
+            or not self.model_policy_key
+            or len(self.model_policy_key) > 128
+        ):
+            raise InvalidRequest() from None
         for value in (self.tenant_ref, self.actor_ref):
             if value is not None and (
                 type(value) is not str or not value or len(value) > 256
@@ -173,6 +194,7 @@ class LangChainAuthorizationContext:
         return (
             "LangChainAuthorizationContext("
             f"task={self.task!r}, correlation_id={self.correlation_id!r}, "
+            f"model_policy_key={self.model_policy_key!r}, "
             f"deadline={self.deadline!r})"
         )
 
@@ -184,6 +206,9 @@ class _CallFrame:
     action_id: str
     tenant_ref: str | None
     actor_ref: str | None
+    model_policy_key: str
+    deadline: float | None
+    cancelled: Callable[[], bool] | None
 
 
 _CURRENT_CALL: contextvars.ContextVar[_CallFrame | None] = contextvars.ContextVar(
@@ -236,8 +261,11 @@ def _request_context(request: object) -> LangChainAuthorizationContext:
             return LangChainAuthorizationContext(
                 task=frame.task,
                 correlation_id=frame.correlation_id,
+                model_policy_key=frame.model_policy_key,
                 tenant_ref=frame.tenant_ref,
                 actor_ref=frame.actor_ref,
+                deadline=frame.deadline,
+                cancelled=frame.cancelled,
             )
         raise InvalidRequest() from None
     return explicit
@@ -277,9 +305,11 @@ def _tool_arguments(request: ToolCallRequest) -> object:
         raise InvalidRequest() from None
 
 
-def _model_name(request: ModelRequest[Any]) -> str:
+def _public_model_name(request: ModelRequest[Any]) -> str:
     try:
-        name = request.model._llm_type  # noqa: SLF001 - public LangChain model hook
+        name = getattr(request.model, "model_name", None)
+        if name is None:
+            name = request.model.name
         if type(name) is not str or not name or len(name) > 128:
             raise TypeError
         return name
@@ -295,7 +325,6 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
         "_builder",
         "_client",
         "_model_policies",
-        "_redactor",
         "_tool_policies",
     )
 
@@ -307,13 +336,17 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
         tool_policies: Mapping[str, LangChainActionPolicy],
         model_policies: Mapping[str, LangChainActionPolicy],
     ) -> None:
-        if client is not None and not isinstance(
-            client, SyncAuthorizationClientProtocol
+        if client is not None and (
+            not isinstance(client, SyncAuthorizationClientProtocol)
+            or client.authorization_client_kind != "sync"
         ):
             raise InvalidRequest() from None
-        if async_client is not None and not isinstance(
-            async_client, AsyncAuthorizationClientProtocol
+        if async_client is not None and (
+            not isinstance(async_client, AsyncAuthorizationClientProtocol)
+            or async_client.authorization_client_kind != "async"
         ):
+            raise InvalidRequest() from None
+        if client is not None and inspect.iscoroutinefunction(client.authorize):
             raise InvalidRequest() from None
         if client is None and async_client is None:
             raise InvalidRequest() from None
@@ -321,7 +354,6 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
         self._async_client = async_client
         self._tool_policies = _immutable_policies(tool_policies)
         self._model_policies = _immutable_policies(model_policies)
-        self._redactor = Redactor()
         self._builder = ActionRequestBuilder(
             adapter_id="palonexus-langchain",
             adapter_version="0.2.0",
@@ -342,28 +374,22 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
         policy = policies.get(name)
         if policy is None:
             raise InvalidRequest() from None
-        try:
-            safe_arguments = self._redactor.redact(arguments)
-            normalized = json.dumps(
-                safe_arguments,
-                ensure_ascii=False,
-                separators=(",", ":"),
-                sort_keys=True,
-                allow_nan=False,
-            ).encode("utf-8")
-        except Exception:
-            raise InvalidRequest() from None
-        arguments_hash = hashlib.sha256(normalized).hexdigest()
+        del arguments
         target = self._builder.prepare_generic_target(
             ActionTarget(
                 kind="tool",
                 service=policy.service,
-                resource=(
-                    f"tool:{policy.service}/{name}#arguments-sha256:{arguments_hash}"
-                ),
+                resource=f"tool:{policy.service}/{name}",
             )
         )
         parent = _CURRENT_CALL.get()
+        if parent is not None and (
+            context.task != parent.task
+            or context.correlation_id != parent.correlation_id
+            or context.tenant_ref != parent.tenant_ref
+            or context.actor_ref != parent.actor_ref
+        ):
+            raise InvalidRequest() from None
         causation_id = None if parent is None else parent.action_id
         intent = self._builder.new(
             action="tool:invoke",
@@ -385,6 +411,9 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
             action_id=str(attempt.request.action_id),
             tenant_ref=context.tenant_ref,
             actor_ref=context.actor_ref,
+            model_policy_key=context.model_policy_key,
+            deadline=context.deadline,
+            cancelled=context.cancelled,
         )
         return attempt, context, frame
 
@@ -423,11 +452,22 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
         if self._client is None:
             raise InvalidRequest() from None
         try:
-            self._client.authorize(
+            result = self._client.authorize(
                 attempt,
                 deadline=_checked_deadline(context.deadline),
                 cancelled=context.cancelled,
             )
+            if inspect.isawaitable(result):
+                if inspect.iscoroutine(result):
+                    result.close()
+                elif hasattr(result, "cancel"):
+                    result.cancel()
+                raise InvalidRequest() from None
+            if (
+                type(result) is not AuthorizationDecision
+                or result.outcome is not DecisionOutcome.ALLOW
+            ):
+                raise InvalidRequest() from None
         except ApprovalRequired as error:
             raise self._approval(error) from None
         finally:
@@ -441,11 +481,19 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
         if self._async_client is None:
             raise InvalidRequest() from None
         try:
-            await self._async_client.authorize(
+            pending = self._async_client.authorize(
                 attempt,
                 deadline=_checked_deadline(context.deadline),
                 cancelled=context.cancelled,
             )
+            if not inspect.isawaitable(pending):
+                raise InvalidRequest() from None
+            result = await pending
+            if (
+                type(result) is not AuthorizationDecision
+                or result.outcome is not DecisionOutcome.ALLOW
+            ):
+                raise InvalidRequest() from None
         except ApprovalRequired as error:
             raise self._approval(error) from None
         finally:
@@ -526,7 +574,11 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
         handler: Callable[[ModelRequest[Any]], ModelResponse[Any]],
     ) -> ModelResponse[Any] | AIMessage:
         try:
-            name = _model_name(request)
+            selected = _request_context(request)
+            name = selected.model_policy_key
+            policy = self._model_policies.get(name)
+            if policy is None or policy.model_name != _public_model_name(request):
+                raise InvalidRequest() from None
             attempt, context, frame = self._prepare(
                 request=request,
                 name=name,
@@ -547,7 +599,11 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
         handler: Callable[[ModelRequest[Any]], Awaitable[ModelResponse[Any]]],
     ) -> ModelResponse[Any] | AIMessage:
         try:
-            name = _model_name(request)
+            selected = _request_context(request)
+            name = selected.model_policy_key
+            policy = self._model_policies.get(name)
+            if policy is None or policy.model_name != _public_model_name(request):
+                raise InvalidRequest() from None
             attempt, context, frame = self._prepare(
                 request=request,
                 name=name,
@@ -563,6 +619,55 @@ class PaloNexusLangChainMiddleware(AgentMiddleware[Any, Any]):
         )
 
 
+def validate_authorized_middleware_stack(
+    middleware: Sequence[AgentMiddleware[Any, Any]],
+) -> tuple[AgentMiddleware[Any, Any], ...]:
+    """Require exactly one PaloNexus middleware in the innermost position."""
+
+    if not isinstance(middleware, Sequence):
+        raise InvalidRequest() from None
+    checked = tuple(middleware)
+    matches = [
+        index
+        for index, item in enumerate(checked)
+        if type(item) is PaloNexusLangChainMiddleware
+    ]
+    if matches != [len(checked) - 1]:
+        raise InvalidRequest() from None
+    return checked
+
+
+def authorized_middleware_stack(
+    middleware: Sequence[AgentMiddleware[Any, Any]],
+    authorization: PaloNexusLangChainMiddleware,
+) -> tuple[AgentMiddleware[Any, Any], ...]:
+    """Place PaloNexus last, which LangChain executes as the inner layer."""
+
+    if type(authorization) is not PaloNexusLangChainMiddleware:
+        raise InvalidRequest() from None
+    if any(type(item) is PaloNexusLangChainMiddleware for item in middleware):
+        raise InvalidRequest() from None
+    return validate_authorized_middleware_stack((*middleware, authorization))
+
+
+def create_authorized_agent(
+    *,
+    model: Any,
+    tools: Sequence[Any],
+    authorization: PaloNexusLangChainMiddleware,
+    middleware: Sequence[AgentMiddleware[Any, Any]] = (),
+    **kwargs: Any,
+) -> Any:
+    """Create an agent whose final effective model/tool target is authorized."""
+
+    return create_agent(
+        model=model,
+        tools=tools,
+        middleware=authorized_middleware_stack(middleware, authorization),
+        **kwargs,
+    )
+
+
 __all__ = [
     "AsyncAuthorizationClientProtocol",
     "LangChainActionPolicy",
@@ -574,4 +679,7 @@ __all__ = [
     "MissingIntegrationDependency",
     "PaloNexusLangChainMiddleware",
     "SyncAuthorizationClientProtocol",
+    "authorized_middleware_stack",
+    "create_authorized_agent",
+    "validate_authorized_middleware_stack",
 ]

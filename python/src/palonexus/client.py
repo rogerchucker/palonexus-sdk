@@ -305,6 +305,12 @@ class AuthorizationClient:
         self._condition = threading.Condition(threading.RLock())
         self._operation_local = threading.local()
 
+    @property
+    def authorization_client_kind(self) -> Literal["sync"]:
+        """Nominal marker used by public framework client protocols."""
+
+        return "sync"
+
     def _ensure_open(self, request: object | None = None) -> None:
         with self._condition:
             if self._state == "OPEN":

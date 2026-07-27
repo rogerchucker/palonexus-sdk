@@ -32,6 +32,9 @@ _LANGCHAIN_EXPORTS = frozenset(
         "MissingIntegrationDependency",
         "PaloNexusLangChainMiddleware",
         "SyncAuthorizationClientProtocol",
+        "authorized_middleware_stack",
+        "create_authorized_agent",
+        "validate_authorized_middleware_stack",
     }
 )
 

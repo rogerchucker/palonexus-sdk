@@ -104,6 +104,12 @@ class AsyncAuthorizationClient:
         self._condition = asyncio.Condition()
         self._close_task: asyncio.Task[None] | None = None
 
+    @property
+    def authorization_client_kind(self) -> Literal["async"]:
+        """Nominal marker used by public framework client protocols."""
+
+        return "async"
+
     async def _ensure_open(self, request: object | None = None) -> None:
         async with self._condition:
             if self._state == "OPEN":
