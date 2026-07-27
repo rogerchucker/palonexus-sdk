@@ -1,11 +1,18 @@
 package config
 
 import (
+	"crypto/rand"
+	"crypto/rsa"
+	"crypto/x509"
+	"crypto/x509/pkix"
+	"encoding/pem"
+	"math/big"
 	"os"
 	"path/filepath"
 	"runtime"
 	"strings"
 	"testing"
+	"time"
 )
 
 func writeConfig(t *testing.T, body string) string {
@@ -25,6 +32,28 @@ func validConfig(endpoint string) string {
 		"local_test_mode": false,
 		"routes": [{"target":"api.example.com","decision_endpoint":"https://decision.example.com"}]
 	}`
+}
+
+func testCertificatePEM(t *testing.T) []byte {
+	t.Helper()
+	key, err := rsa.GenerateKey(rand.Reader, 2048)
+	if err != nil {
+		t.Fatal(err)
+	}
+	template := &x509.Certificate{
+		SerialNumber:          big.NewInt(1),
+		Subject:               pkix.Name{CommonName: "test CA"},
+		NotBefore:             time.Now().Add(-time.Hour),
+		NotAfter:              time.Now().Add(time.Hour),
+		IsCA:                  true,
+		BasicConstraintsValid: true,
+		KeyUsage:              x509.KeyUsageCertSign,
+	}
+	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: der})
 }
 
 func TestLoadAcceptsHTTPSAndReturnsImmutableCopies(t *testing.T) {
@@ -78,6 +107,17 @@ func TestLocalHTTPRequiresConfigAndRuntimeOptInAndLoopback(t *testing.T) {
 	if _, err := Load(writeConfig(t, remote), Options{AllowLocalTestMode: true}); err == nil {
 		t.Fatal("local mode must not permit remote plaintext endpoints")
 	}
+
+	localhost := strings.Replace(body, "127.0.0.1", "localhost", 1)
+	if _, err := Load(writeConfig(t, localhost), Options{AllowLocalTestMode: true}); err == nil {
+		t.Fatal("local mode must require an IP literal")
+	}
+	for _, endpoint := range []string{"http://127.7.8.9:8181", "http://[::1]:8181"} {
+		candidate := strings.Replace(body, "http://127.0.0.1:8181", endpoint, 1)
+		if _, err := Load(writeConfig(t, candidate), Options{AllowLocalTestMode: true}); err != nil {
+			t.Fatalf("loopback literal %q rejected: %v", endpoint, err)
+		}
+	}
 }
 
 func TestLoadRejectsUnknownDuplicateAndMalformedJSON(t *testing.T) {
@@ -96,7 +136,8 @@ func TestLoadRejectsUnknownDuplicateAndMalformedJSON(t *testing.T) {
 func TestLoadValidatesTrustedCA(t *testing.T) {
 	dir := t.TempDir()
 	ca := filepath.Join(dir, "ca.pem")
-	if err := os.WriteFile(ca, []byte("not-secret-ca-data"), 0o600); err != nil {
+	original := testCertificatePEM(t)
+	if err := os.WriteFile(ca, original, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	body := strings.Replace(validConfig("https://decision.example.com"), `"trusted_ca_file": ""`, `"trusted_ca_file": "`+ca+`"`, 1)
@@ -104,8 +145,13 @@ func TestLoadValidatesTrustedCA(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if cfg.TrustedCAFile() != ca {
-		t.Fatalf("CA path = %q", cfg.TrustedCAFile())
+	got := cfg.TrustedCAPEM()
+	if string(got) != string(original) {
+		t.Fatal("loaded CA material differs")
+	}
+	got[0] ^= 0xff
+	if string(cfg.TrustedCAPEM()) != string(original) {
+		t.Fatal("caller mutated retained CA material")
 	}
 
 	if err := os.Chmod(ca, 0o666); err != nil {
@@ -113,6 +159,71 @@ func TestLoadValidatesTrustedCA(t *testing.T) {
 	}
 	if _, err := Load(writeConfig(t, body), Options{}); err == nil {
 		t.Fatal("accepted group/world-writable CA")
+	}
+}
+
+func TestLoadRejectsEmptyAndMalformedTrustedCA(t *testing.T) {
+	for _, data := range [][]byte{
+		nil,
+		[]byte("not PEM"),
+		[]byte("-----BEGIN CERTIFICATE-----\ninvalid\n-----END CERTIFICATE-----\n"),
+		pem.EncodeToMemory(&pem.Block{Type: "PRIVATE KEY", Bytes: []byte("secret")}),
+	} {
+		ca := filepath.Join(t.TempDir(), "ca.pem")
+		if err := os.WriteFile(ca, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		body := strings.Replace(validConfig("https://decision.example.com"), `"trusted_ca_file": ""`, `"trusted_ca_file": "`+ca+`"`, 1)
+		if _, err := Load(writeConfig(t, body), Options{}); err == nil {
+			t.Fatal("accepted invalid CA material")
+		}
+	}
+}
+
+func TestLoadedTrustedCAIsIndependentOfPathReplacement(t *testing.T) {
+	dir := t.TempDir()
+	ca := filepath.Join(dir, "ca.pem")
+	original := testCertificatePEM(t)
+	if err := os.WriteFile(ca, original, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Replace(validConfig("https://decision.example.com"), `"trusted_ca_file": ""`, `"trusted_ca_file": "`+ca+`"`, 1)
+	cfg, err := Load(writeConfig(t, body), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement := filepath.Join(dir, "replacement.pem")
+	if err := os.WriteFile(replacement, []byte("attacker bytes"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(ca, ca+".old"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(replacement, ca); err != nil {
+		t.Fatal(err)
+	}
+	if string(cfg.TrustedCAPEM()) != string(original) {
+		t.Fatal("retained CA followed replaced path")
+	}
+}
+
+func TestLoadRejectsAmbiguousEndpointAuthoritiesAndPorts(t *testing.T) {
+	endpoints := []string{
+		"https://:443",
+		"https://example.com:",
+		"https://example.com:notaport",
+		"https://example.com:0",
+		"https://example.com:65536",
+		"https://%65xample.com",
+		"https://example.com%0a.evil",
+		"https://example.com/\x00",
+	}
+	for _, endpoint := range endpoints {
+		t.Run(endpoint, func(t *testing.T) {
+			if _, err := Load(writeConfig(t, validConfig(endpoint)), Options{}); err == nil {
+				t.Fatal("accepted ambiguous endpoint")
+			}
+		})
 	}
 }
 

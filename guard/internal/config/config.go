@@ -3,7 +3,9 @@ package config
 
 import (
 	"bytes"
+	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"fmt"
 	"io"
@@ -11,6 +13,8 @@ import (
 	"net/url"
 	"os"
 	"runtime"
+	"strconv"
+	"strings"
 	"syscall"
 
 	"github.com/rogerchucker/palonexus-sdk/guard/internal/routing"
@@ -42,16 +46,20 @@ type fileConfig struct {
 type Config struct {
 	decisionEndpoint string
 	oidcIssuer       string
-	trustedCAFile    string
+	trustedCAPEM     []byte
 	localTestMode    bool
 	routes           []Route
 }
 
 func (c *Config) DecisionEndpoint() string { return c.decisionEndpoint }
 func (c *Config) OIDCIssuer() string       { return c.oidcIssuer }
-func (c *Config) TrustedCAFile() string    { return c.trustedCAFile }
 func (c *Config) LocalTestMode() bool      { return c.localTestMode }
 func (c *Config) Routes() []Route          { return append([]Route(nil), c.routes...) }
+
+// TrustedCAPEM returns a defensive copy of CA certificates read from the
+// securely validated descriptor. TLS consumers must use this retained material
+// rather than reopening the configured path.
+func (c *Config) TrustedCAPEM() []byte { return append([]byte(nil), c.trustedCAPEM...) }
 
 // Load securely opens, validates, and decodes a configuration file.
 //
@@ -103,26 +111,46 @@ func Load(path string, options Options) (*Config, error) {
 	if _, err := routing.New(compiledRoutes); err != nil {
 		return nil, errors.New("load config: invalid or ambiguous routes")
 	}
+	var trustedCAPEM []byte
 	if raw.TrustedCAFile != "" {
-		if _, err := readValidatedFile(raw.TrustedCAFile, fileKindCA); err != nil {
+		trustedCAPEM, err = readValidatedFile(raw.TrustedCAFile, fileKindCA)
+		if err != nil {
 			return nil, fmt.Errorf("load config: invalid trusted CA: %w", err)
+		}
+		if err := validateCertificates(trustedCAPEM); err != nil {
+			return nil, errors.New("load config: invalid trusted CA material")
 		}
 	}
 
 	return &Config{
 		decisionEndpoint: raw.DecisionEndpoint,
 		oidcIssuer:       raw.OIDCIssuer,
-		trustedCAFile:    raw.TrustedCAFile,
+		trustedCAPEM:     append([]byte(nil), trustedCAPEM...),
 		localTestMode:    localAllowed,
 		routes:           append([]Route(nil), raw.Routes...),
 	}, nil
 }
 
 func validateEndpoint(raw string, localAllowed bool) error {
+	for _, character := range raw {
+		if character <= 0x1f || character == 0x7f {
+			return errors.New("invalid endpoint")
+		}
+	}
 	parsed, err := url.Parse(raw)
-	if err != nil || parsed.Host == "" || parsed.User != nil ||
+	if err != nil || !parsed.IsAbs() || parsed.Opaque != "" ||
+		parsed.Host == "" || parsed.Hostname() == "" || parsed.User != nil ||
 		parsed.RawQuery != "" || parsed.Fragment != "" {
 		return errors.New("invalid endpoint")
+	}
+	if strings.HasSuffix(parsed.Host, ":") {
+		return errors.New("invalid endpoint")
+	}
+	if port := parsed.Port(); port != "" {
+		number, portErr := strconv.Atoi(port)
+		if portErr != nil || number < 1 || number > 65535 {
+			return errors.New("invalid endpoint")
+		}
 	}
 	if parsed.Scheme == "https" {
 		return nil
@@ -132,8 +160,28 @@ func validateEndpoint(raw string, localAllowed bool) error {
 	}
 	host := parsed.Hostname()
 	ip := net.ParseIP(host)
-	if host != "localhost" && (ip == nil || !ip.IsLoopback()) {
+	if ip == nil || !ip.IsLoopback() {
 		return errors.New("local endpoint required")
+	}
+	return nil
+}
+
+func validateCertificates(data []byte) error {
+	rest := data
+	count := 0
+	for len(bytes.TrimSpace(rest)) != 0 {
+		block, remaining := pem.Decode(rest)
+		if block == nil || block.Type != "CERTIFICATE" {
+			return errors.New("invalid certificate PEM")
+		}
+		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+			return errors.New("invalid X.509 certificate")
+		}
+		count++
+		rest = remaining
+	}
+	if count == 0 {
+		return errors.New("no certificates")
 	}
 	return nil
 }
