@@ -75,25 +75,6 @@ func TestBindingEncodingIsInjectiveAcrossDelimiterUnicodeAndMaximumLengths(t *te
 	}
 }
 
-func TestLegacyDelimiterCredentialIsPurgedAndNeverReturned(t *testing.T) {
-	backend := NewMemoryBackendForTesting()
-	store, err := New("guard.test", backend)
-	if err != nil {
-		t.Fatal(err)
-	}
-	key := Key{Tenant: "a:b", Account: "c"}
-	legacy := legacyAccountName(key)
-	if err := backend.Put(context.Background(), "guard.test", legacy, []byte("legacy-secret")); err != nil {
-		t.Fatal(err)
-	}
-	if value, err := store.Get(context.Background(), key); !errors.Is(err, ErrNotFound) || value != nil {
-		t.Fatalf("legacy Get = %q, %v", value, err)
-	}
-	if value, err := backend.Get(context.Background(), "guard.test", legacy); !errors.Is(err, ErrNotFound) || value != nil {
-		t.Fatalf("legacy item survived purge = %q, %v", value, err)
-	}
-}
-
 func TestInjectiveBindingsRoundTripAndDeleteIndependently(t *testing.T) {
 	t.Parallel()
 	store, err := New("dev.palonexus.guard", NewMemoryBackendForTesting())

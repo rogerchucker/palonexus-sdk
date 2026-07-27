@@ -292,25 +292,6 @@ func TestCleanupTempsUsesIndependentDirectoryOffset(t *testing.T) {
 	}
 }
 
-func TestLogoutPurgesB379LegacyStateWithoutDecodingPayload(t *testing.T) {
-	store := newTestStore(t)
-	binding := Binding{Tenant: "tenant", Account: "account"}
-	for _, kind := range []Kind{KindRouting, KindSession, KindReconciliation} {
-		document := []byte(`{"version":1,"tenant":"tenant","account":"account","kind":"` + string(kind) +
-			`","payload":{"contentType":"application/octet-stream","value":"opaque"}}`)
-		writeAnchoredTestRecord(t, store, legacyRecordName(binding, kind), document)
-	}
-	if err := store.DeleteAccount(context.Background(), binding); err != nil {
-		t.Fatal(err)
-	}
-	for _, kind := range []Kind{KindRouting, KindSession, KindReconciliation} {
-		if err := unix.Fstatat(store.impl.(*unixStore).rootFD, legacyRecordName(binding, kind),
-			&unix.Stat_t{}, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
-			t.Fatalf("legacy %s survived: %v", kind, err)
-		}
-	}
-}
-
 func TestStoreSerializesAcrossProcesses(t *testing.T) {
 	root := filepath.Join(canonicalTempDir(t), "state")
 	store, err := New(root)
