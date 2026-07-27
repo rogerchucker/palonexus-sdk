@@ -18,7 +18,12 @@ from typing import Any, Final, Literal, Never, cast
 
 from .. import _canonicalize
 from .._generated import protocol as wire
-from ..errors import AuthorizationUnavailable, IdempotencyConflict, InvalidRequest
+from ..errors import (
+    AuthorizationUnavailable,
+    IdempotencyConflict,
+    InvalidRequest,
+    PaloNexusError,
+)
 
 _MAX_DELAY: Final[float] = 60.0
 _POLL: Final[float] = 0.01
@@ -34,11 +39,18 @@ class FrozenClock:
     __slots__ = ("_lock", "_now")
 
     def __init__(self, now: str) -> None:
+        failed = False
+        parsed: datetime | None = None
         try:
+            if type(now) is not str:
+                raise ValueError
             parsed = datetime.fromisoformat(now.replace("Z", "+00:00"))
             if parsed.tzinfo is None:
                 raise ValueError
         except Exception:
+            failed = True
+        del now
+        if failed or parsed is None:
             _invalid()
         self._now = parsed.astimezone(UTC)
         self._lock = threading.Lock()
@@ -99,6 +111,58 @@ class _IdempotencyEntry:
     expires_at: datetime
 
 
+@dataclass(frozen=True, slots=True)
+class _ApprovalBinding:
+    request_hash: str
+    action_id: str
+    request_id: str
+    correlation_id: str
+    client_scope_hash: str
+    authoritative_scope_hash: str
+    decision_id: str
+    approval_id: str
+    approval_expires_at: datetime
+
+
+@dataclass(frozen=True, slots=True)
+class _ResolutionBinding:
+    approval_id: str
+    status: str
+    reviewer_ref: str | None
+    result: wire.ApprovalRecord
+
+
+_CONTROL_EXCEPTIONS = (
+    KeyboardInterrupt,
+    SystemExit,
+    GeneratorExit,
+    concurrent.futures.CancelledError,
+    asyncio.CancelledError,
+)
+
+
+def _clean_control(error: BaseException) -> BaseException:
+    error.__traceback__ = None
+    error.__cause__ = None
+    error.__context__ = None
+    return error
+
+
+def _safe_failure(error: BaseException) -> BaseException:
+    if isinstance(error, _CONTROL_EXCEPTIONS):
+        return _clean_control(error)
+    if isinstance(error, PaloNexusError):
+        safe = type(error)(
+            request_id=error.request_id,
+            decision_id=error.decision_id,
+            correlation_id=error.correlation_id,
+        )
+    else:
+        safe = AuthorizationUnavailable()
+    _clean_control(error)
+    return safe
+
+
 class ScriptedEngine:
     """Exact-outcome engine with no policy or condition evaluation.
 
@@ -111,12 +175,14 @@ class ScriptedEngine:
         "_calls",
         "_clock",
         "_closed",
+        "_decision_bindings",
         "_id_source",
         "_idempotency",
         "_idempotency_capacity",
         "_idempotency_ttl",
         "_lock",
         "_outcomes",
+        "_resolution_idempotency",
         "_sequence",
     )
 
@@ -147,6 +213,8 @@ class ScriptedEngine:
         self._outcomes = deque(outcomes)
         self._idempotency: dict[str, _IdempotencyEntry] = {}
         self._approvals: dict[str, wire.ApprovalRecord] = {}
+        self._decision_bindings: dict[str, _ApprovalBinding] = {}
+        self._resolution_idempotency: dict[str, _ResolutionBinding] = {}
         self._calls: list[RecordedCall] = []
         self._lock = threading.RLock()
         self._sequence = 0
@@ -172,7 +240,17 @@ class ScriptedEngine:
 
     @staticmethod
     def error(error: BaseException) -> _Outcome:
-        return _Outcome("error", value=error)
+        """Queue an error without making an unsafe exception part of SDK state.
+
+        Safe ``PaloNexusError`` instances remain typed. Interpreter control-flow
+        exceptions retain identity after their graph is cleared. Every other
+        ``BaseException`` is discarded immediately and later surfaces as the
+        canonical ``AuthorizationUnavailable`` failure.
+        """
+
+        if isinstance(error, PaloNexusError) or isinstance(error, _CONTROL_EXCEPTIONS):
+            return _Outcome("error", value=_clean_control(error))
+        return _Outcome("unsafe_error")
 
     @staticmethod
     def delay(seconds: float, outcome: _Outcome) -> _Outcome:
@@ -199,7 +277,20 @@ class ScriptedEngine:
             return tuple(self._calls)
 
     def _now(self) -> datetime:
-        value = self._clock()
+        failed = False
+        control: BaseException | None = None
+        value: object = None
+        try:
+            value = self._clock()
+        except BaseException as error:
+            if isinstance(error, _CONTROL_EXCEPTIONS):
+                control = _clean_control(error)
+            else:
+                failed = True
+        if control is not None:
+            raise control
+        if failed:
+            _invalid()
         if not isinstance(value, datetime) or value.tzinfo is None:
             _invalid()
         return value.astimezone(UTC)
@@ -207,7 +298,20 @@ class ScriptedEngine:
     def _new_id(self, prefix: str) -> str:
         self._sequence += 1
         if self._id_source is not None:
-            supplied = self._id_source()
+            failed = False
+            control: BaseException | None = None
+            supplied: object = None
+            try:
+                supplied = self._id_source()
+            except BaseException as error:
+                if isinstance(error, _CONTROL_EXCEPTIONS):
+                    control = _clean_control(error)
+                else:
+                    failed = True
+            if control is not None:
+                raise control
+            if failed:
+                _invalid()
             if type(supplied) is not str:
                 _invalid()
             suffix = supplied.split("_", 1)[-1]
@@ -240,6 +344,14 @@ class ScriptedEngine:
         ]
         for key in expired:
             del self._idempotency[key]
+        stale_decisions = [
+            key
+            for key, binding in self._decision_bindings.items()
+            if binding.approval_expires_at <= now
+            and binding.approval_id not in self._approvals
+        ]
+        for key in stale_decisions:
+            del self._decision_bindings[key]
 
     def _record(
         self, request: wire.ActionRequest, client_scope_hash: str, request_hash: str
@@ -287,12 +399,14 @@ class ScriptedEngine:
         *, deadline: float | None, cancelled: Callable[[], bool] | None
     ) -> None:
         if cancelled is not None:
+            requested = False
             try:
-                if cancelled():
-                    raise concurrent.futures.CancelledError
-            except concurrent.futures.CancelledError:
-                raise
-            except Exception:
+                requested = bool(cancelled())
+            except BaseException as error:
+                if isinstance(error, _CONTROL_EXCEPTIONS):
+                    raise _clean_control(error)
+                requested = True
+            if requested:
                 raise concurrent.futures.CancelledError from None
         if deadline is not None and time.monotonic() >= deadline:
             raise AuthorizationUnavailable() from None
@@ -318,8 +432,8 @@ class ScriptedEngine:
     ) -> wire.AuthorizationDecision:
         if outcome.kind == "error":
             assert isinstance(outcome.value, BaseException)
-            raise outcome.value
-        if outcome.kind == "outage":
+            raise _clean_control(outcome.value)
+        if outcome.kind in {"outage", "unsafe_error"}:
             raise AuthorizationUnavailable(
                 request_id=request.request_id,
                 correlation_id=request.correlation_id,
@@ -375,8 +489,8 @@ class ScriptedEngine:
             self._check_control(deadline=deadline, cancelled=cancelled)
             if self._closed:
                 raise AuthorizationUnavailable() from None
-            now = self._now()
-            self._purge_expired(now)
+            start_now = self._now()
+            self._purge_expired(start_now)
             prior = self._idempotency.get(key)
             self._record(request, client_scope_hash, request_hash)
             if prior is not None:
@@ -405,12 +519,35 @@ class ScriptedEngine:
                 )
                 assert outcome.nested is not None
                 outcome = outcome.nested
-            result = self._decision(outcome, request, client_scope_hash, now)
+            completion_now = self._now()
+            result = self._decision(outcome, request, client_scope_hash, completion_now)
+            if (
+                result.approval is not None
+                and len(self._decision_bindings) >= self._idempotency_capacity
+            ):
+                raise AuthorizationUnavailable(
+                    request_id=request.request_id,
+                    correlation_id=request.correlation_id,
+                ) from None
             self._idempotency[key] = _IdempotencyEntry(
                 request_hash=request_hash,
                 result=result,
-                expires_at=now + timedelta(seconds=self._idempotency_ttl),
+                expires_at=completion_now + timedelta(seconds=self._idempotency_ttl),
             )
+            if result.approval is not None:
+                self._decision_bindings[str(result.decision_id)] = _ApprovalBinding(
+                    request_hash=request_hash,
+                    action_id=str(request.action_id),
+                    request_id=str(request.request_id),
+                    correlation_id=str(request.correlation_id),
+                    client_scope_hash=client_scope_hash,
+                    authoritative_scope_hash=str(result.authoritative_scope_hash),
+                    decision_id=str(result.decision_id),
+                    approval_id=str(result.approval.approval_id),
+                    approval_expires_at=datetime.fromisoformat(
+                        str(result.approval.expires_at).replace("Z", "+00:00")
+                    ),
+                )
             return result
 
     def request_approval(
@@ -426,6 +563,8 @@ class ScriptedEngine:
         self._check_control(deadline=deadline, cancelled=cancelled)
         with self._lock:
             self._check_control(deadline=deadline, cancelled=cancelled)
+            if self._closed:
+                raise AuthorizationUnavailable() from None
             request_hash = self._hash(request)
             self._record(
                 request,
@@ -438,6 +577,26 @@ class ScriptedEngine:
                 canonical_request_hash=request_hash,
                 client_scope_hash=authoritative_scope_hash,
             )
+            binding = self._decision_bindings.get(decision_id)
+            mismatch = (
+                binding is None
+                or binding.request_hash != request_hash
+                or binding.action_id != str(request.action_id)
+                or binding.request_id != str(request.request_id)
+                or binding.correlation_id != str(request.correlation_id)
+                or binding.client_scope_hash
+                != _canonicalize.client_scope_hash(request.to_dict())
+                or binding.authoritative_scope_hash != authoritative_scope_hash
+                or binding.approval_id != approval_id
+                or binding.approval_expires_at <= self._now()
+            )
+            if mismatch:
+                raise IdempotencyConflict(
+                    request_id=request.request_id,
+                    decision_id=decision_id,
+                    correlation_id=request.correlation_id,
+                ) from None
+            assert binding is not None
             existing = self._approvals.get(approval_id)
             if existing is not None:
                 return existing
@@ -455,7 +614,7 @@ class ScriptedEngine:
                 "authoritativeScopeHash": authoritative_scope_hash,
                 "status": "pending",
                 "requestedAt": _timestamp(now),
-                "expiresAt": _timestamp(now + timedelta(minutes=15)),
+                "expiresAt": _timestamp(binding.approval_expires_at),
                 "requesterRef": "subject:testing-requester",
                 "authorizationDecisionId": decision_id,
                 "creationAuditRef": self._new_id("audit"),
@@ -540,19 +699,57 @@ class ScriptedEngine:
         reviewer_ref: str | None,
         resolution_idempotency_key: str,
     ) -> wire.ApprovalRecord:
+        failed = False
+        try:
+            checked_approval_id = str(wire.ApprovalID(approval_id))
+            checked_key = str(
+                wire.ApprovalResolutionIdempotencyKey(resolution_idempotency_key)
+            )
+            if status not in {"approved", "denied", "expired", "cancelled"}:
+                raise ValueError
+            checked_reviewer = (
+                None if reviewer_ref is None else str(wire.PrincipalRef(reviewer_ref))
+            )
+        except Exception:
+            failed = True
+            checked_approval_id = ""
+            checked_key = ""
+            checked_reviewer = None
+        if failed:
+            raise InvalidRequest() from None
         with self._lock:
-            record = self._approvals.get(approval_id)
-            if record is None or str(record.status) != "pending":
-                raise ValueError("approval is absent or terminal")
-            if status in {"approved", "denied"} and reviewer_ref is None:
-                raise ValueError("reviewer_ref is required")
+            prior_resolution = self._resolution_idempotency.get(checked_key)
+            if prior_resolution is not None:
+                if (
+                    prior_resolution.approval_id == checked_approval_id
+                    and prior_resolution.status == status
+                    and prior_resolution.reviewer_ref == checked_reviewer
+                ):
+                    return prior_resolution.result
+                raise IdempotencyConflict() from None
+            record = self._approvals.get(checked_approval_id)
+            if record is None:
+                raise IdempotencyConflict() from None
+            if str(record.status) != "pending":
+                raise IdempotencyConflict(
+                    decision_id=record.resolution_decision_id,
+                    correlation_id=record.correlation_id,
+                ) from None
+            if status in {"approved", "denied"} and checked_reviewer is None:
+                raise InvalidRequest() from None
             resolved = self._resolve(
                 record,
                 status=status,
-                reviewer_ref=reviewer_ref,
-                resolution_idempotency_key=resolution_idempotency_key,
+                reviewer_ref=checked_reviewer,
+                resolution_idempotency_key=checked_key,
             )
-            self._approvals[approval_id] = resolved
+            self._approvals[checked_approval_id] = resolved
+            self._resolution_idempotency[checked_key] = _ResolutionBinding(
+                approval_id=checked_approval_id,
+                status=status,
+                reviewer_ref=checked_reviewer,
+                result=resolved,
+            )
             return resolved
 
     def close(self) -> None:
@@ -573,15 +770,36 @@ class FakeTransport:
     def decide(
         self, request: wire.ActionRequest, **kwargs: Any
     ) -> wire.AuthorizationDecision:
-        return self._engine.decide(request, **kwargs)
+        failure: BaseException | None = None
+        try:
+            return self._engine.decide(request, **kwargs)
+        except BaseException as error:
+            failure = _safe_failure(error)
+        del request, kwargs
+        assert failure is not None
+        raise failure from None
 
     def request_approval(
         self, request: wire.ActionRequest, **kwargs: Any
     ) -> wire.ApprovalRecord:
-        return self._engine.request_approval(request, **kwargs)
+        failure: BaseException | None = None
+        try:
+            return self._engine.request_approval(request, **kwargs)
+        except BaseException as error:
+            failure = _safe_failure(error)
+        del request, kwargs
+        assert failure is not None
+        raise failure from None
 
     def get_approval(self, approval_id: str, **kwargs: Any) -> wire.ApprovalRecord:
-        return self._engine.get_approval(approval_id, **kwargs)
+        failure: BaseException | None = None
+        try:
+            return self._engine.get_approval(approval_id, **kwargs)
+        except BaseException as error:
+            failure = _safe_failure(error)
+        del approval_id, kwargs
+        assert failure is not None
+        raise failure from None
 
     def close(self) -> None:
         """Borrowed engine lifecycle is intentionally unchanged."""
@@ -612,27 +830,59 @@ class AsyncFakeTransport:
 
         kwargs["cancelled"] = cancelled
         worker = asyncio.create_task(
-            asyncio.to_thread(self._engine.decide, request, **kwargs)
+            asyncio.to_thread(
+                FakeTransport(self._engine, testing_only=True).decide,
+                request,
+                **kwargs,
+            )
         )
+        failure: BaseException | None = None
         try:
             return await asyncio.shield(worker)
-        except asyncio.CancelledError:
+        except asyncio.CancelledError as error:
             stop.set()
             try:
                 await worker
             except BaseException:
                 pass
-            raise
+            failure = _clean_control(error)
+        except BaseException as error:
+            failure = _safe_failure(error)
+        del request, kwargs, worker
+        assert failure is not None
+        raise failure from None
 
     async def request_approval(
         self, request: wire.ActionRequest, **kwargs: Any
     ) -> wire.ApprovalRecord:
-        return await asyncio.to_thread(self._engine.request_approval, request, **kwargs)
+        failure: BaseException | None = None
+        try:
+            return await asyncio.to_thread(
+                FakeTransport(self._engine, testing_only=True).request_approval,
+                request,
+                **kwargs,
+            )
+        except BaseException as error:
+            failure = _safe_failure(error)
+        del request, kwargs
+        assert failure is not None
+        raise failure from None
 
     async def get_approval(
         self, approval_id: str, **kwargs: Any
     ) -> wire.ApprovalRecord:
-        return await asyncio.to_thread(self._engine.get_approval, approval_id, **kwargs)
+        failure: BaseException | None = None
+        try:
+            return await asyncio.to_thread(
+                FakeTransport(self._engine, testing_only=True).get_approval,
+                approval_id,
+                **kwargs,
+            )
+        except BaseException as error:
+            failure = _safe_failure(error)
+        del approval_id, kwargs
+        assert failure is not None
+        raise failure from None
 
     async def aclose(self) -> None:
         """Borrowed engine lifecycle is intentionally unchanged."""

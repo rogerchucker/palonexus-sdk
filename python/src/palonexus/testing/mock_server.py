@@ -5,9 +5,11 @@ from __future__ import annotations
 
 import ipaddress
 import json
+import math
+import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Final, Literal, Self
+from typing import Any, Final, Literal, Self
 
 from .._generated import protocol as wire
 from ..errors import PaloNexusError
@@ -33,12 +35,69 @@ def _error_document(error: PaloNexusError) -> bytes:
 
 
 class _Server(ThreadingHTTPServer):
-    daemon_threads = False
+    daemon_threads = True
     allow_reuse_address = False
 
-    def __init__(self, address: tuple[str, int], engine: ScriptedEngine) -> None:
+    def __init__(
+        self,
+        address: tuple[str, int],
+        engine: ScriptedEngine,
+        connection_timeout: float,
+    ) -> None:
         self.engine = engine
+        self.connection_timeout = connection_timeout
+        self._active: dict[socket.socket, threading.Timer] = {}
+        self._active_lock = threading.Lock()
         super().__init__(address, _Handler)
+
+    def get_request(self) -> tuple[socket.socket, tuple[str, int]]:
+        connection, address = super().get_request()
+        connection.settimeout(self.connection_timeout)
+        timer = threading.Timer(
+            self.connection_timeout,
+            self._expire_connection,
+            args=(connection,),
+        )
+        timer.daemon = True
+        with self._active_lock:
+            self._active[connection] = timer
+        timer.start()
+        return connection, address
+
+    def _expire_connection(self, connection: socket.socket) -> None:
+        try:
+            connection.shutdown(socket.SHUT_RDWR)
+        except OSError:
+            pass
+        try:
+            connection.close()
+        except OSError:
+            pass
+
+    def close_request(self, request: Any) -> None:
+        with self._active_lock:
+            timer = self._active.pop(request, None)
+        if timer is not None:
+            timer.cancel()
+        super().close_request(request)
+
+    def close_active(self) -> None:
+        with self._active_lock:
+            active = tuple(self._active.items())
+            self._active.clear()
+        for connection, timer in active:
+            timer.cancel()
+            try:
+                connection.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+            try:
+                connection.close()
+            except OSError:
+                pass
+
+    def serve_bounded(self) -> None:
+        self.serve_forever(poll_interval=0.01)
 
 
 class _Handler(BaseHTTPRequestHandler):
@@ -131,7 +190,14 @@ class _Handler(BaseHTTPRequestHandler):
 class MockDecisionServer:
     """Owned loopback server; construction is deliberately test-capability gated."""
 
-    __slots__ = ("_server", "_thread", "_closed", "_started")
+    __slots__ = (
+        "_server",
+        "_thread",
+        "_closed",
+        "_started",
+        "_state_lock",
+        "_stopped",
+    )
 
     def __init__(
         self,
@@ -140,6 +206,7 @@ class MockDecisionServer:
         testing_only: Literal[True],
         host: str = "127.0.0.1",
         port: int = 0,
+        connection_timeout: float = 1.0,
     ) -> None:
         if testing_only is not True or type(engine) is not ScriptedEngine:
             raise ValueError("testing_only=True and a ScriptedEngine are required")
@@ -155,14 +222,28 @@ class MockDecisionServer:
             or not 0 <= port <= 65535
         ):
             raise ValueError("port is invalid")
-        self._server = _Server((host, port), engine)
+        if (
+            isinstance(connection_timeout, bool)
+            or not isinstance(connection_timeout, (int, float))
+            or not math.isfinite(connection_timeout)
+            or connection_timeout < 0.01
+            or connection_timeout > 5.0
+        ):
+            raise ValueError("connection_timeout is invalid")
+        self._server = _Server(
+            (host, port),
+            engine,
+            float(connection_timeout),
+        )
         self._thread = threading.Thread(
-            target=self._server.serve_forever,
+            target=self._server.serve_bounded,
             name="palonexus-mock-decision-server",
             daemon=False,
         )
         self._closed = False
         self._started = False
+        self._state_lock = threading.RLock()
+        self._stopped = threading.Event()
 
     @property
     def host(self) -> str:
@@ -178,29 +259,41 @@ class MockDecisionServer:
 
     @property
     def closed(self) -> bool:
-        return self._closed
+        with self._state_lock:
+            return self._closed
 
     @property
     def thread_ident(self) -> int | None:
         return self._thread.ident
 
     def start(self) -> Self:
-        if self._closed:
-            raise RuntimeError("server is closed")
-        if not self._started:
-            self._thread.start()
-            self._started = True
+        with self._state_lock:
+            if self._closed:
+                raise RuntimeError("server is closed")
+            if not self._started:
+                self._thread.start()
+                self._started = True
         return self
 
     def close(self) -> None:
-        if self._closed:
+        owner = False
+        with self._state_lock:
+            if not self._closed:
+                self._closed = True
+                owner = True
+            started = self._started
+        if not owner:
+            self._stopped.wait()
             return
-        self._closed = True
-        if self._started:
-            self._server.shutdown()
-        self._server.server_close()
-        if self._started:
-            self._thread.join()
+        try:
+            self._server.close_active()
+            if started:
+                self._server.shutdown()
+            self._server.server_close()
+            if started:
+                self._thread.join()
+        finally:
+            self._stopped.set()
 
     def __enter__(self) -> Self:
         return self.start()

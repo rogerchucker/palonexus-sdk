@@ -8,6 +8,8 @@ import concurrent.futures
 import json
 import socket
 import threading
+import time
+import traceback
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Any
@@ -20,6 +22,7 @@ from palonexus import (
     AuthorizationClient,
     AuthorizationUnavailable,
     IdempotencyConflict,
+    InvalidRequest,
     RetryPolicy,
     TaskContext,
     _canonicalize,
@@ -41,6 +44,7 @@ from palonexus.transports import (
 
 ROOT = Path(__file__).parents[2]
 ACTION = ROOT / "protocol/test-vectors/action/valid/file-write.json"
+_HOSTILE_SECRET = "TOPSECRET-CALLBACK-VALUE"
 
 
 def request(*, key: str | None = None, action: str | None = None) -> wire.ActionRequest:
@@ -181,12 +185,47 @@ def test_approval_lifecycle_is_deterministic_and_terminal() -> None:
     )
     assert str(approved.status) == "approved"
     assert transport.get_approval(str(pending.approval_id)) is approved
-    with pytest.raises(ValueError):
+    with pytest.raises(IdempotencyConflict):
         scripted.resolve_approval(
             str(pending.approval_id),
             status="denied",
             reviewer_ref="subject:test-reviewer",
             resolution_idempotency_key="approval_01J5ABCDEFGHJKMNPQRSTVWXY5",
+        )
+
+
+def test_approval_creation_is_bound_to_issued_decision_and_request() -> None:
+    scripted = engine(ScriptedEngine.approval_required(), ScriptedEngine.allow())
+    transport = FakeTransport(scripted, testing_only=True)
+    original = request()
+    decision = transport.decide(original, client_scope_hash=scope(original))
+    assert decision.approval is not None
+    kwargs = {
+        "decision_id": str(decision.decision_id),
+        "authoritative_scope_hash": str(decision.authoritative_scope_hash),
+        "approval_id": str(decision.approval.approval_id),
+    }
+    first = transport.request_approval(original, **kwargs)
+    assert transport.request_approval(original, **kwargs) is first
+
+    changed = request(action="file:delete")
+    with pytest.raises(IdempotencyConflict):
+        transport.request_approval(changed, **kwargs)
+    with pytest.raises(IdempotencyConflict):
+        transport.request_approval(
+            original,
+            **{**kwargs, "authoritative_scope_hash": "sha256:" + "f" * 64},
+        )
+    allowed_request = request(key="authz_01J5ABCDEFGHJKMNPQRSTVWXY9")
+    allowed = transport.decide(
+        allowed_request, client_scope_hash=scope(allowed_request)
+    )
+    with pytest.raises(IdempotencyConflict):
+        transport.request_approval(
+            allowed_request,
+            decision_id=str(allowed.decision_id),
+            authoritative_scope_hash=str(allowed.authoritative_scope_hash),
+            approval_id="apr_01J5ABCDEFGHJKMNPQRSTVWXY9",
         )
 
 
@@ -222,11 +261,62 @@ def test_every_approval_terminal_state_has_one_exact_transition(
     assert str(terminal.status) == status
     assert terminal.action_id == pending.action_id
     assert terminal.authoritative_scope_hash == pending.authoritative_scope_hash
-    with pytest.raises(ValueError):
+    with pytest.raises(IdempotencyConflict):
         scripted.resolve_approval(
             str(pending.approval_id),
             status="cancelled",
             reviewer_ref=None,
+            resolution_idempotency_key="approval_01J5ABCDEFGHJKMNPQRSTVWXY5",
+        )
+
+
+def test_resolution_idempotency_replays_and_conflicts_globally() -> None:
+    scripted = engine(
+        ScriptedEngine.approval_required(),
+        ScriptedEngine.approval_required(),
+    )
+    transport = FakeTransport(scripted, testing_only=True)
+
+    def create(value: wire.ActionRequest) -> wire.ApprovalRecord:
+        decision = transport.decide(value, client_scope_hash=scope(value))
+        assert decision.approval is not None
+        return transport.request_approval(
+            value,
+            decision_id=str(decision.decision_id),
+            authoritative_scope_hash=str(decision.authoritative_scope_hash),
+            approval_id=str(decision.approval.approval_id),
+        )
+
+    first = create(request())
+    second = create(request(key="authz_01J5ABCDEFGHJKMNPQRSTVWXY9"))
+    key = "approval_01J5ABCDEFGHJKMNPQRSTVWXY4"
+    resolved = scripted.resolve_approval(
+        str(first.approval_id),
+        status="approved",
+        reviewer_ref="subject:test-reviewer",
+        resolution_idempotency_key=key,
+    )
+    assert (
+        scripted.resolve_approval(
+            str(first.approval_id),
+            status="approved",
+            reviewer_ref="subject:test-reviewer",
+            resolution_idempotency_key=key,
+        )
+        is resolved
+    )
+    with pytest.raises(IdempotencyConflict):
+        scripted.resolve_approval(
+            str(second.approval_id),
+            status="approved",
+            reviewer_ref="subject:test-reviewer",
+            resolution_idempotency_key=key,
+        )
+    with pytest.raises(IdempotencyConflict):
+        scripted.resolve_approval(
+            str(first.approval_id),
+            status="denied",
+            reviewer_ref="subject:test-reviewer",
             resolution_idempotency_key="approval_01J5ABCDEFGHJKMNPQRSTVWXY5",
         )
 
@@ -267,6 +357,37 @@ def test_idempotency_expiry_is_clock_controlled() -> None:
     clock.advance(11)
     second = transport.decide(value, client_scope_hash=scope(value))
     assert str(second.outcome) == "deny"
+
+
+def test_delay_uses_completion_clock_for_timestamps_and_ttl() -> None:
+    clock = FrozenClock("2026-07-25T20:00:00Z")
+
+    def advance_during_delay() -> None:
+        time.sleep(0.01)
+        clock.advance(20)
+
+    scripted = ScriptedEngine(
+        ScriptedEngine.delay(0.03, ScriptedEngine.allow()),
+        ScriptedEngine.deny(),
+        testing_only=True,
+        clock=clock,
+        idempotency_capacity=1,
+        idempotency_ttl=10,
+    )
+    thread = threading.Thread(target=advance_during_delay)
+    thread.start()
+    value = request()
+    first = FakeTransport(scripted, testing_only=True).decide(
+        value, client_scope_hash=scope(value)
+    )
+    thread.join()
+    assert str(first.server_time) == "2026-07-25T20:00:20Z"
+    assert (
+        FakeTransport(scripted, testing_only=True).decide(
+            value, client_scope_hash=scope(value)
+        )
+        is first
+    )
 
 
 def test_concurrent_same_key_consumes_one_scripted_outcome() -> None:
@@ -484,13 +605,127 @@ def test_async_cancellation_drains_delayed_worker() -> None:
     asyncio.run(scenario())
 
 
-def test_direct_control_exceptions_propagate_and_delays_obey_cancellation() -> None:
-    marker = RuntimeError("test control failure")
-    scripted = engine(ScriptedEngine.error(marker))
-    with pytest.raises(RuntimeError, match="test control failure"):
+def test_hostile_callbacks_and_scripted_errors_are_sanitized() -> None:
+    def hostile_clock() -> datetime:
+        raise RuntimeError(_HOSTILE_SECRET)
+
+    scripted = ScriptedEngine(
+        ScriptedEngine.allow(),
+        testing_only=True,
+        clock=hostile_clock,
+    )
+    with pytest.raises(InvalidRequest) as caught:
         FakeTransport(scripted, testing_only=True).decide(
             request(), client_scope_hash=scope(request())
         )
+    rendered = "".join(
+        traceback.TracebackException.from_exception(
+            caught.value, capture_locals=True
+        ).format()
+    )
+    assert _HOSTILE_SECRET not in rendered
+    assert caught.value.__cause__ is None
+    assert caught.value.__context__ is None
+
+    unsafe = engine(ScriptedEngine.error(RuntimeError(_HOSTILE_SECRET)))
+    with pytest.raises(AuthorizationUnavailable) as unsafe_caught:
+        FakeTransport(unsafe, testing_only=True).decide(
+            request(), client_scope_hash=scope(request())
+        )
+    assert _HOSTILE_SECRET not in repr(unsafe_caught.value)
+    assert unsafe_caught.value.__cause__ is None
+    assert unsafe_caught.value.__context__ is None
+
+    class UnsafeBase(BaseException):
+        pass
+
+    unsafe_base = engine(ScriptedEngine.error(UnsafeBase(_HOSTILE_SECRET)))
+    with pytest.raises(AuthorizationUnavailable):
+        FakeTransport(unsafe_base, testing_only=True).decide(
+            request(), client_scope_hash=scope(request())
+        )
+
+
+def test_hostile_frozen_clock_id_and_cancel_inputs_do_not_escape() -> None:
+    class HostileText(str):
+        def replace(self, *_: object, **__: object) -> str:
+            raise RuntimeError(_HOSTILE_SECRET)
+
+        def __repr__(self) -> str:
+            return _HOSTILE_SECRET
+
+    with pytest.raises(InvalidRequest) as frozen_caught:
+        FrozenClock(HostileText("2026-07-25T20:00:00Z"))
+    frozen_rendered = "".join(
+        traceback.TracebackException.from_exception(
+            frozen_caught.value, capture_locals=True
+        ).format()
+    )
+    assert _HOSTILE_SECRET not in frozen_rendered
+
+    def hostile_id() -> str:
+        raise RuntimeError(_HOSTILE_SECRET)
+
+    scripted = ScriptedEngine(
+        ScriptedEngine.allow(),
+        testing_only=True,
+        clock=FrozenClock("2026-07-25T20:00:00Z"),
+        id_source=hostile_id,
+    )
+    with pytest.raises(InvalidRequest) as id_caught:
+        scripted.decide(request(), client_scope_hash=scope(request()))
+    id_rendered = "".join(
+        traceback.TracebackException.from_exception(
+            id_caught.value, capture_locals=True
+        ).format()
+    )
+    assert _HOSTILE_SECRET not in id_rendered
+    assert id_caught.value.__cause__ is None
+    assert id_caught.value.__context__ is None
+
+    def hostile_cancel() -> bool:
+        raise RuntimeError(_HOSTILE_SECRET)
+
+    with pytest.raises(concurrent.futures.CancelledError) as cancel_caught:
+        engine(ScriptedEngine.allow()).decide(
+            request(),
+            client_scope_hash=scope(request()),
+            cancelled=hostile_cancel,
+        )
+    assert cancel_caught.value.__cause__ is None
+    assert cancel_caught.value.__context__ is None
+
+
+def test_mock_server_sanitizes_engine_callback_failures() -> None:
+    def hostile_clock() -> datetime:
+        raise RuntimeError(_HOSTILE_SECRET)
+
+    scripted = ScriptedEngine(
+        ScriptedEngine.allow(),
+        testing_only=True,
+        clock=hostile_clock,
+    )
+    with MockDecisionServer(scripted, testing_only=True) as server:
+        response = httpx.post(
+            f"{server.origin}/v1/authorization/decisions",
+            content=_canonicalize.canonical_json(request().to_dict()),
+            headers={"Content-Type": "application/json"},
+            trust_env=False,
+        )
+    assert response.status_code == 503
+    assert _HOSTILE_SECRET not in response.text
+
+
+def test_direct_control_exceptions_propagate_and_delays_obey_cancellation() -> None:
+    marker = KeyboardInterrupt()
+    scripted = engine(ScriptedEngine.error(marker))
+    with pytest.raises(KeyboardInterrupt) as caught:
+        FakeTransport(scripted, testing_only=True).decide(
+            request(), client_scope_hash=scope(request())
+        )
+    assert caught.value is marker
+    assert marker.__cause__ is None
+    assert marker.__context__ is None
 
     delayed = engine(ScriptedEngine.delay(1.0, ScriptedEngine.allow()))
     with pytest.raises(concurrent.futures.CancelledError):
@@ -499,6 +734,50 @@ def test_direct_control_exceptions_propagate_and_delays_obey_cancellation() -> N
             client_scope_hash=scope(request()),
             cancelled=lambda: True,
         )
+
+
+def test_mock_server_closes_half_open_and_slow_connections_within_bound() -> None:
+    scripted = engine(ScriptedEngine.allow())
+    server = MockDecisionServer(
+        scripted,
+        testing_only=True,
+        connection_timeout=0.1,
+    ).start()
+    sockets: list[socket.socket] = []
+    try:
+        half_open = socket.create_connection((server.host, server.port))
+        half_open.sendall(b"POST /v1/authorization/decisions HTTP/1.1\r\n")
+        sockets.append(half_open)
+        incomplete = socket.create_connection((server.host, server.port))
+        incomplete.sendall(
+            b"POST /v1/authorization/decisions HTTP/1.1\r\n"
+            b"Host: 127.0.0.1\r\nContent-Type: application/json\r\n"
+            b"Content-Length: 100\r\n\r\n{}"
+        )
+        sockets.append(incomplete)
+        slow = socket.create_connection((server.host, server.port))
+        slow.sendall(b"P")
+        sockets.append(slow)
+        time.sleep(0.2)
+        slow.settimeout(0.2)
+        assert slow.recv(1) == b""
+        oversized = socket.create_connection((server.host, server.port))
+        oversized.sendall(b"GET / HTTP/1.1\r\nX-Test: " + b"x" * 70_000 + b"\r\n\r\n")
+        oversized.settimeout(0.5)
+        assert b"431" in oversized.recv(512).split(b"\r\n", 1)[0]
+        oversized.close()
+        started = time.monotonic()
+        closers = [threading.Thread(target=server.close) for _ in range(3)]
+        for closer in closers:
+            closer.start()
+        for closer in closers:
+            closer.join()
+        assert time.monotonic() - started < 1.0
+        assert server.closed
+    finally:
+        server.close()
+        for connection in sockets:
+            connection.close()
 
 
 def test_testing_package_has_no_embedded_policy_or_private_environment_names() -> None:
