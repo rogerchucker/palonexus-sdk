@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import base64
 import csv
 import hashlib
 import json
@@ -804,6 +805,157 @@ def _workspace_editables(errors: list[str]) -> dict[str, str]:
     return editables
 
 
+GO_VERSION = re.compile(
+    r"^v\d+\.\d+\.\d+(?:-[0-9A-Za-z][0-9A-Za-z.-]*)?(?:\+[0-9A-Za-z.-]+)?$"
+)
+GO_PRIVATE_SUFFIXES = (".internal", ".local", ".localhost", ".invalid", ".test")
+
+
+def _public_go_module_path(module: str) -> bool:
+    if not module or "\\" in module or "://" in module or module.startswith((".", "/")):
+        return False
+    host = module.split("/", 1)[0].lower()
+    return (
+        "." in host
+        and ":" not in host
+        and host != "localhost"
+        and not host.endswith(GO_PRIVATE_SUFFIXES)
+    )
+
+
+def _go_requirements(
+    contents: str, relative: Path, errors: list[str]
+) -> dict[str, str]:
+    requirements: dict[str, str] = {}
+    in_block = False
+    for line_number, raw_line in enumerate(contents.splitlines(), start=1):
+        stripped = raw_line.strip()
+        if not stripped or stripped.startswith("//"):
+            continue
+        if re.match(r"^(replace|exclude|retract|tool)\b", stripped):
+            errors.append(f"Go module replacements are not allowed: {relative}")
+            continue
+        if stripped == "require (":
+            if in_block:
+                errors.append(f"malformed Go require block: {relative}")
+            in_block = True
+            continue
+        if in_block and stripped == ")":
+            in_block = False
+            continue
+        if stripped.startswith(("module ", "go ", "toolchain ")):
+            continue
+        requirement = (
+            stripped
+            if in_block
+            else (
+                stripped.removeprefix("require ").strip()
+                if stripped.startswith("require ")
+                else ""
+            )
+        )
+        if not requirement:
+            # Syntax outside dependency directives belongs to Go itself and is
+            # irrelevant unless it mutates dependency resolution.
+            continue
+        requirement = requirement.split("//", 1)[0].strip()
+        fields = requirement.split()
+        if len(fields) != 2:
+            errors.append(f"malformed Go requirement: {relative}:{line_number}")
+            continue
+        module, version = fields
+        if not _public_go_module_path(module):
+            errors.append(f"private or non-public Go module path: {module}")
+            continue
+        if GO_VERSION.fullmatch(version) is None:
+            errors.append(f"Go module version is not exactly pinned: {module}")
+            continue
+        if module in requirements:
+            errors.append(f"duplicate Go module requirement: {module}")
+            continue
+        requirements[module] = version
+    if in_block:
+        errors.append(f"unterminated Go require block: {relative}")
+    return requirements
+
+
+def _valid_go_checksum(value: str) -> bool:
+    if not value.startswith("h1:"):
+        return False
+    try:
+        decoded = base64.b64decode(value[3:], validate=True)
+    except (ValueError, base64.binascii.Error):
+        return False
+    return len(decoded) == 32
+
+
+def _go_dependencies(errors: list[str]) -> dict[str, str]:
+    dependencies: dict[str, str] = {}
+    manifests = [
+        path
+        for path in ROOT.rglob("go.mod")
+        if not IGNORED_PARTS.intersection(path.relative_to(ROOT).parts)
+    ]
+    for manifest in manifests:
+        relative = manifest.relative_to(ROOT)
+        if manifest.is_symlink():
+            errors.append(f"dependency manifest symlink is not allowed: {relative}")
+            continue
+        try:
+            contents = manifest.read_text(encoding="utf-8")
+        except (OSError, UnicodeError) as exc:
+            errors.append(f"cannot read dependency manifest {relative}: {exc}")
+            continue
+        requirements = _go_requirements(contents, relative, errors)
+        for module, version in requirements.items():
+            if module in dependencies and dependencies[module] != version:
+                errors.append(f"conflicting Go module requirement: {module}")
+            dependencies[module] = version
+
+        sum_path = manifest.with_name("go.sum")
+        checksum_entries: set[tuple[str, str, bool]] = set()
+        if sum_path.is_file():
+            try:
+                sum_lines = sum_path.read_text(encoding="utf-8").splitlines()
+            except (OSError, UnicodeError) as exc:
+                errors.append(f"cannot read Go checksum file: {exc}")
+                sum_lines = []
+            for line_number, line in enumerate(sum_lines, start=1):
+                fields = line.split()
+                if len(fields) != 3:
+                    errors.append(
+                        f"malformed Go checksum: {sum_path.relative_to(ROOT)}:"
+                        f"{line_number}"
+                    )
+                    continue
+                module, raw_version, checksum = fields
+                metadata = raw_version.endswith("/go.mod")
+                version = raw_version.removesuffix("/go.mod")
+                entry = (module, version, metadata)
+                if not _valid_go_checksum(checksum):
+                    errors.append(f"missing valid module checksum: {module}@{version}")
+                    continue
+                if entry in checksum_entries:
+                    errors.append(
+                        f"duplicate Go checksum entry: {module}@{raw_version}"
+                    )
+                    continue
+                checksum_entries.add(entry)
+                if requirements.get(module) != version:
+                    errors.append(
+                        f"unexpected Go checksum entry: {module}@{raw_version}"
+                    )
+        elif requirements:
+            errors.append(f"missing Go checksum file: {sum_path.relative_to(ROOT)}")
+
+        for module, version in requirements.items():
+            for metadata in (False, True):
+                if (module, version, metadata) not in checksum_entries:
+                    kind = "go.mod" if metadata else "module"
+                    errors.append(f"missing valid {kind} checksum: {module}@{version}")
+    return dependencies
+
+
 def _manifest_dependencies(errors: list[str]) -> dict[str, str]:
     requirements_by_name: dict[str, str] = {}
     constraints_by_name: dict[str, list[str]] = {}
@@ -903,20 +1055,6 @@ def _manifest_dependencies(errors: list[str]) -> dict[str, str]:
                 errors.append(
                     f"unsupported dependency reconciliation: npm ({relative})"
                 )
-    for go_mod in ROOT.rglob("go.mod"):
-        relative = go_mod.relative_to(ROOT)
-        contents = go_mod.read_text(encoding="utf-8")
-        if not IGNORED_PARTS.intersection(relative.parts) and re.search(
-            r"(?m)^\s*require(?:\s|\()", contents
-        ):
-            errors.append(f"unsupported dependency reconciliation: go ({relative})")
-    for go_sum in ROOT.rglob("go.sum"):
-        relative = go_sum.relative_to(ROOT)
-        if (
-            not IGNORED_PARTS.intersection(relative.parts)
-            and go_sum.read_text(encoding="utf-8").strip()
-        ):
-            errors.append(f"unsupported dependency reconciliation: go ({relative})")
     for cargo_toml in ROOT.rglob("Cargo.toml"):
         relative = cargo_toml.relative_to(ROOT)
         if IGNORED_PARTS.intersection(relative.parts):
@@ -1045,6 +1183,10 @@ def _manifest_dependencies(errors: list[str]) -> dict[str, str]:
         constraint = build_requirements_by_name.get(name)
         if version is None or constraint != f"=={version}":
             errors.append(f"build dependency closure is not exactly pinned: {name}")
+    for name, version in _go_dependencies(errors).items():
+        if name in dependencies and dependencies[name] != version:
+            errors.append(f"cross-ecosystem dependency collision: {name}")
+        dependencies[name] = version
     return dependencies
 
 

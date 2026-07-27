@@ -90,6 +90,148 @@ def _run_verifier(repository: Path) -> subprocess.CompletedProcess[str]:
     )
 
 
+def _add_provenance(repository: Path, *paths: str) -> None:
+    provenance = repository / "docs" / "legal" / "PROVENANCE.csv"
+    with provenance.open("a", encoding="utf-8") as stream:
+        for path in paths:
+            stream.write(
+                f"{path},rogerchucker/palonexus-sdk,WORKTREE,{path},"
+                "PaloNexus,yes,new,MIT,reviewer\n"
+            )
+
+
+def _add_dependency(
+    repository: Path,
+    name: str = "golang.org/x/text",
+    version: str = "v0.40.0",
+) -> None:
+    inventory = repository / "docs" / "legal" / "THIRD_PARTY.md"
+    contents = inventory.read_text(encoding="utf-8")
+    row = (
+        f"| {name} | {version} | BSD-3-Clause | reviewed | "
+        "Retain license and notices | None supplied | Go module |\n"
+    )
+    inventory.write_text(
+        contents.replace(
+            "<!-- dependency-inventory:end -->",
+            row + "<!-- dependency-inventory:end -->",
+        ),
+        encoding="utf-8",
+    )
+
+
+def _write_go_module(
+    repository: Path,
+    *,
+    go_mod: str = (
+        "module example.com/test\n\ngo 1.25.0\n\nrequire golang.org/x/text v0.40.0\n"
+    ),
+    go_sum: str = (
+        "golang.org/x/text v0.40.0 "
+        "h1:Ub2Z6/xjgF1WrYQz2nuITOEegKFtiIy+rieRJ5lHZKs=\n"
+        "golang.org/x/text v0.40.0/go.mod "
+        "h1:hpnzDAfGV753zIKo+wk3u1bVKCGPbrnF7+7LBF/UHVY=\n"
+    ),
+) -> None:
+    (repository / "go.mod").write_text(go_mod, encoding="utf-8")
+    (repository / "go.sum").write_text(go_sum, encoding="utf-8")
+    _add_provenance(repository, "go.mod", "go.sum")
+
+
+def test_verifier_accepts_reviewed_checksum_backed_go_modules(tmp_path: Path) -> None:
+    repository = _legal_fixture(tmp_path)
+    _write_go_module(repository)
+    _add_dependency(repository)
+
+    result = _run_verifier(repository)
+
+    assert result.returncode == 0, result.stdout
+
+
+def test_verifier_reconciles_indirect_go_modules(tmp_path: Path) -> None:
+    repository = _legal_fixture(tmp_path)
+    _write_go_module(
+        repository,
+        go_mod=(
+            "module example.com/test\n\ngo 1.25.0\n\nrequire (\n"
+            "\tgolang.org/x/text v0.40.0\n"
+            "\tgolang.org/x/net v0.57.0 // indirect\n)\n"
+        ),
+        go_sum=(
+            "golang.org/x/text v0.40.0 "
+            "h1:Ub2Z6/xjgF1WrYQz2nuITOEegKFtiIy+rieRJ5lHZKs=\n"
+            "golang.org/x/text v0.40.0/go.mod "
+            "h1:hpnzDAfGV753zIKo+wk3u1bVKCGPbrnF7+7LBF/UHVY=\n"
+            "golang.org/x/net v0.57.0 "
+            "h1:K5+3DljvIuDG9/Jv9rvyMywYNFCQ9RSUY6OOTTkT+tE=\n"
+            "golang.org/x/net v0.57.0/go.mod "
+            "h1:KpXc8iv+r3XplLAG/f7Jsf9RPszJzdR0f58q9vGOuEU=\n"
+        ),
+    )
+    _add_dependency(repository)
+    _add_dependency(repository, "golang.org/x/net", "v0.57.0")
+
+    result = _run_verifier(repository)
+
+    assert result.returncode == 0, result.stdout
+
+
+@pytest.mark.parametrize(
+    ("go_mod", "go_sum", "expected"),
+    [
+        (
+            "module example.com/test\ngo 1.25\nrequire golang.org/x/text latest\n",
+            "",
+            "Go module version is not exactly pinned",
+        ),
+        (
+            "module example.com/test\ngo 1.25\n"
+            "require golang.org/x/text v0.40.0\n"
+            "replace golang.org/x/text => ../text\n",
+            "",
+            "Go module replacements are not allowed",
+        ),
+        (
+            "module example.com/test\ngo 1.25\nrequire corp.internal/private v1.0.0\n",
+            "",
+            "private or non-public Go module path",
+        ),
+        (
+            "module example.com/test\ngo 1.25\nrequire golang.org/x/text v0.40.0\n",
+            "golang.org/x/text v0.40.0 h1:not-a-checksum\n",
+            "missing valid module checksum",
+        ),
+        (
+            "module example.com/test\ngo 1.25\nrequire golang.org/x/text v0.40.0\n",
+            "golang.org/x/text v0.39.0 "
+            "h1:Ub2Z6/xjgF1WrYQz2nuITOEegKFtiIy+rieRJ5lHZKs=\n",
+            "unexpected Go checksum entry",
+        ),
+    ],
+)
+def test_verifier_rejects_unsafe_or_unreconciled_go_modules(
+    tmp_path: Path, go_mod: str, go_sum: str, expected: str
+) -> None:
+    repository = _legal_fixture(tmp_path)
+    _write_go_module(repository, go_mod=go_mod, go_sum=go_sum)
+    _add_dependency(repository)
+
+    result = _run_verifier(repository)
+
+    assert result.returncode == 1
+    assert expected in result.stdout
+
+
+def test_verifier_requires_go_module_inventory_review(tmp_path: Path) -> None:
+    repository = _legal_fixture(tmp_path)
+    _write_go_module(repository)
+
+    result = _run_verifier(repository)
+
+    assert result.returncode == 1
+    assert "dependency missing from inventory: golang.org/x/text" in result.stdout
+
+
 def test_relicensing_record_identifies_the_authorized_extraction() -> None:
     record = (LEGAL / "RELICENSING.md").read_text(encoding="utf-8")
 
@@ -335,11 +477,6 @@ def test_verifier_requires_python_dependencies_in_lock(tmp_path: Path) -> None:
             "plugins/demo/package.json",
             '{"name":"demo","license":"MIT","dependencies":{"left-pad":"1.0.0"}}',
             "unsupported dependency reconciliation: npm",
-        ),
-        (
-            "guard/go.mod",
-            "module example.com/guard\nrequire example.com/dependency v1.0.0\n",
-            "unsupported dependency reconciliation: go",
         ),
         (
             "guard/Cargo.toml",
