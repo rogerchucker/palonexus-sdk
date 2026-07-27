@@ -6,6 +6,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"io"
 	"net"
@@ -21,13 +22,13 @@ import (
 )
 
 type HTTPConfig struct {
-	Endpoint string
-	RootCAs  *x509.CertPool
-	Token    func(context.Context) ([]byte, error)
-	Binding  Binding
-	ClientID string
-	Clock    func() time.Time
-	Timeout  time.Duration
+	Endpoint     string
+	TrustedCAPEM []byte
+	Token        func(context.Context) ([]byte, error)
+	Binding      Binding
+	ClientID     string
+	Clock        func() time.Time
+	Timeout      time.Duration
 }
 
 type HTTPTransport struct {
@@ -82,16 +83,30 @@ func newHTTPTransport(config HTTPConfig, controls networkControls) (*HTTPTranspo
 	transport.ForceAttemptHTTP2 = false
 	transport.TLSNextProto = map[string]func(string, *tls.Conn) http.RoundTripper{}
 	tlsConfig := &tls.Config{MinVersion: tls.VersionTLS12}
-	if config.RootCAs != nil {
-		subjects := config.RootCAs.Subjects()
-		total := 0
-		for _, subject := range subjects {
-			total += len(subject)
-		}
-		if len(subjects) > 128 || total > 1<<20 {
+	if len(config.TrustedCAPEM) > 0 {
+		if len(config.TrustedCAPEM) > 1<<20 {
 			return nil, ErrUnsafeRecord
 		}
-		tlsConfig.RootCAs = config.RootCAs.Clone()
+		pool := x509.NewCertPool()
+		rest := config.TrustedCAPEM
+		count := 0
+		for len(rest) > 0 {
+			block, next := pem.Decode(rest)
+			if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 || len(block.Bytes) == 0 || len(block.Bytes) > 1<<20 {
+				return nil, ErrUnsafeRecord
+			}
+			certificate, parseErr := x509.ParseCertificate(block.Bytes)
+			if parseErr != nil {
+				return nil, ErrUnsafeRecord
+			}
+			pool.AddCert(certificate)
+			count++
+			if count > 128 {
+				return nil, ErrUnsafeRecord
+			}
+			rest = next
+		}
+		tlsConfig.RootCAs = pool
 	}
 	transport.TLSClientConfig = tlsConfig
 	resolver := controls.resolver

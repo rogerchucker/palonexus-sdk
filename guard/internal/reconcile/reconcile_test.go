@@ -4,8 +4,8 @@ package reconcile
 
 import (
 	"context"
-	"crypto/x509"
 	"encoding/json"
+	"encoding/pem"
 	"errors"
 	"net"
 	"net/http"
@@ -212,10 +212,9 @@ func TestHTTPTransportIsStrictBoundedAndRedactsAuthorization(t *testing.T) {
 			`ef28a07d036d06a118e72c15fe30347821a29f4e845769fee1f8e18c3ef11238","acknowledgedAt":"2026-07-25T20:00:05Z"}`))
 	}))
 	defer server.Close()
-	roots := x509.NewCertPool()
-	roots.AddCert(server.Certificate())
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: server.Certificate().Raw})
 	ownedToken := []byte("super-secret-bearer")
-	transport, err := newHTTPTransportWithNetwork(HTTPConfig{Endpoint: server.URL, RootCAs: roots, Token: func(context.Context) ([]byte, error) {
+	transport, err := newHTTPTransportWithNetwork(HTTPConfig{Endpoint: server.URL, TrustedCAPEM: caPEM, Token: func(context.Context) ([]byte, error) {
 		return ownedToken, nil
 	}, Binding: b1, ClientID: "registered-codex"}, networkControls{
 		resolver: fixedResolver{{IP: net.ParseIP("93.184.216.34")}},
