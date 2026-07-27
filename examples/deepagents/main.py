@@ -1,19 +1,18 @@
 # SPDX-License-Identifier: MIT
-"""Deterministic offline Deep Agents middleware example."""
+"""Deterministic offline Deep Agents delegation example."""
 
 from __future__ import annotations
 
 from typing import Any
 
-from langchain.tools.tool_node import ToolCallRequest
-from langchain_core.messages import ToolMessage
-from langchain_core.runnables import RunnableConfig
+from langchain_core.language_models.fake_chat_models import FakeMessagesListChatModel
+from langchain_core.messages import AIMessage
 from langchain_core.tools import tool
-from langgraph.prebuilt.tool_node import ToolRuntime
 from palonexus import AuthorizationClient, PolicyDenied, TaskContext
 from palonexus.integrations.deepagents import (
     DeepAgentsAuthorizationContext,
     PaloNexusDeepAgentsMiddleware,
+    create_authorized_deep_agent,
 )
 from palonexus.integrations.langchain import (
     LangChainActionPolicy,
@@ -24,53 +23,79 @@ from palonexus.integrations.langchain import (
 from palonexus.testing import FakeTransport, ScriptedEngine
 
 ACTOR = "agent:offline-coordinator"
-AGENTS = {
+ACTORS = {
     "coordinator": ACTOR,
     "inventory-worker": ACTOR,
+    "general-purpose": ACTOR,
 }
 
 
-@tool
-def inventory_write(item_id: str) -> str:
-    """Update one synthetic inventory item."""
+class ToolCapableFakeModel(FakeMessagesListChatModel):
+    """Offline scripted model that accepts the host's public tool binding."""
 
-    return f"updated:{item_id}"
+    def bind_tools(
+        self,
+        tools: Any,
+        *,
+        tool_choice: str | None = None,
+        **kwargs: Any,
+    ) -> Any:
+        del tools, tool_choice, kwargs
+        return self
 
 
-def request(agent_name: str, context: DeepAgentsAuthorizationContext) -> Any:
-    runtime = ToolRuntime(
-        state={},
-        context=context,
-        config=RunnableConfig(metadata={"lc_agent_name": agent_name}),
-        stream_writer=lambda _: None,
-        tool_call_id=f"call-{agent_name}",
-        store=None,
-        tools=[inventory_write],
+def build(outcome: object) -> tuple[object, list[str], DeepAgentsAuthorizationContext]:
+    model = ToolCapableFakeModel(
+        responses=[
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "task",
+                        "args": {
+                            "description": "update synthetic inventory",
+                            "subagent_type": "inventory-worker",
+                        },
+                        "id": "call-task",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(
+                content="",
+                tool_calls=[
+                    {
+                        "name": "inventory_write",
+                        "args": {"item_id": "42"},
+                        "id": "call-write",
+                        "type": "tool_call",
+                    }
+                ],
+            ),
+            AIMessage(content="child complete"),
+            AIMessage(content="parent complete"),
+        ],
+        name="offline-deep-agent-model",
     )
-    return ToolCallRequest(
-        tool_call={
-            "name": "inventory_write",
-            "args": {"item_id": "42"},
-            "id": f"call-{agent_name}",
-            "type": "tool_call",
-        },
-        tool=inventory_write,
-        state={},
-        runtime=runtime,
-    )
-
-
-def main() -> None:
     engine = ScriptedEngine(
         ScriptedEngine.allow(),
-        ScriptedEngine.deny(),
-        ScriptedEngine.approval_required(),
+        ScriptedEngine.allow(),
+        outcome,
+        ScriptedEngine.allow(),
+        ScriptedEngine.allow(),
         testing_only=True,
     )
+    executions: list[str] = []
+
+    @tool("inventory_write")
+    def inventory_write(item_id: str) -> str:
+        """Update one synthetic inventory item."""
+
+        executions.append(item_id)
+        return f"updated:{item_id}"
+
     delegate = PaloNexusLangChainMiddleware(
-        client=AuthorizationClient(
-            FakeTransport(engine, testing_only=True),
-        ),
+        client=AuthorizationClient(FakeTransport(engine, testing_only=True)),
         async_client=None,
         tool_policies={
             "inventory_write": LangChainActionPolicy(
@@ -78,12 +103,32 @@ def main() -> None:
                 side_effect="write",
             )
         },
-        model_policies={},
+        model_policies={
+            "offline-deep-agent-model": LangChainActionPolicy(
+                service="model-runtime",
+                side_effect="external",
+            )
+        },
+        model_bindings={"offline-deep-agent-model": model},
         tool_bindings={"inventory_write": inventory_write},
     )
-    middleware = PaloNexusDeepAgentsMiddleware(
+    authorization = PaloNexusDeepAgentsMiddleware(
         authorization=delegate,
-        accountable_actors=AGENTS,
+        accountable_actors=ACTORS,
+    )
+    graph = create_authorized_deep_agent(
+        model=model,
+        tools=[inventory_write],
+        authorization=authorization,
+        name="coordinator",
+        subagents=[
+            {
+                "name": "inventory-worker",
+                "description": "Updates synthetic inventory.",
+                "system_prompt": "Call inventory_write exactly once.",
+                "tools": [inventory_write],
+            }
+        ],
     )
     context = DeepAgentsAuthorizationContext(
         authorization=LangChainAuthorizationContext(
@@ -92,45 +137,39 @@ def main() -> None:
                 session_id="session_01J5ABCDEFGHJKMNPQRSTVWXY2",
             ),
             correlation_id="corr_01J5ABCDEFGHJKMNPQRSTVWXY8",
-            model_policy_key="offline-model",
+            model_policy_key="offline-deep-agent-model",
             actor_ref=ACTOR,
         ),
-        accountable_actors=AGENTS,
+        accountable_actors=ACTORS,
     )
-    parent_calls = 0
-    child_calls = 0
+    return graph, executions, context
 
-    def denied_child(value: ToolCallRequest) -> ToolMessage:
-        del value
-        nonlocal child_calls
-        child_calls += 1
-        raise AssertionError("denied child executed")
 
-    def parent(value: ToolCallRequest) -> ToolMessage:
-        nonlocal parent_calls
-        parent_calls += 1
-        try:
-            middleware.wrap_tool_call(
-                request("inventory-worker", context),
-                denied_child,
-            )
-        except PolicyDenied:
-            print("NESTED_DENIED")
-        return ToolMessage(content="parent-ok", tool_call_id=value.tool_call["id"])
+def invoke(graph: Any, context: DeepAgentsAuthorizationContext) -> object:
+    return graph.invoke(
+        {"messages": [{"role": "user", "content": "delegate"}]},
+        context=context,
+    )
 
-    middleware.wrap_tool_call(request("coordinator", context), parent)
-    assert parent_calls == 1 and child_calls == 0
-    print("CORRELATED")
 
+def main() -> None:
+    allowed, executions, context = build(ScriptedEngine.allow())
+    invoke(allowed, context)
+    assert executions == ["42"]
+    print("DECLARATIVE_SUBAGENT_GOVERNED")
+
+    denied, executions, context = build(ScriptedEngine.deny())
     try:
-        middleware.wrap_tool_call(
-            request("coordinator", context),
-            lambda value: ToolMessage(
-                content="must-not-run",
-                tool_call_id=value.tool_call["id"],
-            ),
-        )
+        invoke(denied, context)
+    except PolicyDenied:
+        assert executions == []
+        print("NESTED_DENIED")
+
+    pending, executions, context = build(ScriptedEngine.approval_required())
+    try:
+        invoke(pending, context)
     except LangChainApprovalRequired:
+        assert executions == []
         print("APPROVAL_PROPAGATED")
 
 

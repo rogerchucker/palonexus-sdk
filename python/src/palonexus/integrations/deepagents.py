@@ -17,18 +17,8 @@ from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from types import MappingProxyType
 from typing import Any, Never, cast
 
-from langchain.agents.middleware import AgentMiddleware
-from langchain.tools.tool_node import ToolCallRequest
-from langchain_core.messages import ToolMessage
-from langchain_core.tools import BaseTool
-from langgraph.types import Command
-
-from ..errors import AuthorizationUnavailable, InvalidRequest, PaloNexusError
+from ..errors import AuthorizationUnavailable, PaloNexusError
 from . import MissingIntegrationDependency
-from .langchain import (
-    LangChainAuthorizationContext,
-    PaloNexusLangChainMiddleware,
-)
 
 _CONTROL_FLOW_ERRORS = (
     KeyboardInterrupt,
@@ -36,6 +26,19 @@ _CONTROL_FLOW_ERRORS = (
     GeneratorExit,
     concurrent.futures.CancelledError,
     asyncio.CancelledError,
+)
+_HOST_BUILTINS = frozenset(
+    {
+        "edit_file",
+        "execute",
+        "glob",
+        "grep",
+        "ls",
+        "read_file",
+        "task",
+        "write_file",
+        "write_todos",
+    }
 )
 
 
@@ -48,8 +51,28 @@ class MissingDeepAgentsDependency(MissingIntegrationDependency):
     )
 
 
+try:
+    from langchain.agents.middleware import (
+        AgentMiddleware,
+        ModelRequest,
+        ModelResponse,
+    )
+    from langchain.tools.tool_node import ToolCallRequest
+    from langchain_core.messages import AIMessage, ToolMessage
+    from langchain_core.tools import BaseTool
+    from langgraph.types import Command
+
+    from .langchain import (
+        LangChainAuthorizationContext,
+        LangChainInvalidRequest,
+        PaloNexusLangChainMiddleware,
+    )
+except ImportError:
+    raise MissingDeepAgentsDependency() from None
+
+
 def _invalid() -> Never:
-    raise InvalidRequest() from None
+    raise LangChainInvalidRequest() from None
 
 
 def _checked_actor_map(value: object) -> Mapping[str, str]:
@@ -74,6 +97,49 @@ def _checked_actor_map(value: object) -> Mapping[str, str]:
     if not checked:
         _invalid()
     return MappingProxyType(checked)
+
+
+def _checked_user_middleware(value: object) -> tuple[AgentMiddleware[Any, Any], ...]:
+    if not isinstance(value, Sequence):
+        _invalid()
+    checked: list[AgentMiddleware[Any, Any]] = []
+    try:
+        for item in value:
+            if not isinstance(item, AgentMiddleware) or isinstance(
+                item,
+                (PaloNexusDeepAgentsMiddleware, PaloNexusLangChainMiddleware),
+            ):
+                raise TypeError
+            injected = item.tools
+            if any(
+                not isinstance(tool, BaseTool) or tool.name in _HOST_BUILTINS
+                for tool in injected
+            ):
+                raise TypeError
+            checked.append(item)
+    except Exception:
+        _invalid()
+    return tuple(checked)
+
+
+def _checked_user_tools(value: object) -> tuple[BaseTool, ...]:
+    if not isinstance(value, Sequence):
+        _invalid()
+    checked: list[BaseTool] = []
+    names: set[str] = set()
+    try:
+        for tool in value:
+            if (
+                not isinstance(tool, BaseTool)
+                or tool.name in _HOST_BUILTINS
+                or tool.name in names
+            ):
+                raise TypeError
+            names.add(tool.name)
+            checked.append(tool)
+    except Exception:
+        _invalid()
+    return tuple(checked)
 
 
 class DeepAgentsAuthorizationContext(Mapping[str, object]):
@@ -144,10 +210,12 @@ def _runtime_context(request: object) -> DeepAgentsAuthorizationContext:
     return context
 
 
-def _agent_name(request: object) -> str:
+def _agent_name(request: object) -> str | None:
     try:
         runtime = getattr(request, "runtime")
-        config = getattr(runtime, "config")
+        config = getattr(runtime, "config", None)
+        if config is None:
+            return None
         if not isinstance(config, Mapping):
             raise TypeError
         metadata = config.get("metadata")
@@ -165,27 +233,102 @@ def _agent_name(request: object) -> str:
 class PaloNexusDeepAgentsMiddleware(AgentMiddleware[Any, Any]):
     """Validate Deep Agents provenance, then reuse Task 10 authorization."""
 
-    __slots__ = ("_accountable_actors", "_authorization")
+    __slots__ = (
+        "_accountable_actors",
+        "_authorization",
+        "_bound_agent_name",
+        "_governed_subagents",
+        "_orchestration_builtins",
+    )
 
     def __init__(
         self,
         *,
         authorization: PaloNexusLangChainMiddleware,
         accountable_actors: Mapping[str, str],
+        _bound_agent_name: str | None = None,
+        _governed_subagents: frozenset[str] = frozenset(),
+        _orchestration_builtins: bool = False,
     ) -> None:
         if type(authorization) is not PaloNexusLangChainMiddleware:
             _invalid()
         self._authorization = authorization
         self._accountable_actors = _checked_actor_map(accountable_actors)
+        self._bound_agent_name = _bound_agent_name
+        self._governed_subagents = _governed_subagents
+        self._orchestration_builtins = _orchestration_builtins
+
+    @property
+    def accountable_actors(self) -> Mapping[str, str]:
+        """The immutable bindings required in runtime context."""
+
+        return self._accountable_actors
+
+    def _for_factory(
+        self,
+        governed_subagents: frozenset[str],
+        bound_agent_name: str,
+    ) -> PaloNexusDeepAgentsMiddleware:
+        if not governed_subagents or bound_agent_name not in self._accountable_actors:
+            _invalid()
+        return PaloNexusDeepAgentsMiddleware(
+            authorization=self._authorization,
+            accountable_actors=self._accountable_actors,
+            _bound_agent_name=bound_agent_name,
+            _governed_subagents=governed_subagents,
+            _orchestration_builtins=True,
+        )
 
     def _validate(self, request: object) -> None:
         context = _runtime_context(request)
-        agent_name = _agent_name(request)
+        observed = _agent_name(request)
+        agent_name = self._bound_agent_name
+        if agent_name is None:
+            if observed is None:
+                _invalid()
+            agent_name = observed
+        elif observed is not None and observed != agent_name:
+            _invalid()
         if context.accountable_actors != self._accountable_actors:
             _invalid()
         expected_actor = self._accountable_actors.get(agent_name)
         if expected_actor is None or context.authorization.actor_ref != expected_actor:
             _invalid()
+
+    def _orchestration_tool(self, request: ToolCallRequest) -> bool:
+        if not self._orchestration_builtins:
+            return False
+        try:
+            name = request.tool_call["name"]
+            arguments = request.tool_call["args"]
+            if (
+                type(name) is not str
+                or not isinstance(arguments, Mapping)
+                or request.tool is None
+                or request.tool.name != name
+            ):
+                raise TypeError
+            if name == "write_todos":
+                return frozenset(arguments) == {"todos"} and isinstance(
+                    arguments["todos"], list
+                )
+            if name != "task":
+                return False
+            if frozenset(arguments) != {"description", "subagent_type"}:
+                raise TypeError
+            description = arguments["description"]
+            subagent_type = arguments["subagent_type"]
+            if (
+                type(description) is not str
+                or not description
+                or type(subagent_type) is not str
+                or subagent_type not in self._governed_subagents
+            ):
+                raise TypeError
+            return True
+        except Exception:
+            _invalid()
+        raise AssertionError("unreachable")
 
     def wrap_tool_call(
         self,
@@ -193,6 +336,8 @@ class PaloNexusDeepAgentsMiddleware(AgentMiddleware[Any, Any]):
         handler: Callable[[ToolCallRequest], ToolMessage | Command[Any]],
     ) -> ToolMessage | Command[Any]:
         self._validate(request)
+        if self._orchestration_tool(request):
+            return handler(request)
         return self._authorization.wrap_tool_call(request, handler)
 
     async def awrap_tool_call(
@@ -204,7 +349,25 @@ class PaloNexusDeepAgentsMiddleware(AgentMiddleware[Any, Any]):
         ],
     ) -> ToolMessage | Command[Any]:
         self._validate(request)
+        if self._orchestration_tool(request):
+            return await handler(request)
         return await self._authorization.awrap_tool_call(request, handler)
+
+    def wrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: Callable[[ModelRequest[Any]], ModelResponse[Any]],
+    ) -> ModelResponse[Any] | AIMessage:
+        self._validate(request)
+        return self._authorization.wrap_model_call(request, handler)
+
+    async def awrap_model_call(
+        self,
+        request: ModelRequest[Any],
+        handler: Callable[[ModelRequest[Any]], Awaitable[ModelResponse[Any]]],
+    ) -> ModelResponse[Any] | AIMessage:
+        self._validate(request)
+        return await self._authorization.awrap_model_call(request, handler)
 
 
 def _factory_supports_public_hooks(factory: Callable[..., object]) -> bool:
@@ -212,7 +375,14 @@ def _factory_supports_public_hooks(factory: Callable[..., object]) -> bool:
         parameters = inspect.signature(factory).parameters
     except (TypeError, ValueError):
         return False
-    return {"model", "tools", "middleware", "context_schema"} <= set(parameters)
+    return {
+        "model",
+        "tools",
+        "middleware",
+        "context_schema",
+        "name",
+        "subagents",
+    } <= set(parameters)
 
 
 def _installed_factory() -> Callable[..., object]:
@@ -230,6 +400,8 @@ def create_authorized_deep_agent(
     model: object,
     tools: Sequence[BaseTool],
     authorization: PaloNexusDeepAgentsMiddleware,
+    name: str,
+    subagents: Sequence[Mapping[str, object]] = (),
     middleware: Sequence[AgentMiddleware[Any, Any]] = (),
     deep_agent_factory: Callable[..., object] | None = None,
     **kwargs: object,
@@ -238,29 +410,99 @@ def create_authorized_deep_agent(
 
     if (
         type(authorization) is not PaloNexusDeepAgentsMiddleware
-        or not isinstance(tools, Sequence)
-        or any(not isinstance(tool, BaseTool) for tool in tools)
-        or not isinstance(middleware, Sequence)
-        or any(not isinstance(item, AgentMiddleware) for item in middleware)
-        or any(
-            isinstance(
-                item,
-                (PaloNexusDeepAgentsMiddleware, PaloNexusLangChainMiddleware),
-            )
-            for item in middleware
-        )
-        or {"model", "tools", "middleware", "context_schema"} & set(kwargs)
+        or type(name) is not str
+        or not name
+        or len(name.encode("utf-8")) > 128
+        or not isinstance(subagents, Sequence)
+        or {"model", "tools", "middleware", "context_schema", "name", "subagents"}
+        & set(kwargs)
     ):
         _invalid()
+    checked_tools = _checked_user_tools(tools)
+    checked_middleware = _checked_user_middleware(middleware)
+    allowed_keys = frozenset(
+        {
+            "name",
+            "description",
+            "system_prompt",
+            "tools",
+            "middleware",
+            "interrupt_on",
+            "skills",
+            "permissions",
+            "response_format",
+        }
+    )
+    prepared: list[dict[str, object]] = []
+    names: set[str] = set()
+    for raw in subagents:
+        if not isinstance(raw, Mapping) or not frozenset(raw) <= allowed_keys:
+            _invalid()
+        try:
+            agent_name = raw["name"]
+            description = raw["description"]
+            system_prompt = raw["system_prompt"]
+        except Exception:
+            _invalid()
+        if (
+            type(agent_name) is not str
+            or not agent_name
+            or len(agent_name.encode("utf-8")) > 128
+            or agent_name in names
+            or agent_name == name
+            or type(description) is not str
+            or not description
+            or type(system_prompt) is not str
+            or not system_prompt
+        ):
+            _invalid()
+        selected_tools = _checked_user_tools(raw.get("tools", checked_tools))
+        selected_middleware = raw.get("middleware", ())
+        checked_subagent_middleware = _checked_user_middleware(selected_middleware)
+        names.add(agent_name)
+        copied = dict(raw)
+        copied["tools"] = selected_tools
+        copied["middleware"] = checked_subagent_middleware
+        prepared.append(copied)
+    if "general-purpose" not in names:
+        names.add("general-purpose")
+        prepared.append(
+            {
+                "name": "general-purpose",
+                "description": "Governed general-purpose delegated work.",
+                "system_prompt": (
+                    "Complete only the delegated task using governed tools."
+                ),
+                "tools": checked_tools,
+            }
+        )
+    expected_actors = {name, *names}
+    if set(authorization.accountable_actors) != expected_actors:
+        _invalid()
+    governed_names = frozenset(names)
+    governed = authorization._for_factory(governed_names, name)
+    for spec in prepared:
+        existing = spec.get("middleware", ())
+        if not isinstance(existing, Sequence):
+            _invalid()
+        subagent_name = spec["name"]
+        if type(subagent_name) is not str:
+            _invalid()
+        spec["middleware"] = [
+            *existing,
+            authorization._for_factory(governed_names, subagent_name),
+        ]
     factory = _installed_factory() if deep_agent_factory is None else deep_agent_factory
     if not callable(factory) or not _factory_supports_public_hooks(factory):
         raise MissingDeepAgentsDependency() from None
     try:
         return factory(
             model=model,
-            tools=tuple(tools),
-            middleware=(*middleware, authorization),
+            tools=checked_tools,
+            middleware=(*checked_middleware, governed),
             context_schema=DeepAgentsAuthorizationContext,
+            name=name,
+            subagents=tuple(prepared),
             **kwargs,
         )
     except BaseException as error:
