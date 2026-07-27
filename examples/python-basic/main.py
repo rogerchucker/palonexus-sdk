@@ -8,6 +8,7 @@ from typing import Any
 from palonexus import (
     ActionRequestBuilder,
     AuthorizationClient,
+    InvalidRequest,
     PolicyDenied,
     TaskContext,
 )
@@ -89,6 +90,11 @@ def main() -> None:
         resolution_idempotency_key="approval_01J5ABCDEFGHJKMNPQRSTVWXY4",
     )
     approved = client.get_approval(pending.approval_id, expected=pending)
+    assert approved.authorization_decision_id == prior.decision_id
+    assert approved.action_id == str(original.request.action_id)
+    assert approved.correlation_id == prior.correlation_id
+    assert approved.authoritative_scope_hash == prior.authoritative_scope_hash
+    assert approved.creation_audit_ref == prior.audit_ref
     print("APPROVAL_APPROVED")
 
     current = prepare(
@@ -96,15 +102,44 @@ def main() -> None:
         action_id="act_01J5ABCDEFGHJKMNPQRSTVWXY3",
     )
     resumed = client.resume(builder, original, current, prior, approved)
+    calls = engine.recorded_calls
+    assert tuple(call.operation for call in calls) == (
+        "decide",
+        "decide",
+        "request_approval",
+        "get_approval",
+        "decide",
+    )
+    original_request = calls[1].request
+    resume_request = calls[4].request
+    assert resume_request["causationId"] == prior.decision_id
+    assert resume_request["resumeFromApprovalId"] == approved.approval_id
+    for field in (
+        "actionId",
+        "correlationId",
+        "action",
+        "target",
+        "task",
+        "sideEffect",
+    ):
+        assert resume_request[field] == original_request[field]
+    assert resume_request["requestId"] != original_request["requestId"]
+    assert resume_request["idempotencyKey"] != original_request["idempotencyKey"]
+    assert calls[4].client_scope_hash == calls[1].client_scope_hash
     print("RESUMED_ALLOW")
 
     executable_path = resumed.consume()
     executions.append(str(executable_path))
     assert executions == ["/example/inventory/items/42.json"]
     print("EXECUTED_ONCE")
+    try:
+        resumed.consume()
+    except InvalidRequest:
+        print("REPLAY_BLOCKED")
+    else:
+        raise RuntimeError("prepared action execution replayed")
 
     assert prior.correlation_id == approved.correlation_id == CORRELATION_ID
-    assert approved.creation_audit_ref == prior.audit_ref
     assert approved.resolution_audit_ref is not None
     print("AUDIT_CORRELATED")
 

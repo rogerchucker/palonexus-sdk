@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import ast
 import os
 import subprocess
 import sys
@@ -21,6 +22,7 @@ MARKERS = (
     "APPROVAL_APPROVED",
     "RESUMED_ALLOW",
     "EXECUTED_ONCE",
+    "REPLAY_BLOCKED",
     "AUDIT_CORRELATED",
 )
 
@@ -33,17 +35,29 @@ def test_core_example_runs_full_governed_lifecycle_offline(
     blocker = tmp_path / "sitecustomize.py"
     blocker.write_text(
         "import socket\n"
+        "import sys\n"
         "def blocked(*args, **kwargs):\n"
         "    raise AssertionError('network access is forbidden')\n"
+        "def audit(event, args):\n"
+        "    if event in {'socket.connect', 'socket.getaddrinfo', 'socket.sendto'}:\n"
+        "        blocked()\n"
+        "sys.addaudithook(audit)\n"
         "socket.create_connection = blocked\n"
-        "socket.socket.connect = blocked\n",
+        "socket.getaddrinfo = blocked\n"
+        "socket.gethostbyname = blocked\n"
+        "socket.gethostbyname_ex = blocked\n"
+        "socket.socket.connect = blocked\n"
+        "socket.socket.connect_ex = blocked\n"
+        "socket.socket.sendto = blocked\n",
         encoding="utf-8",
     )
-    environment = os.environ.copy()
-    existing = environment.get("PYTHONPATH")
-    environment["PYTHONPATH"] = (
-        str(tmp_path) if not existing else os.pathsep.join((str(tmp_path), existing))
-    )
+    environment = {
+        "HOME": str(tmp_path),
+        "LANG": "C.UTF-8",
+        "PATH": os.environ.get("PATH", ""),
+        "PYTHONHASHSEED": "0",
+        "PYTHONPATH": str(tmp_path),
+    }
 
     result = subprocess.run(
         [sys.executable, str(example)],
@@ -65,12 +79,24 @@ def test_core_example_uses_public_sdk_and_synthetic_inventory_only(
     example: Path,
 ) -> None:
     source = example.read_text(encoding="utf-8")
+    tree = ast.parse(source, filename=str(example))
+    imported_modules = {
+        node.module
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module is not None
+    } | {
+        alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.Import)
+        for alias in node.names
+    }
 
     assert "inventory" in source
-    assert "palonexus._" not in source
-    assert "python.tests" not in source
-    assert "tests." not in source
+    assert imported_modules <= (
+        sys.stdlib_module_names | {"__future__", "palonexus", "palonexus.testing"}
+    )
+    assert {
+        module for module in imported_modules if module.startswith("palonexus")
+    } <= {"palonexus", "palonexus.testing"}
     assert "http://" not in source
     assert "https://" not in source
-    assert "socket" not in source
-    assert "subprocess" not in source
