@@ -37,6 +37,7 @@ classifiers = [
   "Programming Language :: Python :: 3.13",
 ]
 dependencies = [
+  "httpx>=0.28.1,<0.29",
   "idna==3.18",
   "pydantic>=2.13.4,<3",
   "unicodedata2==15.1.0",

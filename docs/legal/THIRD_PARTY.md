@@ -59,11 +59,16 @@ locked distribution without contacting the network.
 | Dependency | Version | License | Review status | Obligations | Notice | Source |
 | --- | --- | --- | --- | --- | --- | --- |
 | annotated-types | 0.8.0 | MIT | reviewed | Retain notices | None identified | PyPI |
+| anyio | 4.14.2 | MIT | reviewed | Retain notices | None identified | PyPI |
 | ast-serialize | 0.6.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | attrs | 26.1.0 | MIT | reviewed | Retain notices | None identified | PyPI |
+| certifi | 2026.7.22 | MPL-2.0 | reviewed | Retain notices; disclose modifications to covered files | None identified | PyPI |
 | colorama | 0.4.6 | BSD-3-Clause | reviewed | Retain notices | None identified | PyPI |
 | hatch-vcs | 0.5.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | hatchling | 1.31.0 | MIT | reviewed | Retain notices | None identified | PyPI |
+| h11 | 0.16.0 | MIT | reviewed | Retain notices | None identified | PyPI |
+| httpcore | 1.0.9 | BSD-3-Clause | reviewed | Retain notices | None identified | PyPI |
+| httpx | 0.28.1 | BSD-3-Clause | reviewed | Retain notices | None identified | PyPI |
 | idna | 3.18 | BSD-3-Clause | reviewed | Retain license and notices | None supplied | PyPI |
 | iniconfig | 2.3.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | jsonschema | 4.26.0 | MIT | reviewed | Retain notices | None identified | PyPI |
