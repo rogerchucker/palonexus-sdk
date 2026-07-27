@@ -68,6 +68,9 @@ func (s *Store) Put(ctx context.Context, key Key, secret []byte) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
+	if err := s.backend.Delete(ctx, s.service, legacyAccountName(key)); err != nil {
+		return sanitizeBackendError(err)
+	}
 	copyOfSecret := append([]byte(nil), secret...)
 	defer Zero(copyOfSecret)
 	if err := s.backend.Put(ctx, s.service, accountName(key), copyOfSecret); err != nil {
@@ -84,10 +87,12 @@ func (s *Store) Get(ctx context.Context, key Key) ([]byte, error) {
 		return nil, err
 	}
 	temporary, err := s.backend.Get(ctx, s.service, accountName(key))
+	purgeErr := s.backend.Delete(ctx, s.service, legacyAccountName(key))
+	if purgeErr != nil {
+		Zero(temporary)
+		return nil, sanitizeBackendError(purgeErr)
+	}
 	if err != nil {
-		if errors.Is(err, ErrNotFound) {
-			_ = s.backend.Delete(ctx, s.service, legacyAccountName(key))
-		}
 		return nil, sanitizeBackendError(err)
 	}
 	defer Zero(temporary)
@@ -109,13 +114,12 @@ func (s *Store) Delete(ctx context.Context, key Key) error {
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := s.backend.Delete(ctx, s.service, accountName(key)); err != nil {
-		return sanitizeBackendError(err)
+	currentErr := s.backend.Delete(ctx, s.service, accountName(key))
+	legacyErr := s.backend.Delete(ctx, s.service, legacyAccountName(key))
+	if legacyErr != nil {
+		return sanitizeBackendError(legacyErr)
 	}
-	if err := s.backend.Delete(ctx, s.service, legacyAccountName(key)); err != nil {
-		return sanitizeBackendError(err)
-	}
-	return nil
+	return sanitizeBackendError(currentErr)
 }
 
 func legacyAccountName(key Key) string { return key.Tenant + ":" + key.Account }
