@@ -270,11 +270,13 @@ def test_gitleaks_extends_reviewed_defaults_without_broad_allowlist() -> None:
 def test_gitleaks_false_positives_are_ignored_only_by_exact_fingerprint() -> None:
     ignore = ROOT / ".gitleaksignore"
     fingerprints = ignore.read_text(encoding="utf-8").splitlines()
-    assert len(fingerprints) == 6
+    # Pinned so that adding an ignore entry requires reviewing this test.
+    assert len(fingerprints) == 33
     assert len(set(fingerprints)) == len(fingerprints)
     assert all(
         re.fullmatch(
-            r"[0-9a-f]{40}:[A-Za-z0-9_./-]+:generic-api-key:[0-9]+",
+            r"[0-9a-f]{40}:[A-Za-z0-9_./-]+"
+            r":(?:generic-api-key|curl-auth-header|jwt):[0-9]+",
             fingerprint,
         )
         for fingerprint in fingerprints
