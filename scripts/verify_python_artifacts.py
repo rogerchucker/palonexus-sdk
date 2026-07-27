@@ -20,6 +20,7 @@ from pathlib import Path, PurePosixPath
 
 from packaging.utils import parse_sdist_filename, parse_wheel_filename
 from packaging.version import InvalidVersion, Version
+from setuptools_scm import get_version
 
 ROOT = Path(__file__).resolve().parents[1]
 FORBIDDEN_PATH_PARTS = frozenset(
@@ -176,6 +177,17 @@ def _expected_version(raw: str) -> Version:
     return version
 
 
+def _derive_scm_version(root: Path = ROOT) -> str:
+    try:
+        raw = get_version(
+            root=str(root),
+            search_parent_directories=True,
+        )
+    except Exception as error:
+        raise RuntimeError("current SCM version is unavailable") from error
+    return str(_expected_version(raw))
+
+
 def _require_version(actual: Version, expected: Version, *, source: str) -> None:
     if actual != expected:
         raise RuntimeError(
@@ -184,6 +196,9 @@ def _require_version(actual: Version, expected: Version, *, source: str) -> None
 
 
 def _verify_wheel(path: Path, expected_version: Version | None = None) -> None:
+    if expected_version is not None:
+        _, filename_version, _, _ = parse_wheel_filename(path.name)
+        _require_version(filename_version, expected_version, source=path.name)
     with zipfile.ZipFile(path) as archive:
         members = archive.infolist()
         names = [member.filename for member in members]
@@ -203,19 +218,28 @@ def _verify_wheel(path: Path, expected_version: Version | None = None) -> None:
                 raise RuntimeError(f"non-regular wheel member: {member.filename}")
         if "palonexus/py.typed" not in names:
             raise RuntimeError("wheel does not contain palonexus/py.typed")
+        expected_metadata_prefix = (
+            None
+            if expected_version is None
+            else f"palonexus-{str(expected_version).replace('-', '_')}.dist-info/"
+        )
         for name in names:
-            if not (
-                name.startswith("palonexus/")
-                or (name.startswith("palonexus-") and ".dist-info/" in name)
-            ):
+            package_member = name.startswith("palonexus/") and ".dist-info" not in name
+            metadata_member = expected_metadata_prefix is not None and name.startswith(
+                expected_metadata_prefix
+            )
+            unbound_metadata_member = (
+                expected_metadata_prefix is None
+                and name.startswith("palonexus-")
+                and ".dist-info/" in name
+            )
+            if not (package_member or metadata_member or unbound_metadata_member):
                 raise RuntimeError(f"wheel crossed distribution boundary: {name}")
             if not _safe_member(name, sdist=False):
                 raise RuntimeError(f"wheel crossed package boundary: {name}")
             if not name.endswith("/"):
                 _verify_payload(name, archive.read(name))
         if expected_version is not None:
-            _, filename_version, _, _ = parse_wheel_filename(path.name)
-            _require_version(filename_version, expected_version, source=path.name)
             metadata_names = [
                 name for name in names if name.endswith(".dist-info/METADATA")
             ]
@@ -243,6 +267,9 @@ def _verify_wheel(path: Path, expected_version: Version | None = None) -> None:
 
 
 def _verify_sdist(path: Path, expected_version: Version | None = None) -> None:
+    if expected_version is not None:
+        _, filename_version = parse_sdist_filename(path.name)
+        _require_version(filename_version, expected_version, source=path.name)
     with tarfile.open(path, "r:gz") as archive:
         members = archive.getmembers()
         normalized_names: set[str] = set()
@@ -256,6 +283,30 @@ def _verify_sdist(path: Path, expected_version: Version | None = None) -> None:
         roots = {PurePosixPath(name).parts[0] for name in normalized_names}
         if len(roots) != 1:
             raise RuntimeError("sdist must have exactly one top-level directory")
+        if expected_version is not None:
+            expected_root = f"palonexus-{expected_version}"
+            if roots != {expected_root}:
+                raise RuntimeError(
+                    f"sdist root mismatch: expected {expected_root}, got {roots}"
+                )
+            allowed_root_files = {
+                ".gitignore",
+                "LICENSE",
+                "PKG-INFO",
+                "pyproject.toml",
+            }
+            for name in normalized_names:
+                relative = PurePosixPath(name).relative_to(expected_root)
+                if not relative.parts:
+                    continue
+                package_directory = relative.as_posix() in {"src", "src/palonexus"}
+                root_file = (
+                    len(relative.parts) == 1 and relative.parts[0] in allowed_root_files
+                )
+                package_member = relative.parts[:2] == ("src", "palonexus")
+                if package_directory or root_file or package_member:
+                    continue
+                raise RuntimeError(f"sdist crossed distribution boundary: {name}")
         marker_found = False
         for member in members:
             if not _safe_member(member.name, sdist=True):
@@ -271,8 +322,6 @@ def _verify_sdist(path: Path, expected_version: Version | None = None) -> None:
         if not marker_found:
             raise RuntimeError("sdist does not contain src/palonexus/py.typed")
         if expected_version is not None:
-            _, filename_version = parse_sdist_filename(path.name)
-            _require_version(filename_version, expected_version, source=path.name)
             metadata_members = [
                 member
                 for member in members
@@ -386,7 +435,7 @@ def verify(*, expected_version: str, keep_build: Path | None = None) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--expected-version", required=True)
+    parser.add_argument("--expected-version")
     parser.add_argument(
         "--keep-build",
         type=Path,
@@ -394,8 +443,13 @@ def main() -> int:
     )
     arguments = parser.parse_args()
     try:
+        expected_version = (
+            arguments.expected_version
+            if arguments.expected_version is not None
+            else _derive_scm_version()
+        )
         verify(
-            expected_version=arguments.expected_version,
+            expected_version=expected_version,
             keep_build=arguments.keep_build,
         )
     except RuntimeError as error:

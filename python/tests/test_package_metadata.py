@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import importlib.metadata
 import io
 import shutil
 import stat
@@ -125,7 +126,8 @@ def test_clean_room_artifact_verifier_and_python_ci_are_present() -> None:
     assert '"3.12"' in workflow_text
     assert '"3.13"' in workflow_text
     assert "verify_python_artifacts.py" in workflow_text
-    assert "--expected-version" in workflow_text
+    assert "python scripts/verify_python_artifacts.py" in workflow_text
+    assert "--expected-version" not in workflow_text
 
 
 def test_gitless_source_tree_cannot_silently_build_version_zero(
@@ -311,4 +313,104 @@ def test_sdist_rejects_internal_version_mismatch(
             archive.addfile(member, io.BytesIO(payload))
 
     with pytest.raises(RuntimeError, match="version mismatch"):
+        verify_python_artifacts._verify_sdist(sdist, expected)
+
+
+def _git(cwd: Path, *arguments: str) -> None:
+    subprocess.run(
+        ["git", *arguments],
+        cwd=cwd,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+
+
+def test_default_version_comes_from_current_scm_not_stale_installed_metadata(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _git(tmp_path, "init", "-q")
+    _git(tmp_path, "config", "user.name", "Artifact Test")
+    _git(tmp_path, "config", "user.email", "artifact@example.invalid")
+    tracked = tmp_path / "tracked.txt"
+    tracked.write_text("first\n", encoding="utf-8")
+    _git(tmp_path, "add", "tracked.txt")
+    _git(tmp_path, "commit", "-q", "-m", "first")
+    stale_version = verify_python_artifacts._derive_scm_version(tmp_path)
+
+    tracked.write_text("second\n", encoding="utf-8")
+    _git(tmp_path, "commit", "-q", "-am", "second")
+    monkeypatch.setattr(
+        importlib.metadata,
+        "version",
+        lambda _name: stale_version,
+    )
+
+    current_version = verify_python_artifacts._derive_scm_version(tmp_path)
+
+    assert current_version != stale_version
+
+
+@pytest.mark.parametrize(
+    "member",
+    (
+        "palonexus-evil.dist-info/WHEEL",
+        "palonexus/palonexus-1.2.3.dist-info/WHEEL",
+        "palonexus-9.9.9.dist-info/WHEEL",
+    ),
+)
+def test_wheel_rejects_lookalike_metadata_namespaces(
+    tmp_path: Path,
+    member: str,
+) -> None:
+    expected = Version("1.2.3")
+    wheel = tmp_path / "palonexus-1.2.3-py3-none-any.whl"
+    with zipfile.ZipFile(wheel, "w") as archive:
+        archive.writestr(_zip_member("palonexus/py.typed"), b"")
+        archive.writestr(
+            _zip_member("palonexus/_version.py"),
+            b"__version__ = version = '1.2.3'\n",
+        )
+        archive.writestr(
+            _zip_member("palonexus-1.2.3.dist-info/METADATA"),
+            b"Metadata-Version: 2.4\nName: palonexus\nVersion: 1.2.3\n",
+        )
+        archive.writestr(_zip_member(member), b"value")
+
+    with pytest.raises(RuntimeError):
+        verify_python_artifacts._verify_wheel(wheel, expected)
+
+
+@pytest.mark.parametrize(
+    "member",
+    (
+        "palonexus-9.9.9/src/palonexus/value.py",
+        "palonexus-1.2.3/arbitrary-root-payload.txt",
+        "palonexus-1.2.3/src/other_package/value.py",
+    ),
+)
+def test_sdist_rejects_wrong_root_and_arbitrary_payloads(
+    tmp_path: Path,
+    member: str,
+) -> None:
+    expected = Version("1.2.3")
+    sdist = tmp_path / "palonexus-1.2.3.tar.gz"
+    payloads = {
+        "palonexus-1.2.3/src/palonexus/py.typed": b"",
+        "palonexus-1.2.3/src/palonexus/_version.py": (
+            b"__version__ = version = '1.2.3'\n"
+        ),
+        "palonexus-1.2.3/PKG-INFO": (
+            b"Metadata-Version: 2.4\nName: palonexus\nVersion: 1.2.3\n"
+        ),
+        member: b"value",
+    }
+    with tarfile.open(sdist, "w:gz") as archive:
+        for name, payload in payloads.items():
+            info = tarfile.TarInfo(name)
+            info.size = len(payload)
+            archive.addfile(info, io.BytesIO(payload))
+
+    with pytest.raises(RuntimeError):
         verify_python_artifacts._verify_sdist(sdist, expected)
