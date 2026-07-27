@@ -470,6 +470,48 @@ type observingBackend struct {
 	getResult []byte
 }
 
+func TestLegacyPurgeFailureBlocksCurrentCredentialUseAndMutation(t *testing.T) {
+	key := Key{Tenant: "tenant", Account: "account"}
+	backend := &legacyPurgeBackend{current: []byte("current-secret"), failLegacy: true}
+	store, _ := New("guard.test", backend)
+	if value, err := store.Get(context.Background(), key); !errors.Is(err, ErrUnavailable) || value != nil {
+		t.Fatalf("Get with failed mandatory purge = %q, %v", value, err)
+	}
+	if err := store.Put(context.Background(), key, []byte("replacement")); !errors.Is(err, ErrUnavailable) ||
+		backend.puts != 0 {
+		t.Fatalf("Put with failed mandatory purge = %v, puts=%d", err, backend.puts)
+	}
+	if err := store.Delete(context.Background(), key); !errors.Is(err, ErrUnavailable) ||
+		backend.currentDeletes != 1 {
+		t.Fatalf("Delete with failed mandatory purge = %v, current deletes=%d", err, backend.currentDeletes)
+	}
+}
+
+type legacyPurgeBackend struct {
+	current        []byte
+	failLegacy     bool
+	puts           int
+	currentDeletes int
+}
+
+func (b *legacyPurgeBackend) Put(context.Context, string, string, []byte) error {
+	b.puts++
+	return nil
+}
+func (b *legacyPurgeBackend) Get(context.Context, string, string) ([]byte, error) {
+	return b.current, nil
+}
+func (b *legacyPurgeBackend) Delete(_ context.Context, _ string, account string) error {
+	if strings.HasPrefix(account, "pnx1:") {
+		b.currentDeletes++
+		return nil
+	}
+	if b.failLegacy {
+		return errors.New("legacy backend unavailable")
+	}
+	return nil
+}
+
 func (b *observingBackend) Put(context.Context, string, string, []byte) error { return nil }
 func (b *observingBackend) Get(context.Context, string, string) ([]byte, error) {
 	return b.getResult, nil

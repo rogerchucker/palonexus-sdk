@@ -188,38 +188,7 @@ func (s *unixStore) DeleteAccount(ctx context.Context, binding Binding) error {
 			}
 			names = append(names, name)
 		}
-		deleted := false
-		for _, name := range names {
-			if !deleted {
-				if err := ctx.Err(); err != nil {
-					return err
-				}
-			}
-			var err error
-			if s.faults.unlink != nil {
-				err = s.faults.unlink(s.rootFD, name)
-			} else {
-				err = unlinkRegularAt(s.rootFD, name)
-			}
-			if err != nil && !errors.Is(err, ErrNotFound) {
-				if deleted {
-					return ErrDurabilityIndeterminate
-				}
-				return err
-			}
-			deleted = deleted || err == nil
-		}
-		syncDir := syncRoot
-		if s.faults.syncDir != nil {
-			syncDir = s.faults.syncDir
-		}
-		if err := syncDir(s.rootFD); err != nil {
-			if deleted {
-				return ErrDurabilityIndeterminate
-			}
-			return err
-		}
-		return nil
+		return s.deleteNamesLocked(ctx, names)
 	})
 }
 
@@ -229,11 +198,10 @@ func (s *unixStore) DeleteMetadata(ctx context.Context, binding Binding, kind Ki
 	}
 	return s.withLock(ctx, func() error {
 		name, _ := s.recordName(binding, kind)
-		err := unlinkRegularAt(s.rootFD, name)
-		if err != nil && !errors.Is(err, ErrNotFound) {
+		if err := rejectUnsafeExistingAt(s.rootFD, name); err != nil && !errors.Is(err, ErrNotFound) {
 			return err
 		}
-		return syncRoot(s.rootFD)
+		return s.deleteNamesLocked(ctx, []string{name})
 	})
 }
 
@@ -261,11 +229,7 @@ func (s *unixStore) WithSessionTransaction(ctx context.Context, binding Binding,
 			return err
 		}
 		if next == nil {
-			err := unlinkRegularAt(s.rootFD, name)
-			if err != nil && !errors.Is(err, ErrNotFound) {
-				return err
-			}
-			return syncRoot(s.rootFD)
+			return s.deleteNamesLocked(ctx, []string{name})
 		}
 		if next.Kind != KindSession || validateMetadata(*next) != nil {
 			return ErrUnsafePayload
@@ -279,6 +243,41 @@ func (s *unixStore) WithSessionTransaction(ctx context.Context, binding Binding,
 		}
 		return s.atomicWrite(ctx, name, wire)
 	})
+}
+
+func (s *unixStore) deleteNamesLocked(ctx context.Context, names []string) error {
+	deleted := false
+	for _, name := range names {
+		if !deleted {
+			if err := ctx.Err(); err != nil {
+				return err
+			}
+		}
+		var err error
+		if s.faults.unlink != nil {
+			err = s.faults.unlink(s.rootFD, name)
+		} else {
+			err = unlinkRegularAt(s.rootFD, name)
+		}
+		if err != nil && !errors.Is(err, ErrNotFound) {
+			if deleted {
+				return ErrDurabilityIndeterminate
+			}
+			return err
+		}
+		deleted = deleted || err == nil
+	}
+	syncDir := syncRoot
+	if s.faults.syncDir != nil {
+		syncDir = s.faults.syncDir
+	}
+	if err := syncDir(s.rootFD); err != nil {
+		if deleted {
+			return ErrDurabilityIndeterminate
+		}
+		return err
+	}
+	return nil
 }
 
 func (s *unixStore) Close() error {
