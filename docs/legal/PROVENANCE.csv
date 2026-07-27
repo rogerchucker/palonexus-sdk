@@ -171,3 +171,6 @@ python/tests/test_examples.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/t
 .github/workflows/python.yml,rogerchucker/palonexus-sdk,WORKTREE,.github/workflows/python.yml,PaloNexus,yes,new,MIT,rogerchucker
 python/tests/test_package_metadata.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/test_package_metadata.py,PaloNexus,yes,new,MIT,rogerchucker
 scripts/verify_python_artifacts.py,rogerchucker/palonexus-sdk,WORKTREE,scripts/verify_python_artifacts.py,PaloNexus,yes,new,MIT,rogerchucker
+guard/cmd/palonexus/main.go,rogerchucker/palonexus-sdk,WORKTREE,guard/cmd/palonexus/main.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/cli/cli.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/cli/cli.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/cli/cli_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/cli/cli_test.go,PaloNexus,yes,new,MIT,rogerchucker
