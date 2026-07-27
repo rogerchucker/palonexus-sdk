@@ -59,7 +59,7 @@ func Run(args []string, stdout, stderr io.Writer) int {
 
 	command := args[0]
 	if _, ok := commands[command]; !ok {
-		_, _ = fmt.Fprintf(stderr, "palonexus: unknown command %q\n", command)
+		_, _ = io.WriteString(stderr, "palonexus: unknown command\n")
 		return 2
 	}
 	if len(args) == 2 && (args[1] == "-h" || args[1] == "--help") {

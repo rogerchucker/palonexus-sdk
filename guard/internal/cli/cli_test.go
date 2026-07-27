@@ -94,12 +94,16 @@ func TestSubcommandHelpIsAvailableWithoutRunningStub(t *testing.T) {
 }
 
 func TestUnknownCommandFailsClosed(t *testing.T) {
-	code, stdout, stderr := runCLI(t, "destroy-everything")
+	secret := "Bearer_super-secret-command"
+	code, stdout, stderr := runCLI(t, secret)
 	if code != 2 || stdout != "" {
 		t.Fatalf("code=%d stdout=%q", code, stdout)
 	}
-	if stderr != "palonexus: unknown command \"destroy-everything\"\n" {
+	if stderr != "palonexus: unknown command\n" {
 		t.Fatalf("stderr = %q", stderr)
+	}
+	if strings.Contains(stdout+stderr, secret) {
+		t.Fatal("output exposed the unknown command value")
 	}
 }
 
