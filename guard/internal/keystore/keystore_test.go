@@ -470,46 +470,30 @@ type observingBackend struct {
 	getResult []byte
 }
 
-func TestLegacyPurgeFailureBlocksCurrentCredentialUseAndMutation(t *testing.T) {
+func TestUnreleasedDelimiterCredentialIsIgnoredAndNotMutated(t *testing.T) {
 	key := Key{Tenant: "tenant", Account: "account"}
-	backend := &legacyPurgeBackend{current: []byte("current-secret"), failLegacy: true}
-	store, _ := New("guard.test", backend)
-	if value, err := store.Get(context.Background(), key); !errors.Is(err, ErrUnavailable) || value != nil {
-		t.Fatalf("Get with failed mandatory purge = %q, %v", value, err)
+	backend := NewMemoryBackendForTesting()
+	store, err := New("guard.test", backend)
+	if err != nil {
+		t.Fatal(err)
 	}
-	if err := store.Put(context.Background(), key, []byte("replacement")); !errors.Is(err, ErrUnavailable) ||
-		backend.puts != 0 {
-		t.Fatalf("Put with failed mandatory purge = %v, puts=%d", err, backend.puts)
+	if err := backend.Put(context.Background(), "guard.test", "tenant:account", []byte("unreleased")); err != nil {
+		t.Fatal(err)
 	}
-	if err := store.Delete(context.Background(), key); !errors.Is(err, ErrUnavailable) ||
-		backend.currentDeletes != 1 {
-		t.Fatalf("Delete with failed mandatory purge = %v, current deletes=%d", err, backend.currentDeletes)
+	if err := store.Put(context.Background(), key, []byte("current")); err != nil {
+		t.Fatal(err)
 	}
-}
-
-type legacyPurgeBackend struct {
-	current        []byte
-	failLegacy     bool
-	puts           int
-	currentDeletes int
-}
-
-func (b *legacyPurgeBackend) Put(context.Context, string, string, []byte) error {
-	b.puts++
-	return nil
-}
-func (b *legacyPurgeBackend) Get(context.Context, string, string) ([]byte, error) {
-	return b.current, nil
-}
-func (b *legacyPurgeBackend) Delete(_ context.Context, _ string, account string) error {
-	if strings.HasPrefix(account, "pnx1:") {
-		b.currentDeletes++
-		return nil
+	value, err := store.Get(context.Background(), key)
+	if err != nil || string(value) != "current" {
+		t.Fatalf("current Get = %q, %v", value, err)
 	}
-	if b.failLegacy {
-		return errors.New("legacy backend unavailable")
+	if err := store.Delete(context.Background(), key); err != nil {
+		t.Fatal(err)
 	}
-	return nil
+	legacy, err := backend.Get(context.Background(), "guard.test", "tenant:account")
+	if err != nil || string(legacy) != "unreleased" {
+		t.Fatalf("unreleased item was selected or mutated = %q, %v", legacy, err)
+	}
 }
 
 func (b *observingBackend) Put(context.Context, string, string, []byte) error { return nil }
