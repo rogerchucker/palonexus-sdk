@@ -144,33 +144,25 @@ class _WorkerOutcome:
 
 
 class _CommitGate:
-    __slots__ = ("_cancelled", "_lock", "_outcome")
+    __slots__ = ("_cancelled", "_outcome")
 
     def __init__(self) -> None:
-        self._cancelled = False
-        self._lock = threading.Lock()
+        self._cancelled = threading.Event()
         self._outcome: _WorkerOutcome | None = None
 
-    def cancel(self) -> _WorkerOutcome | None:
-        with self._lock:
-            if self._outcome is not None:
-                return self._outcome
-            self._cancelled = True
-            self._outcome = _WorkerOutcome("NOT_COMMITTED_CANCELLED")
-            return self._outcome
+    def cancel(self) -> None:
+        self._cancelled.set()
 
-    def commit(self, mutation: Callable[[], object]) -> object:
-        with self._lock:
-            if self._cancelled:
-                raise concurrent.futures.CancelledError from None
-            result = mutation()
-            self._outcome = _WorkerOutcome("COMMITTED", result)
-            return result
+    @property
+    def cancelled(self) -> bool:
+        return self._cancelled.is_set()
+
+    def publish_committed(self, result: object) -> None:
+        self._outcome = _WorkerOutcome("COMMITTED", result)
 
     @property
     def outcome(self) -> _WorkerOutcome | None:
-        with self._lock:
-            return self._outcome
+        return self._outcome
 
 
 _CONTROL_EXCEPTIONS = (
@@ -227,6 +219,7 @@ class ScriptedEngine:
         "_outcomes",
         "_resolution_idempotency",
         "_sequence",
+        "_version",
     )
 
     def __init__(
@@ -265,6 +258,7 @@ class ScriptedEngine:
         self._calls: list[RecordedCall] = []
         self._lock = threading.RLock()
         self._sequence = 0
+        self._version = 0
         self._closed = False
 
     def _commit(
@@ -275,9 +269,16 @@ class ScriptedEngine:
     ) -> object:
         if self._before_commit is not None:
             self._before_commit(operation)
-        result = mutation() if gate is None else gate.commit(mutation)
+        if gate is not None and gate.cancelled:
+            raise concurrent.futures.CancelledError from None
+        result = mutation()
+        if gate is not None:
+            gate.publish_committed(result)
         if self._after_commit is not None:
-            self._after_commit(operation)
+            try:
+                self._after_commit(operation)
+            except BaseException as error:
+                _clean_control(error)
         return result
 
     @staticmethod
@@ -330,6 +331,7 @@ class ScriptedEngine:
             _invalid()
         with self._lock:
             self._outcomes.extend(outcomes)
+            self._version += 1
 
     @property
     def recorded_calls(self) -> tuple[RecordedCall, ...]:
@@ -404,10 +406,12 @@ class ScriptedEngine:
         ]
         for key in expired:
             del self._idempotency[key]
+        if expired:
+            self._version += 1
 
-    def _record(
+    def _prepared_call(
         self, request: wire.ActionRequest, client_scope_hash: str, request_hash: str
-    ) -> None:
+    ) -> RecordedCall:
         document = request.to_dict()
         target = document.get("target")
         safe_target: dict[str, Any] = {}
@@ -437,13 +441,18 @@ class ScriptedEngine:
         }
         document["target"] = safe_target
         document["context"] = {"parameters": None}
+        return RecordedCall(
+            operation="decide",
+            request=cast(Mapping[str, Any], _frozen(document)),
+            canonical_request_hash=request_hash,
+            client_scope_hash=client_scope_hash,
+        )
+
+    def _record(
+        self, request: wire.ActionRequest, client_scope_hash: str, request_hash: str
+    ) -> None:
         self._calls.append(
-            RecordedCall(
-                operation="decide",
-                request=cast(Mapping[str, Any], _frozen(document)),
-                canonical_request_hash=request_hash,
-                client_scope_hash=client_scope_hash,
-            )
+            self._prepared_call(request, client_scope_hash, request_hash)
         )
 
     @staticmethod
@@ -568,6 +577,7 @@ class ScriptedEngine:
                 raise AuthorizationUnavailable() from None
             start_now = self._now()
             self._purge_expired(start_now)
+            expected_version = self._version
             prior = self._idempotency.get(key)
             if prior is not None:
                 if prior.request_hash != request_hash:
@@ -576,8 +586,18 @@ class ScriptedEngine:
                         correlation_id=request.correlation_id,
                     ) from None
 
+                replay_call = self._prepared_call(
+                    request, client_scope_hash, request_hash
+                )
+
                 def replay() -> object:
-                    self._record(request, client_scope_hash, request_hash)
+                    if (
+                        self._version != expected_version
+                        or self._idempotency.get(key) is not prior
+                    ):
+                        raise AuthorizationUnavailable() from None
+                    self._calls.append(replay_call)
+                    self._version += 1
                     return prior.result
 
                 return cast(
@@ -594,7 +614,8 @@ class ScriptedEngine:
                     request_id=request.request_id,
                     correlation_id=request.correlation_id,
                 ) from None
-            outcome = self._outcomes[0]
+            scripted_outcome = self._outcomes[0]
+            outcome = scripted_outcome
             # Serialize scripted consumption and insertion so concurrent reuse of
             # one idempotency key cannot consume two outcomes.
             while outcome.kind == "delay":
@@ -604,41 +625,53 @@ class ScriptedEngine:
                 assert outcome.nested is not None
                 outcome = outcome.nested
             completion_now = self._now()
+            result = self._decision(outcome, request, client_scope_hash, completion_now)
+            if (
+                result.approval is not None
+                and len(self._decision_bindings) >= self._idempotency_capacity
+            ):
+                raise AuthorizationUnavailable(
+                    request_id=request.request_id,
+                    correlation_id=request.correlation_id,
+                ) from None
+            recorded_call = self._prepared_call(
+                request, client_scope_hash, request_hash
+            )
+            idempotency_entry = _IdempotencyEntry(
+                request_hash=request_hash,
+                result=result,
+                expires_at=completion_now + timedelta(seconds=self._idempotency_ttl),
+            )
+            decision_binding: _ApprovalBinding | None = None
+            if result.approval is not None:
+                decision_binding = _ApprovalBinding(
+                    request_hash=request_hash,
+                    action_id=str(request.action_id),
+                    request_id=str(request.request_id),
+                    correlation_id=str(request.correlation_id),
+                    client_scope_hash=client_scope_hash,
+                    authoritative_scope_hash=str(result.authoritative_scope_hash),
+                    decision_id=str(result.decision_id),
+                    approval_id=str(result.approval.approval_id),
+                    approval_expires_at=datetime.fromisoformat(
+                        str(result.approval.expires_at).replace("Z", "+00:00")
+                    ),
+                )
 
             def commit_decision() -> object:
-                self._outcomes.popleft()
-                result = self._decision(
-                    outcome, request, client_scope_hash, completion_now
-                )
                 if (
-                    result.approval is not None
-                    and len(self._decision_bindings) >= self._idempotency_capacity
+                    self._version != expected_version
+                    or not self._outcomes
+                    or self._outcomes[0] is not scripted_outcome
+                    or key in self._idempotency
                 ):
-                    raise AuthorizationUnavailable(
-                        request_id=request.request_id,
-                        correlation_id=request.correlation_id,
-                    ) from None
-                self._record(request, client_scope_hash, request_hash)
-                self._idempotency[key] = _IdempotencyEntry(
-                    request_hash=request_hash,
-                    result=result,
-                    expires_at=completion_now
-                    + timedelta(seconds=self._idempotency_ttl),
-                )
-                if result.approval is not None:
-                    self._decision_bindings[str(result.decision_id)] = _ApprovalBinding(
-                        request_hash=request_hash,
-                        action_id=str(request.action_id),
-                        request_id=str(request.request_id),
-                        correlation_id=str(request.correlation_id),
-                        client_scope_hash=client_scope_hash,
-                        authoritative_scope_hash=str(result.authoritative_scope_hash),
-                        decision_id=str(result.decision_id),
-                        approval_id=str(result.approval.approval_id),
-                        approval_expires_at=datetime.fromisoformat(
-                            str(result.approval.expires_at).replace("Z", "+00:00")
-                        ),
-                    )
+                    raise AuthorizationUnavailable() from None
+                self._outcomes.popleft()
+                self._calls.append(recorded_call)
+                self._idempotency[key] = idempotency_entry
+                if decision_binding is not None:
+                    self._decision_bindings[str(result.decision_id)] = decision_binding
+                self._version += 1
                 return result
 
             return cast(
@@ -712,6 +745,7 @@ class ScriptedEngine:
             self._check_control(deadline=deadline, cancelled=cancelled)
             if self._closed:
                 raise AuthorizationUnavailable() from None
+            expected_version = self._version
             binding = self._decision_bindings.get(checked_decision_id)
             mismatch = (
                 binding is None
@@ -732,11 +766,31 @@ class ScriptedEngine:
             assert binding is not None
             existing = self._approvals.get(checked_approval_id)
             if existing is not None:
+                replay_call = self._prepared_call(
+                    request, binding.client_scope_hash, request_hash
+                )
+                replay_call = RecordedCall(
+                    operation="request_approval",
+                    request=replay_call.request,
+                    canonical_request_hash=request_hash,
+                    client_scope_hash=binding.client_scope_hash,
+                )
+
+                def replay_approval() -> object:
+                    if (
+                        self._version != expected_version
+                        or self._approvals.get(checked_approval_id) is not existing
+                    ):
+                        raise AuthorizationUnavailable() from None
+                    self._calls.append(replay_call)
+                    self._version += 1
+                    return existing
+
                 return cast(
                     wire.ApprovalRecord,
                     self._commit(
                         "request_approval",
-                        lambda: existing,
+                        replay_approval,
                         _commit_gate,
                     ),
                 )
@@ -754,29 +808,40 @@ class ScriptedEngine:
                     correlation_id=request.correlation_id,
                 ) from None
 
+            document: dict[str, wire.JSONValue] = {
+                "schemaVersion": "1",
+                "approvalId": binding.approval_id,
+                "actionId": binding.action_id,
+                "correlationId": binding.correlation_id,
+                "authoritativeScopeHash": binding.authoritative_scope_hash,
+                "status": "pending",
+                "requestedAt": _timestamp(now),
+                "expiresAt": _timestamp(binding.approval_expires_at),
+                "requesterRef": "subject:testing-requester",
+                "authorizationDecisionId": binding.decision_id,
+                "creationAuditRef": self._new_id("audit"),
+            }
+            record = wire.parse_approval(document)
+            approval_call = self._prepared_call(
+                request, binding.client_scope_hash, request_hash
+            )
+            approval_call = RecordedCall(
+                operation="request_approval",
+                request=approval_call.request,
+                canonical_request_hash=request_hash,
+                client_scope_hash=binding.client_scope_hash,
+            )
+
             def commit_approval() -> object:
-                document: dict[str, wire.JSONValue] = {
-                    "schemaVersion": "1",
-                    "approvalId": binding.approval_id,
-                    "actionId": binding.action_id,
-                    "correlationId": binding.correlation_id,
-                    "authoritativeScopeHash": binding.authoritative_scope_hash,
-                    "status": "pending",
-                    "requestedAt": _timestamp(now),
-                    "expiresAt": _timestamp(binding.approval_expires_at),
-                    "requesterRef": "subject:testing-requester",
-                    "authorizationDecisionId": binding.decision_id,
-                    "creationAuditRef": self._new_id("audit"),
-                }
-                record = wire.parse_approval(document)
-                self._record(request, binding.client_scope_hash, request_hash)
-                self._calls[-1] = RecordedCall(
-                    operation="request_approval",
-                    request=self._calls[-1].request,
-                    canonical_request_hash=request_hash,
-                    client_scope_hash=binding.client_scope_hash,
-                )
+                if (
+                    self._version != expected_version
+                    or self._decision_bindings.get(checked_decision_id) is not binding
+                    or checked_approval_id in self._approvals
+                ):
+                    raise AuthorizationUnavailable() from None
+                self._calls.append(approval_call)
                 self._approvals[checked_approval_id] = record
+                self._version += 1
                 return record
 
             return cast(
@@ -821,6 +886,7 @@ class ScriptedEngine:
         self._check_control(deadline=deadline, cancelled=cancelled)
         with self._lock:
             self._check_control(deadline=deadline, cancelled=cancelled)
+            expected_version = self._version
             try:
                 record = self._approvals[approval_id]
             except KeyError:
@@ -833,20 +899,46 @@ class ScriptedEngine:
             approval_hash = (
                 "sha256:" + hashlib.sha256(approval_id.encode("utf-8")).hexdigest()
             )
+            observed_call = RecordedCall(
+                operation="get_approval",
+                request=MappingProxyType({"approvalId": approval_id}),
+                canonical_request_hash=approval_hash,
+                client_scope_hash="",
+            )
+            prepared = record
+            expiry_key: str | None = None
+            expiry_binding: _ResolutionBinding | None = None
+            if str(record.status) == "pending" and now >= expiry:
+                expiry_key = self._new_id("approval")
+                if expiry_key in self._resolution_idempotency:
+                    raise AuthorizationUnavailable() from None
+                prepared = self._resolve(
+                    record,
+                    status="expired",
+                    reviewer_ref=None,
+                    resolution_idempotency_key=expiry_key,
+                    now=now,
+                )
+                expiry_binding = _ResolutionBinding(
+                    approval_id=approval_id,
+                    status="expired",
+                    reviewer_ref=None,
+                    result=prepared,
+                )
 
             def commit_get() -> object:
-                current = record
-                if str(current.status) == "pending" and now >= expiry:
-                    current = self._expire_locked(current, now=now)
-                self._calls.append(
-                    RecordedCall(
-                        operation="get_approval",
-                        request=MappingProxyType({"approvalId": approval_id}),
-                        canonical_request_hash=approval_hash,
-                        client_scope_hash="",
-                    )
-                )
-                return current
+                if (
+                    self._version != expected_version
+                    or self._approvals.get(approval_id) is not record
+                ):
+                    raise AuthorizationUnavailable() from None
+                if expiry_key is not None:
+                    assert expiry_binding is not None
+                    self._approvals[approval_id] = prepared
+                    self._resolution_idempotency[expiry_key] = expiry_binding
+                self._calls.append(observed_call)
+                self._version += 1
+                return prepared
 
             return cast(
                 wire.ApprovalRecord,
@@ -902,13 +994,15 @@ class ScriptedEngine:
             now=now,
         )
         approval_id = str(record.approval_id)
-        self._approvals[approval_id] = resolved
-        self._resolution_idempotency[resolution_idempotency_key] = _ResolutionBinding(
+        resolution_binding = _ResolutionBinding(
             approval_id=approval_id,
             status=status,
             reviewer_ref=reviewer_ref,
             result=resolved,
         )
+        self._approvals[approval_id] = resolved
+        self._resolution_idempotency[resolution_idempotency_key] = resolution_binding
+        self._version += 1
         return resolved
 
     def _expire_locked(
@@ -1019,6 +1113,7 @@ class ScriptedEngine:
     def close(self) -> None:
         with self._lock:
             self._closed = True
+            self._version += 1
 
 
 class FakeTransport:
@@ -1090,6 +1185,10 @@ class AsyncFakeTransport:
                 result = call()
             except concurrent.futures.CancelledError:
                 return gate.outcome or _WorkerOutcome("NOT_COMMITTED_CANCELLED")
+            except BaseException:
+                if gate.cancelled:
+                    return _WorkerOutcome("NOT_COMMITTED_CANCELLED")
+                raise
             return gate.outcome or _WorkerOutcome("COMMITTED", result)
 
         worker = asyncio.create_task(asyncio.to_thread(worker_call))

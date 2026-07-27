@@ -210,6 +210,11 @@ def test_approval_creation_is_bound_to_issued_decision_and_request() -> None:
     }
     first = transport.request_approval(original, **kwargs)
     assert transport.request_approval(original, **kwargs) is first
+    assert [call.operation for call in scripted.recorded_calls] == [
+        "decide",
+        "request_approval",
+        "request_approval",
+    ]
 
     changed = request(action="file:delete")
     with pytest.raises(IdempotencyConflict):
@@ -864,7 +869,10 @@ def test_async_cancelled_approval_create_does_not_record_or_mutate() -> None:
     asyncio.run(scenario())
 
 
-def test_async_decide_cancellation_and_commit_are_linearized() -> None:
+@pytest.mark.parametrize("_iteration", range(20))
+def test_async_decide_cancellation_and_commit_are_linearized(
+    _iteration: int,
+) -> None:
     async def cancellation_wins() -> None:
         at_commit = threading.Event()
         release_commit = threading.Event()
@@ -1018,6 +1026,72 @@ def test_async_expiry_cancellation_and_commit_are_linearized() -> None:
 
     asyncio.run(cancellation_wins())
     asyncio.run(commit_wins())
+
+
+def test_async_cancellation_does_not_block_loop_during_fallible_prepare() -> None:
+    async def scenario() -> None:
+        entered = threading.Event()
+        release = threading.Event()
+
+        def blocked_id() -> str:
+            entered.set()
+            release.wait()
+            raise RuntimeError(_HOSTILE_SECRET)
+
+        scripted = ScriptedEngine(
+            ScriptedEngine.allow(),
+            testing_only=True,
+            id_source=blocked_id,
+        )
+        value = request()
+        transport = AsyncFakeTransport(scripted, testing_only=True)
+        task = asyncio.create_task(
+            transport.decide(value, client_scope_hash=scope(value))
+        )
+        await asyncio.to_thread(entered.wait)
+        fallback_release = threading.Timer(0.3, release.set)
+        fallback_release.start()
+        task.cancel("prepare-cancelled")
+        started = time.monotonic()
+        await asyncio.sleep(0.02)
+        elapsed = time.monotonic() - started
+        release.set()
+        fallback_release.join()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await task
+        assert caught.value.args == ("prepare-cancelled",)
+        assert elapsed < 0.1
+        assert scripted.recorded_calls == ()
+        scripted._id_source = None
+        assert (
+            str(
+                FakeTransport(scripted, testing_only=True)
+                .decide(value, client_scope_hash=scope(value))
+                .outcome
+            )
+            == "allow"
+        )
+
+    asyncio.run(scenario())
+
+
+def test_postcommit_observer_failure_cannot_replace_committed_result() -> None:
+    def hostile_after_commit(_: str) -> None:
+        raise RuntimeError(_HOSTILE_SECRET)
+
+    scripted = ScriptedEngine(
+        ScriptedEngine.allow(),
+        testing_only=True,
+        after_commit=hostile_after_commit,
+    )
+    value = request()
+    result = asyncio.run(
+        AsyncFakeTransport(scripted, testing_only=True).decide(
+            value, client_scope_hash=scope(value)
+        )
+    )
+    assert str(result.outcome) == "allow"
+    assert len(scripted.recorded_calls) == 1
 
 
 def test_mock_server_sanitizes_engine_callback_failures() -> None:
