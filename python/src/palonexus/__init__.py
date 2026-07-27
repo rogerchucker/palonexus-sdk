@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: MIT
 """Public PaloNexus Python SDK API."""
 
+from .async_client import AsyncAuthorizationClient
+from .client import AuthorizationClient, AuthorizationDecision
 from .context import atask, task
 from .credentials import (
     AsyncCredentialProvider,
@@ -56,8 +58,11 @@ __all__ = [
     "ApprovalExpired",
     "ApprovalRequired",
     "ApprovalScopeMismatch",
+    "AsyncAuthorizationClient",
     "AsyncCredentialProvider",
     "AuthenticationFailed",
+    "AuthorizationClient",
+    "AuthorizationDecision",
     "AuthorizationUnavailable",
     "CompletionState",
     "Credential",
