@@ -780,6 +780,33 @@ class ActionRequestBuilder:
         temporary envelope. Success transfers execution ownership: the
         original is closed before the resumed envelope is returned.
         """
+        resumed = self._prepare_resume(
+            original,
+            current,
+            prior_decision_id=prior_decision_id,
+            approval_id=approval_id,
+        )
+        try:
+            self._commit_resume(original, resumed)
+        except BaseException:
+            resumed.close()
+            raise
+        return resumed
+
+    def _prepare_resume(
+        self,
+        original: _PreparedAction,
+        current: ActionRequest,
+        *,
+        prior_decision_id: str,
+        approval_id: str,
+    ) -> _PreparedAction:
+        """Build a sealed resume candidate without retiring ``original``.
+
+        This package-private phase exists so clients can obtain a fresh policy
+        decision before committing execution ownership. The public ``resume``
+        method above retains its original atomic-transfer contract.
+        """
         if not isinstance(original, _PreparedAction):
             raise _invalid()
         original._verify_for(self._seal_key)
@@ -864,9 +891,6 @@ class ActionRequestBuilder:
                 except Exception:
                     _wipe(execution)
                     raise _invalid() from None
-                # Everything that can reject the new action has completed.
-                # This is the non-failing ownership-transfer commit.
-                original_state.close()
                 return resumed
         except (ApprovalScopeMismatch, ModelValidationError):
             raise
@@ -877,6 +901,36 @@ class ActionRequestBuilder:
                 temporary.close()
             if fresh_target is not None:
                 fresh_target.close()
+
+    def _commit_resume(
+        self,
+        original: _PreparedAction,
+        resumed: _PreparedAction,
+    ) -> None:
+        """Atomically retire an original after its candidate is allowed."""
+
+        if not isinstance(original, _PreparedAction) or not isinstance(
+            resumed, _PreparedAction
+        ):
+            raise _invalid()
+        original_state = original._verify_for(self._seal_key)
+        resumed._verify_for(self._seal_key)
+        try:
+            if (
+                resumed.request.action_id != original.request.action_id
+                or resumed.request.correlation_id != original.request.correlation_id
+                or resumed.request.task != original.request.task
+                or resumed.client_scope_hash != original.client_scope_hash
+            ):
+                raise _invalid()
+            with original_state.lock:
+                original._verify_for(self._seal_key)
+                resumed._verify_for(self._seal_key)
+                original_state.close()
+        except ModelValidationError:
+            raise
+        except (AttributeError, TypeError, ValueError):
+            raise _invalid() from None
 
 
 __all__ = ["ActionRequestBuilder"]

@@ -3,26 +3,36 @@
 
 from __future__ import annotations
 
+import concurrent.futures
+import math
 import threading
+import time
 from collections.abc import Callable
 from datetime import datetime
 from typing import Literal, Never, Protocol, Self
 
 from ._generated import protocol as _wire
+from .approvals import ApprovalRecord, ApprovalStatus, ApprovalTransport
 from .errors import (
+    ApprovalExpired,
     ApprovalRequired,
+    ApprovalScopeMismatch,
     AuthorizationUnavailable,
     InvalidDecision,
     InvalidRequest,
     PolicyDenied,
 )
-from .models import DecisionOutcome
+from .models import ActionRequest, DecisionOutcome
+from .protocol import ActionRequestBuilder, _PreparedAction
 from .transports import AuthorizationTransport
 
 
 class _AuthorizationAttempt(Protocol):
-    request: _wire.ActionRequest
-    client_scope_hash: str
+    @property
+    def request(self) -> _wire.ActionRequest: ...
+
+    @property
+    def client_scope_hash(self) -> str: ...
 
 
 class AuthorizationDecision:
@@ -233,6 +243,7 @@ class AuthorizationClient:
 
     __slots__ = (
         "_active",
+        "_approval_transport",
         "_close_failure",
         "_closing_thread_id",
         "_condition",
@@ -246,13 +257,19 @@ class AuthorizationClient:
         self,
         transport: AuthorizationTransport,
         *,
+        approval_transport: ApprovalTransport | None = None,
         owns_transport: bool = False,
     ) -> None:
         if not isinstance(transport, AuthorizationTransport):
             raise InvalidRequest() from None
         if type(owns_transport) is not bool:
             raise InvalidRequest() from None
+        if approval_transport is not None and not isinstance(
+            approval_transport, ApprovalTransport
+        ):
+            raise InvalidRequest() from None
         self._transport = transport
+        self._approval_transport = approval_transport
         self._owns_transport = owns_transport
         self._state = "OPEN"
         self._active = 0
@@ -333,6 +350,155 @@ class AuthorizationClient:
             )
         )
 
+    def _approvals(self) -> ApprovalTransport:
+        if self._approval_transport is None:
+            raise AuthorizationUnavailable() from None
+        return self._approval_transport
+
+    def request_approval(
+        self,
+        attempt: _AuthorizationAttempt,
+        decision: AuthorizationDecision,
+        *,
+        deadline: float | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> ApprovalRecord:
+        """Create or return the approval bound to one immutable attempt."""
+
+        request, scope_hash = _attempt_parts(attempt)
+        if (
+            type(decision) is not AuthorizationDecision
+            or decision.outcome is not DecisionOutcome.APPROVAL_REQUIRED
+            or decision.approval_id is None
+            or decision.request_id != str(request.request_id)
+            or decision.correlation_id != str(request.correlation_id)
+            or decision.client_scope_hash != scope_hash
+        ):
+            raise ApprovalScopeMismatch(
+                request_id=request.request_id,
+                decision_id=getattr(decision, "decision_id", None),
+                correlation_id=request.correlation_id,
+            ) from None
+        self._begin_operation(request)
+        try:
+            value = self._approvals().request_approval(
+                request,
+                decision_id=decision.decision_id,
+                authoritative_scope_hash=decision.authoritative_scope_hash,
+                approval_id=decision.approval_id,
+                deadline=deadline,
+                cancelled=cancelled,
+            )
+            record = ApprovalRecord._from_protocol(value)
+            _bind_approval(record, request=request, decision=decision)
+            return record
+        finally:
+            self._end_operation()
+
+    def get_approval(
+        self,
+        approval_id: str,
+        *,
+        deadline: float | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> ApprovalRecord:
+        """Read one validated approval record."""
+
+        try:
+            checked_id = str(_wire.ApprovalID(approval_id))
+        except (TypeError, ValueError):
+            raise InvalidRequest() from None
+        self._begin_operation(None)
+        try:
+            record = ApprovalRecord._from_protocol(
+                self._approvals().get_approval(
+                    checked_id,
+                    deadline=deadline,
+                    cancelled=cancelled,
+                )
+            )
+            if record.approval_id != checked_id:
+                raise InvalidDecision() from None
+            return record
+        finally:
+            self._end_operation()
+
+    def wait_for_approval(
+        self,
+        approval_id: str,
+        *,
+        deadline: float,
+        cancelled: Callable[[], bool] | None = None,
+        poll_interval: float = 0.25,
+    ) -> ApprovalRecord:
+        """Poll without busy-looping until a terminal approval or deadline."""
+
+        checked_deadline, checked_interval = _poll_parameters(deadline, poll_interval)
+        while True:
+            if cancelled is not None and cancelled():
+                raise _cancelled()
+            now = time.monotonic()
+            if now >= checked_deadline:
+                raise AuthorizationUnavailable() from None
+            record = self.get_approval(
+                approval_id,
+                deadline=checked_deadline,
+                cancelled=cancelled,
+            )
+            if record.status is not ApprovalStatus.PENDING:
+                return record
+            remaining = checked_deadline - time.monotonic()
+            if remaining <= 0:
+                raise AuthorizationUnavailable() from None
+            threading.Event().wait(min(checked_interval, remaining))
+
+    def resume(
+        self,
+        builder: ActionRequestBuilder,
+        original: _PreparedAction,
+        current: ActionRequest,
+        prior_decision: AuthorizationDecision,
+        approval: ApprovalRecord,
+        *,
+        deadline: float | None = None,
+        cancelled: Callable[[], bool] | None = None,
+    ) -> _PreparedAction:
+        """Reauthorize a sealed resume candidate, then transfer execution."""
+
+        _require_resumable(original, prior_decision, approval)
+        candidate: _PreparedAction | None = None
+        committed = False
+        try:
+            candidate = builder._prepare_resume(  # noqa: SLF001
+                original,
+                current,
+                prior_decision_id=prior_decision.decision_id,
+                approval_id=approval.approval_id,
+            )
+            fresh_decision = self.authorize(
+                candidate,
+                deadline=deadline,
+                cancelled=cancelled,
+            )
+            if (
+                fresh_decision.authoritative_scope_hash
+                != approval.authoritative_scope_hash
+            ):
+                raise ApprovalScopeMismatch(
+                    request_id=fresh_decision.request_id,
+                    decision_id=fresh_decision.decision_id,
+                    correlation_id=fresh_decision.correlation_id,
+                ) from None
+            builder._commit_resume(original, candidate)  # noqa: SLF001
+            committed = True
+            return candidate
+        finally:
+            if candidate is not None and not committed:
+                try:
+                    candidate.close()
+                except BaseException:
+                    pass
+
     def close(self) -> None:
         """Wait for active calls, then close an owned transport exactly once."""
 
@@ -385,3 +551,82 @@ class AuthorizationClient:
 
 
 __all__ = ["AuthorizationClient", "AuthorizationDecision"]
+
+
+def _bind_approval(
+    record: ApprovalRecord,
+    *,
+    request: _wire.ActionRequest,
+    decision: AuthorizationDecision,
+) -> None:
+    if (
+        record.approval_id != decision.approval_id
+        or record.action_id != str(request.action_id)
+        or record.correlation_id != str(request.correlation_id)
+        or record.authorization_decision_id != decision.decision_id
+        or record.authoritative_scope_hash != decision.authoritative_scope_hash
+        or record.creation_audit_ref != decision.audit_ref
+    ):
+        raise ApprovalScopeMismatch(
+            request_id=request.request_id,
+            decision_id=decision.decision_id,
+            correlation_id=request.correlation_id,
+        ) from None
+
+
+def _poll_parameters(deadline: object, interval: object) -> tuple[float, float]:
+    if (
+        isinstance(deadline, bool)
+        or not isinstance(deadline, (int, float))
+        or not math.isfinite(deadline)
+        or isinstance(interval, bool)
+        or not isinstance(interval, (int, float))
+        or not math.isfinite(interval)
+        or interval <= 0
+        or interval > 60
+    ):
+        raise InvalidRequest() from None
+    return float(deadline), float(interval)
+
+
+def _cancelled() -> BaseException:
+    return concurrent.futures.CancelledError()
+
+
+def _require_resumable(
+    original: _PreparedAction,
+    prior: AuthorizationDecision,
+    approval: ApprovalRecord,
+) -> None:
+    try:
+        request = getattr(original, "request")
+        scope_hash = getattr(original, "client_scope_hash")
+        if (
+            type(prior) is not AuthorizationDecision
+            or type(approval) is not ApprovalRecord
+            or prior.outcome is not DecisionOutcome.APPROVAL_REQUIRED
+            or prior.approval_id != approval.approval_id
+            or prior.request_id != str(request.request_id)
+            or prior.correlation_id != str(request.correlation_id)
+            or prior.client_scope_hash != scope_hash
+            or prior.authoritative_scope_hash != approval.authoritative_scope_hash
+            or prior.decision_id != approval.authorization_decision_id
+            or prior.audit_ref != approval.creation_audit_ref
+            or approval.action_id != str(request.action_id)
+            or approval.correlation_id != str(request.correlation_id)
+        ):
+            raise ValueError
+    except Exception:
+        raise ApprovalScopeMismatch() from None
+    identifiers = {
+        "request_id": prior.request_id,
+        "decision_id": prior.decision_id,
+        "correlation_id": prior.correlation_id,
+    }
+    if approval.status is ApprovalStatus.APPROVED:
+        return
+    if approval.status is ApprovalStatus.EXPIRED:
+        raise ApprovalExpired(**identifiers) from None
+    if approval.status is ApprovalStatus.PENDING:
+        raise ApprovalRequired(**identifiers) from None
+    raise PolicyDenied(**identifiers) from None
