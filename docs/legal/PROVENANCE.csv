@@ -215,3 +215,6 @@ guard/internal/state/store_unsupported_test.go,rogerchucker/palonexus-sdk,WORKTR
 guard/internal/auth/oidc.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/auth/oidc.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/auth/oidc_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/auth/oidc_test.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/auth/session.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/auth/session.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/decision/client.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/decision/client.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/decision/client_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/decision/client_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/decision/errors.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/decision/errors.go,PaloNexus,yes,new,MIT,rogerchucker
