@@ -14,7 +14,8 @@ also receive the same object at
 `config["configurable"]["palonexus"]`. Model middleware cannot read
 `RunnableConfig` in LangChain 1.x, so model calls require runtime context and
 an application-owned `model_policy_key`. Each model policy also binds that key
-to the model's public `name` or `model_name`; a substituted model fails closed.
+to the exact application-supplied `BaseChatModel` object; a distinct backend
+object fails closed even if it advertises the same public name.
 
 Use `create_authorized_agent`, not a raw `create_agent` middleware list.
 LangChain executes middleware in onion order: the first entry is outermost and
@@ -40,7 +41,7 @@ resource-projection contract is available.
 | Surface | Sync | Async | Configuration and limit |
 | --- | --- | --- | --- |
 | Tool call | enforced | enforced | Runtime context or `RunnableConfig`; arguments omitted from scope |
-| Model call | enforced | enforced | Runtime context only; policy key plus public model name |
+| Model call | enforced | enforced | Runtime context only; policy key plus exact bound model object |
 | Agent stream | pre-start gate | pre-start gate | No chunk precedes allow; LangChain owns post-allow cleanup |
 | Durable approval resume | no | no | Use the PaloNexus LangGraph integration |
 | Target-mutating middleware | enforced with helper | enforced with helper | PaloNexus must be last/innermost |

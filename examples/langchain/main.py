@@ -68,7 +68,6 @@ def middleware(
             "offline-model": LangChainActionPolicy(
                 service="offline-model",
                 side_effect="external",
-                model_name="offline-model",
             )
         },
     )
@@ -109,6 +108,7 @@ def main() -> None:
                 AIMessage(content="done"),
             ],
         ),
+        model_policy_key="offline-model",
         tools=[read_inventory],
         authorization=middleware(allowed, include_tool=True),
         context_schema=LangChainAuthorizationContext,
@@ -127,6 +127,7 @@ def main() -> None:
             responses=[AIMessage(content="unreachable")],
             name="offline-model",
         ),
+        model_policy_key="offline-model",
         tools=[],
         authorization=middleware(denied, include_tool=False),
         context_schema=LangChainAuthorizationContext,
@@ -150,6 +151,7 @@ def main() -> None:
             responses=[AIMessage(content="unreachable")],
             name="offline-model",
         ),
+        model_policy_key="offline-model",
         tools=[],
         authorization=middleware(approval, include_tool=False),
         context_schema=LangChainAuthorizationContext,

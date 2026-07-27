@@ -66,6 +66,12 @@ class _ToolCapableFakeModel(FakeMessagesListChatModel):
         return self
 
 
+FAKE_MODEL = FakeListChatModel(
+    responses=["ok"],
+    name="fake-list-chat-model",
+)
+
+
 @tool
 def inventory_read(item_id: str, api_token: str) -> str:
     """Read an inventory item."""
@@ -79,6 +85,7 @@ def _context(
     correlation_id: str = CORRELATION,
     model_policy_key: str = "fake-list-chat-model",
     deadline: float | None = None,
+    cancelled: Any = None,
 ) -> LangChainAuthorizationContext:
     return LangChainAuthorizationContext(
         task=task,
@@ -87,6 +94,7 @@ def _context(
         tenant_ref="tenant-not-authoritative",
         actor_ref="actor-not-authoritative",
         deadline=deadline,
+        cancelled=cancelled,
     )
 
 
@@ -114,9 +122,9 @@ def _middleware(
                 "fake-list-chat-model": LangChainActionPolicy(
                     service="model-runtime",
                     side_effect="external",
-                    model_name="fake-list-chat-model",
                 )
             },
+            model_bindings={"fake-list-chat-model": FAKE_MODEL},
         ),
         engine,
     )
@@ -141,9 +149,9 @@ def _async_middleware(
                 "fake-list-chat-model": LangChainActionPolicy(
                     service="model-runtime",
                     side_effect="external",
-                    model_name="fake-list-chat-model",
                 )
             },
+            model_bindings={"fake-list-chat-model": FAKE_MODEL},
         ),
         engine,
     )
@@ -182,10 +190,7 @@ def _model_request(
     context: LangChainAuthorizationContext | None = None,
 ) -> ModelRequest[Any]:
     return ModelRequest(
-        model=FakeListChatModel(
-            responses=["ok"],
-            name="fake-list-chat-model",
-        ),
+        model=FAKE_MODEL,
         messages=[],
         runtime=Runtime(context=context),
     )
@@ -537,7 +542,6 @@ def test_real_langchain_agent_and_stream_are_gated_before_execution() -> None:
             "fake-messages-list-chat-model": LangChainActionPolicy(
                 service="model-runtime",
                 side_effect="external",
-                model_name="fake-messages-list-chat-model",
             )
         },
     )
@@ -560,6 +564,7 @@ def test_real_langchain_agent_and_stream_are_gated_before_execution() -> None:
     )
     agent = create_authorized_agent(
         model=model,
+        model_policy_key="fake-messages-list-chat-model",
         tools=[counted_inventory],
         authorization=middleware,
         context_schema=LangChainAuthorizationContext,
@@ -589,7 +594,6 @@ def test_real_langchain_agent_and_stream_are_gated_before_execution() -> None:
             "fake-messages-list-chat-model": LangChainActionPolicy(
                 service="model-runtime",
                 side_effect="external",
-                model_name="fake-messages-list-chat-model",
             )
         },
     )
@@ -598,6 +602,7 @@ def test_real_langchain_agent_and_stream_are_gated_before_execution() -> None:
             name="fake-messages-list-chat-model",
             responses=[AIMessage(content="must-not-stream")],
         ),
+        model_policy_key="fake-messages-list-chat-model",
         tools=[],
         authorization=denied_middleware,
         context_schema=LangChainAuthorizationContext,
@@ -712,6 +717,97 @@ def test_exact_non_allow_decision_from_duck_client_fails_closed() -> None:
             _tool_request(context=_context()),
             lambda request: pytest.fail("handler executed"),
         )
+
+
+def test_genuine_allow_from_different_attempt_is_rejected() -> None:
+    engine = ScriptedEngine(
+        ScriptedEngine.allow(),
+        testing_only=True,
+    )
+    underlying = AuthorizationClient(FakeTransport(engine, testing_only=True))
+
+    class ReplayClient:
+        authorization_client_kind = "sync"
+        cached: Any = None
+
+        def authorize(self, attempt: Any, **kwargs: Any) -> Any:
+            if self.cached is None:
+                self.cached = underlying.authorize(attempt, **kwargs)
+            return self.cached
+
+    middleware = PaloNexusLangChainMiddleware(
+        client=ReplayClient(),  # type: ignore[arg-type]
+        async_client=None,
+        tool_policies={
+            "inventory_read": LangChainActionPolicy(
+                service="inventory",
+                side_effect="read_only",
+            )
+        },
+        model_policies={},
+    )
+    calls = 0
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal calls
+        calls += 1
+        return ToolMessage(content="ok", tool_call_id=request.tool_call["id"])
+
+    middleware.wrap_tool_call(_tool_request(context=_context()), handler)
+    with pytest.raises(InvalidRequest):
+        middleware.wrap_tool_call(_tool_request(context=_context()), handler)
+    assert calls == 1
+
+
+def test_async_genuine_allow_from_different_attempt_is_rejected() -> None:
+    async def scenario() -> None:
+        engine = ScriptedEngine(ScriptedEngine.allow(), testing_only=True)
+        underlying = AsyncAuthorizationClient(
+            AsyncFakeTransport(engine, testing_only=True)
+        )
+
+        class ReplayAsyncClient:
+            authorization_client_kind = "async"
+            cached: Any = None
+
+            async def authorize(self, attempt: Any, **kwargs: Any) -> Any:
+                if self.cached is None:
+                    self.cached = await underlying.authorize(attempt, **kwargs)
+                return self.cached
+
+        middleware = PaloNexusLangChainMiddleware(
+            client=None,
+            async_client=ReplayAsyncClient(),  # type: ignore[arg-type]
+            tool_policies={
+                "inventory_read": LangChainActionPolicy(
+                    service="inventory",
+                    side_effect="read_only",
+                )
+            },
+            model_policies={},
+        )
+        calls = 0
+
+        async def handler(request: ToolCallRequest) -> ToolMessage:
+            nonlocal calls
+            calls += 1
+            return ToolMessage(
+                content="ok",
+                tool_call_id=request.tool_call["id"],
+            )
+
+        await middleware.awrap_tool_call(
+            _tool_request(context=_context()),
+            handler,
+        )
+        with pytest.raises(InvalidRequest):
+            await middleware.awrap_tool_call(
+                _tool_request(context=_context()),
+                handler,
+            )
+        assert calls == 1
+
+    asyncio.run(scenario())
 
 
 def test_swapped_sync_async_clients_are_rejected() -> None:
@@ -892,6 +988,198 @@ def test_implicit_nested_context_inherits_deadline_and_cancellation() -> None:
     assert seen == [(deadline, cancelled), (deadline, cancelled)]
 
 
+def test_explicit_nested_controls_clamp_and_compose_without_weakening() -> None:
+    engine = ScriptedEngine(
+        ScriptedEngine.allow(),
+        ScriptedEngine.allow(),
+        testing_only=True,
+    )
+    underlying = AuthorizationClient(FakeTransport(engine, testing_only=True))
+    seen: list[tuple[float | None, Any]] = []
+
+    class CaptureClient:
+        authorization_client_kind = "sync"
+
+        def authorize(self, attempt: Any, **kwargs: Any) -> Any:
+            seen.append((kwargs.get("deadline"), kwargs.get("cancelled")))
+            return underlying.authorize(attempt, **kwargs)
+
+    middleware = PaloNexusLangChainMiddleware(
+        client=CaptureClient(),  # type: ignore[arg-type]
+        async_client=None,
+        tool_policies={
+            "inventory_read": LangChainActionPolicy(
+                service="inventory",
+                side_effect="read_only",
+            )
+        },
+        model_policies={},
+    )
+    state = {"parent": False, "child": False}
+
+    def parent_cancelled() -> bool:
+        return state["parent"]
+
+    def child_cancelled() -> bool:
+        return state["child"]
+
+    parent_deadline = time.monotonic() + 20
+    child_deadline = parent_deadline - 5
+    parent_context = _context(
+        deadline=parent_deadline,
+        cancelled=parent_cancelled,
+    )
+    child_context = _context(
+        deadline=child_deadline,
+        cancelled=child_cancelled,
+    )
+
+    def outer(_: ToolCallRequest) -> ToolMessage:
+        return middleware.wrap_tool_call(
+            _tool_request(context=child_context),
+            lambda value: ToolMessage(
+                content="inner",
+                tool_call_id=value.tool_call["id"],
+            ),
+        )
+
+    middleware.wrap_tool_call(
+        _tool_request(context=parent_context),
+        outer,
+    )
+    assert seen[0] == (parent_deadline, parent_cancelled)
+    nested_deadline, nested_cancelled = seen[1]
+    assert nested_deadline == child_deadline
+    assert nested_cancelled is not parent_cancelled
+    assert nested_cancelled is not child_cancelled
+    assert nested_cancelled() is False
+    state["parent"] = True
+    assert nested_cancelled() is True
+
+
+def test_async_explicit_nested_controls_clamp_and_preserve_parent() -> None:
+    async def scenario() -> None:
+        engine = ScriptedEngine(
+            ScriptedEngine.allow(),
+            ScriptedEngine.allow(),
+            testing_only=True,
+        )
+        underlying = AsyncAuthorizationClient(
+            AsyncFakeTransport(engine, testing_only=True)
+        )
+        seen: list[tuple[float | None, Any]] = []
+
+        class CaptureAsyncClient:
+            authorization_client_kind = "async"
+
+            async def authorize(self, attempt: Any, **kwargs: Any) -> Any:
+                seen.append((kwargs.get("deadline"), kwargs.get("cancelled")))
+                return await underlying.authorize(attempt, **kwargs)
+
+        middleware = PaloNexusLangChainMiddleware(
+            client=None,
+            async_client=CaptureAsyncClient(),  # type: ignore[arg-type]
+            tool_policies={
+                "inventory_read": LangChainActionPolicy(
+                    service="inventory",
+                    side_effect="read_only",
+                )
+            },
+            model_policies={},
+        )
+
+        def parent_cancelled() -> bool:
+            return False
+
+        parent_deadline = time.monotonic() + 10
+
+        async def outer(_: ToolCallRequest) -> ToolMessage:
+            return await middleware.awrap_tool_call(
+                _tool_request(
+                    context=_context(
+                        deadline=parent_deadline + 10,
+                        cancelled=None,
+                    )
+                ),
+                lambda value: asyncio.sleep(
+                    0,
+                    result=ToolMessage(
+                        content="inner",
+                        tool_call_id=value.tool_call["id"],
+                    ),
+                ),
+            )
+
+        await middleware.awrap_tool_call(
+            _tool_request(
+                context=_context(
+                    deadline=parent_deadline,
+                    cancelled=parent_cancelled,
+                )
+            ),
+            outer,
+        )
+        assert seen == [
+            (parent_deadline, parent_cancelled),
+            (parent_deadline, parent_cancelled),
+        ]
+
+    asyncio.run(scenario())
+
+
+def test_parent_cancellation_firing_inside_sync_nesting_stops_inner_call() -> None:
+    state = {"cancelled": False}
+
+    def cancelled() -> bool:
+        return state["cancelled"]
+
+    middleware, engine = _middleware(
+        ScriptedEngine.allow(),
+    )
+
+    def outer(_: ToolCallRequest) -> ToolMessage:
+        state["cancelled"] = True
+        with pytest.raises(concurrent.futures.CancelledError):
+            middleware.wrap_tool_call(
+                _tool_request(context=_context(cancelled=None)),
+                lambda request: pytest.fail("inner handler executed"),
+            )
+        return ToolMessage(content="outer", tool_call_id="call-1")
+
+    middleware.wrap_tool_call(
+        _tool_request(context=_context(cancelled=cancelled)),
+        outer,
+    )
+    assert len(engine.recorded_calls) == 1
+
+
+def test_parent_cancellation_firing_inside_async_nesting_stops_inner_call() -> None:
+    async def scenario() -> None:
+        state = {"cancelled": False}
+
+        def cancelled() -> bool:
+            return state["cancelled"]
+
+        middleware, engine = _async_middleware(ScriptedEngine.allow())
+
+        async def outer(_: ToolCallRequest) -> ToolMessage:
+            state["cancelled"] = True
+            with pytest.raises(asyncio.CancelledError):
+                await middleware.awrap_tool_call(
+                    _tool_request(context=_context(cancelled=None)),
+                    lambda request: pytest.fail("inner handler executed"),
+                )
+            return ToolMessage(content="outer", tool_call_id="call-1")
+
+        await middleware.awrap_tool_call(
+            _tool_request(context=_context(cancelled=cancelled)),
+            outer,
+        )
+        assert len(engine.recorded_calls) == 1
+
+    asyncio.run(scenario())
+
+
 def test_composition_helpers_enforce_innermost_single_guard() -> None:
     middleware, _ = _middleware(ScriptedEngine.allow())
     other = AgentMiddleware()
@@ -913,7 +1201,7 @@ def test_composition_helpers_enforce_innermost_single_guard() -> None:
 def test_outer_model_substitution_is_seen_and_rejected_by_inner_guard() -> None:
     class SubstituteModel(AgentMiddleware[Any, Any]):
         def wrap_model_call(self, request: Any, handler: Any) -> Any:
-            replacement = FakeListChatModel(responses=["bad"], name="model-b")
+            replacement = FakeListChatModel(responses=["bad"], name="model-a")
             return handler(request.override(model=replacement))
 
     engine = ScriptedEngine(ScriptedEngine.allow(), testing_only=True)
@@ -925,12 +1213,12 @@ def test_outer_model_substitution_is_seen_and_rejected_by_inner_guard() -> None:
             "primary": LangChainActionPolicy(
                 service="model-runtime",
                 side_effect="external",
-                model_name="model-a",
             )
         },
     )
     agent = create_authorized_agent(
         model=FakeListChatModel(responses=["ok"], name="model-a"),
+        model_policy_key="primary",
         tools=[],
         authorization=authorization,
         middleware=(SubstituteModel(),),
