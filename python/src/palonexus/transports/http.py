@@ -11,7 +11,7 @@ import math
 import re
 import threading
 import time
-from collections.abc import Awaitable, Callable, Iterator
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass
 from datetime import date
 from itertools import zip_longest
@@ -557,45 +557,6 @@ def _validate_response_headers(
     return _header_value(headers, "retry-after", maximum=128)
 
 
-def _read_response_sync(
-    response: httpx.Response,
-    *,
-    maximum: int,
-) -> _HTTPResponse:
-    result: _HTTPResponse | None = None
-    transient = False
-    invalid = False
-    try:
-        retry_after = _validate_response_headers(response, maximum=maximum)
-        body = bytearray()
-        chunks: Iterator[bytes] | tuple[bytes, ...]
-        if response.is_stream_consumed:
-            chunks = (response.content,)
-        else:
-            chunks = response.iter_raw()
-        for chunk in chunks:
-            if len(body) + len(chunk) > maximum:
-                raise ValueError
-            body.extend(chunk)
-        result = _HTTPResponse(
-            status_code=response.status_code,
-            body=bytes(body),
-            retry_after=retry_after,
-        )
-    except (KeyboardInterrupt, SystemExit):
-        raise
-    except Exception:
-        if response.status_code in _TRANSIENT_STATUS:
-            transient = True
-        else:
-            invalid = True
-    if transient:
-        raise _TransientResponseError(response.status_code) from None
-    if invalid or result is None:
-        raise ValueError("invalid response") from None
-    return result
-
-
 async def _read_response_async(
     response: httpx.Response,
     *,
@@ -647,6 +608,201 @@ class _TransientResponseError(Exception):
     def __init__(self, status_code: int) -> None:
         self.status_code = status_code
         super().__init__("transient authorization response")
+
+
+class _RuntimeDeadlineExpired(Exception):
+    """Owned sync runtime reached its absolute request deadline."""
+
+
+class _RuntimeClosed(Exception):
+    """Owned sync runtime closed while a request was active."""
+
+
+class _AsyncNetworkRuntime:
+    """Own one AsyncClient and event loop for the synchronous public API.
+
+    The caller thread polls cancellation and an end-to-end deadline. On either
+    condition it cancels the HTTP coroutine and waits for its ``finally`` path
+    to close the response before returning. A cancellation-hostile private
+    test transport therefore blocks fail-closed instead of being abandoned as
+    background work; the production HTTPX transport is cancellation-aware.
+    """
+
+    __slots__ = (
+        "_client",
+        "_closed",
+        "_lock",
+        "_loop",
+        "_operations",
+        "_ready",
+        "_stopped",
+        "_thread",
+    )
+
+    _client: httpx.AsyncClient
+    _closed: bool
+    _lock: threading.RLock
+    _loop: asyncio.AbstractEventLoop | None
+    _operations: dict[
+        concurrent.futures.Future[_HTTPResponse],
+        threading.Event,
+    ]
+    _ready: threading.Event
+    _stopped: threading.Event
+    _thread: threading.Thread
+
+    def __init__(self, client: httpx.AsyncClient) -> None:
+        self._client = client
+        self._closed = False
+        self._lock = threading.RLock()
+        self._loop = None
+        self._operations = {}
+        self._ready = threading.Event()
+        self._stopped = threading.Event()
+        self._thread = threading.Thread(
+            target=self._serve,
+            name="palonexus-http-runtime",
+            daemon=True,
+        )
+        self._thread.start()
+        self._ready.wait()
+        if self._loop is None:
+            raise RuntimeError("authorization runtime is unavailable") from None
+
+    def _serve(self) -> None:
+        loop: asyncio.AbstractEventLoop | None = None
+        try:
+            loop = asyncio.new_event_loop()
+            asyncio.set_event_loop(loop)
+            with self._lock:
+                self._loop = loop
+            self._ready.set()
+            loop.run_forever()
+            pending = asyncio.all_tasks(loop)
+            for task in pending:
+                task.cancel()
+            if pending:
+                loop.run_until_complete(
+                    asyncio.gather(*pending, return_exceptions=True)
+                )
+        finally:
+            self._ready.set()
+            if loop is not None:
+                loop.close()
+            self._stopped.set()
+
+    async def _bounded(
+        self,
+        operation: Callable[[], Awaitable[_HTTPResponse]],
+        *,
+        remaining: float | None,
+        completed: threading.Event,
+    ) -> _HTTPResponse:
+        try:
+            if remaining is None:
+                return await operation()
+            timeout_scope = asyncio.timeout(remaining)
+            try:
+                async with timeout_scope:
+                    return await operation()
+            except TimeoutError:
+                if timeout_scope.expired():
+                    raise _RuntimeDeadlineExpired from None
+                raise
+        finally:
+            completed.set()
+
+    @staticmethod
+    def _cancel_and_drain(
+        future: concurrent.futures.Future[_HTTPResponse],
+        completed: threading.Event,
+    ) -> None:
+        future.cancel()
+        # Do not return with a response or handler still running in the owned
+        # loop. Production HTTPX cancellation completes this promptly.
+        completed.wait()
+        try:
+            future.result()
+        except BaseException:
+            pass
+
+    def run(
+        self,
+        operation: Callable[[], Awaitable[_HTTPResponse]],
+        *,
+        remaining: float | None,
+        cancelled: Callable[[], bool] | None,
+    ) -> _HTTPResponse:
+        completed = threading.Event()
+        with self._lock:
+            loop = self._loop
+            if self._closed or loop is None:
+                raise _RuntimeClosed from None
+            future = asyncio.run_coroutine_threadsafe(
+                self._bounded(
+                    operation,
+                    remaining=remaining,
+                    completed=completed,
+                ),
+                loop,
+            )
+            self._operations[future] = completed
+
+        wall_deadline = None if remaining is None else time.monotonic() + remaining
+        try:
+            while True:
+                if _cancel_requested(cancelled):
+                    self._cancel_and_drain(future, completed)
+                    _raise_sync_cancelled()
+                if wall_deadline is not None and time.monotonic() >= wall_deadline:
+                    self._cancel_and_drain(future, completed)
+                    raise _RuntimeDeadlineExpired from None
+                wait_for = _SLEEP_QUANTUM_SECONDS
+                if wall_deadline is not None:
+                    wait_for = max(
+                        0.0,
+                        min(wait_for, wall_deadline - time.monotonic()),
+                    )
+                try:
+                    return future.result(timeout=wait_for)
+                except TimeoutError:
+                    if future.done():
+                        return future.result()
+                except concurrent.futures.CancelledError:
+                    with self._lock:
+                        closed = self._closed
+                    if closed:
+                        raise _RuntimeClosed from None
+                    raise
+        finally:
+            with self._lock:
+                self._operations.pop(future, None)
+
+    def close(self) -> None:
+        owner = False
+        with self._lock:
+            if not self._closed:
+                self._closed = True
+                owner = True
+            loop = self._loop
+            operations = tuple(self._operations.items())
+        if not owner:
+            self._stopped.wait()
+            return
+        for future, completed in operations:
+            self._cancel_and_drain(future, completed)
+        if loop is not None and not loop.is_closed():
+            try:
+                closing = asyncio.run_coroutine_threadsafe(
+                    self._client.aclose(),
+                    loop,
+                )
+                closing.result()
+            except BaseException:
+                pass
+            loop.call_soon_threadsafe(loop.stop)
+        self._stopped.wait()
+        self._thread.join()
 
 
 def _response_result(
@@ -902,10 +1058,85 @@ async def _async_sleep(
         raise asyncio.CancelledError
 
 
+async def _await_with_controls(
+    operation: Awaitable[_HTTPResponse],
+    *,
+    remaining: float | None,
+    cancelled: Callable[[], bool] | None,
+) -> _HTTPResponse:
+    """Await one HTTP operation while enforcing callback and total deadline."""
+
+    task = asyncio.ensure_future(operation)
+    loop = asyncio.get_running_loop()
+    wall_deadline = None if remaining is None else loop.time() + remaining
+    try:
+        while not task.done():
+            if _cancel_requested(cancelled):
+                task.cancel()
+                await asyncio.gather(task, return_exceptions=True)
+                raise asyncio.CancelledError
+            wait_for = _SLEEP_QUANTUM_SECONDS
+            if wall_deadline is not None:
+                left = wall_deadline - loop.time()
+                if left <= 0:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    raise asyncio.CancelledError
+                wait_for = min(wait_for, left)
+            await asyncio.wait({task}, timeout=wait_for)
+        return await task
+    except asyncio.CancelledError:
+        task.cancel()
+        await asyncio.gather(task, return_exceptions=True)
+        raise
+
+
+async def _send_async_client(
+    client: httpx.AsyncClient,
+    config: HTTPTransportConfig,
+    attempt: _Attempt,
+    authorization_header: str,
+    timeout: httpx.Timeout,
+) -> _HTTPResponse:
+    """Send and fully drain one response on a cancellation-aware client."""
+
+    headers = {
+        "Accept": "application/json",
+        "Accept-Encoding": "identity",
+        "Authorization": authorization_header,
+        "Content-Type": "application/json",
+        "Idempotency-Key": attempt.idempotency_key,
+        "X-PaloNexus-Protocol-Version": "1",
+    }
+    outbound = client.build_request(
+        "POST",
+        config._endpoint,
+        headers=headers,
+        content=attempt.body,
+        timeout=timeout,
+    )
+    outbound.headers.pop("cookie", None)
+    response = await client.send(
+        outbound,
+        stream=True,
+        follow_redirects=False,
+    )
+    try:
+        return await _read_response_async(
+            response,
+            maximum=config.max_response_bytes,
+        )
+    finally:
+        try:
+            client.cookies.clear()
+        except Exception:
+            pass
+        await response.aclose()
+
+
 class HTTPAuthorizationTransport:
     """Synchronous, HTTPS-only PaloNexus decision transport."""
 
-    _client: httpx.Client
     _closed: bool
     _config: HTTPTransportConfig
     _credential_provider: SyncCredentialProvider
@@ -913,10 +1144,10 @@ class HTTPAuthorizationTransport:
     _lock: threading.RLock
     _monotonic: Callable[[], float]
     _retry_policy: RetryPolicy
+    _runtime: _AsyncNetworkRuntime
     _sleep: Callable[[float], None]
 
     __slots__ = (
-        "_client",
         "_closed",
         "_config",
         "_credential_provider",
@@ -924,6 +1155,7 @@ class HTTPAuthorizationTransport:
         "_lock",
         "_monotonic",
         "_retry_policy",
+        "_runtime",
         "_sleep",
     )
 
@@ -943,7 +1175,7 @@ class HTTPAuthorizationTransport:
             config=config,
             credential_provider=credential_provider,
             retry_policy=retry_policy,
-            client=httpx.Client(
+            client=httpx.AsyncClient(
                 verify=True,
                 timeout=config.timeouts._as_httpx(),
                 follow_redirects=False,
@@ -960,7 +1192,7 @@ class HTTPAuthorizationTransport:
         config: HTTPTransportConfig,
         credential_provider: SyncCredentialProvider,
         retry_policy: RetryPolicy,
-        client: httpx.Client,
+        client: httpx.AsyncClient,
         sleep: Callable[[float], None],
         monotonic: Callable[[], float],
         injected_sleep: bool,
@@ -968,7 +1200,7 @@ class HTTPAuthorizationTransport:
         object.__setattr__(self, "_config", config)
         object.__setattr__(self, "_credential_provider", credential_provider)
         object.__setattr__(self, "_retry_policy", retry_policy)
-        object.__setattr__(self, "_client", client)
+        object.__setattr__(self, "_runtime", _AsyncNetworkRuntime(client))
         object.__setattr__(self, "_sleep", sleep)
         object.__setattr__(self, "_monotonic", monotonic)
         object.__setattr__(self, "_injected_sleep", injected_sleep)
@@ -982,7 +1214,7 @@ class HTTPAuthorizationTransport:
         config: HTTPTransportConfig,
         credential_provider: SyncCredentialProvider,
         retry_policy: RetryPolicy,
-        client: httpx.Client,
+        client: httpx.AsyncClient,
         sleep: Callable[[float], None] | None = None,
         monotonic: Callable[[], float] = time.monotonic,
     ) -> Self:
@@ -1010,38 +1242,21 @@ class HTTPAuthorizationTransport:
         attempt: _Attempt,
         authorization_header: str,
         timeout: httpx.Timeout,
+        *,
+        remaining: float | None,
+        cancelled: Callable[[], bool] | None,
     ) -> _HTTPResponse:
-        headers = {
-            "Accept": "application/json",
-            "Accept-Encoding": "identity",
-            "Authorization": authorization_header,
-            "Content-Type": "application/json",
-            "Idempotency-Key": attempt.idempotency_key,
-            "X-PaloNexus-Protocol-Version": "1",
-        }
-        outbound = self._client.build_request(
-            "POST",
-            self._config._endpoint,
-            headers=headers,
-            content=attempt.body,
-            timeout=timeout,
+        return self._runtime.run(
+            lambda: _send_async_client(
+                self._runtime._client,
+                self._config,
+                attempt,
+                authorization_header,
+                timeout,
+            ),
+            remaining=remaining,
+            cancelled=cancelled,
         )
-        # Decision-service cookies are never identity. Removing Cookie after
-        # client request construction prevents a prior Set-Cookie response
-        # from becoming an implicit fallback caller on a retry.
-        outbound.headers.pop("cookie", None)
-        response = self._client.send(
-            outbound,
-            stream=True,
-            follow_redirects=False,
-        )
-        try:
-            return _read_response_sync(
-                response,
-                maximum=self._config.max_response_bytes,
-            )
-        finally:
-            response.close()
 
     def decide(
         self,
@@ -1090,6 +1305,8 @@ class HTTPAuthorizationTransport:
                         self._config.timeouts,
                         remaining_before_io,
                     ),
+                    remaining=remaining_before_io,
+                    cancelled=cancelled,
                 )
                 if _cancel_requested(cancelled):
                     _raise_sync_cancelled()
@@ -1106,6 +1323,10 @@ class HTTPAuthorizationTransport:
                 failure = result
             except _TransientResponseError as error:
                 failure = _status_failure(error.status_code)
+            except _RuntimeDeadlineExpired:
+                _raise_sync_cancelled()
+            except _RuntimeClosed:
+                raise _unavailable(request) from None
             except httpx.DecodingError:
                 invalid_response = True
             except httpx.RequestError as error:
@@ -1149,7 +1370,7 @@ class HTTPAuthorizationTransport:
                 return
             object.__setattr__(self, "_closed", True)
             try:
-                self._client.close()
+                self._runtime.close()
             except Exception:
                 pass
 
@@ -1280,34 +1501,13 @@ class AsyncHTTPAuthorizationTransport:
         authorization_header: str,
         timeout: httpx.Timeout,
     ) -> _HTTPResponse:
-        headers = {
-            "Accept": "application/json",
-            "Accept-Encoding": "identity",
-            "Authorization": authorization_header,
-            "Content-Type": "application/json",
-            "Idempotency-Key": attempt.idempotency_key,
-            "X-PaloNexus-Protocol-Version": "1",
-        }
-        outbound = self._client.build_request(
-            "POST",
-            self._config._endpoint,
-            headers=headers,
-            content=attempt.body,
-            timeout=timeout,
+        return await _send_async_client(
+            self._client,
+            self._config,
+            attempt,
+            authorization_header,
+            timeout,
         )
-        outbound.headers.pop("cookie", None)
-        response = await self._client.send(
-            outbound,
-            stream=True,
-            follow_redirects=False,
-        )
-        try:
-            return await _read_response_async(
-                response,
-                maximum=self._config.max_response_bytes,
-            )
-        finally:
-            await response.aclose()
 
     async def decide(
         self,
@@ -1349,13 +1549,17 @@ class AsyncHTTPAuthorizationTransport:
             failure: _RetryableFailure
             invalid_response = False
             try:
-                response = await self._send(
-                    attempt,
-                    authorization_header,
-                    _request_timeout(
-                        self._config.timeouts,
-                        remaining_before_io,
+                response = await _await_with_controls(
+                    self._send(
+                        attempt,
+                        authorization_header,
+                        _request_timeout(
+                            self._config.timeouts,
+                            remaining_before_io,
+                        ),
                     ),
+                    remaining=remaining_before_io,
+                    cancelled=cancelled,
                 )
                 if _cancel_requested(cancelled):
                     raise asyncio.CancelledError

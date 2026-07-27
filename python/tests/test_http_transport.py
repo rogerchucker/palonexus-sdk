@@ -7,6 +7,7 @@ import asyncio
 import concurrent.futures
 import inspect
 import json
+import threading
 import time
 from collections.abc import Callable
 from datetime import UTC, datetime, timedelta
@@ -94,6 +95,29 @@ class _AsyncProvider:
         )
 
 
+class _SlowAsyncStream(httpx.AsyncByteStream):
+    """Async raw stream with cancellation-visible cleanup."""
+
+    def __init__(self, body: bytes, *, chunks: int, interval: float) -> None:
+        chunk_size = max(1, (len(body) + chunks - 1) // chunks)
+        self._parts = tuple(
+            body[index : index + chunk_size]
+            for index in range(0, len(body), chunk_size)
+        )
+        self._interval = interval
+        self.closed = asyncio.Event()
+        self.emitted = 0
+
+    async def __aiter__(self) -> Any:
+        for part in self._parts:
+            await asyncio.sleep(self._interval)
+            self.emitted += 1
+            yield part
+
+    async def aclose(self) -> None:
+        self.closed.set()
+
+
 def _request() -> wire.ActionRequest:
     return wire.parse_action_json(ACTION_VECTOR.read_bytes())
 
@@ -141,8 +165,11 @@ def _sync_transport(
     sleep: Callable[[float], None] | None = None,
     config: HTTPTransportConfig | None = None,
 ) -> HTTPAuthorizationTransport:
-    client = httpx.Client(
-        transport=httpx.MockTransport(handler),
+    async def async_handler(request: httpx.Request) -> httpx.Response:
+        return handler(request)
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(async_handler),
         follow_redirects=False,
         trust_env=False,
     )
@@ -660,6 +687,201 @@ def test_network_failures_become_safe_authorization_unavailable(
     assert captured.value.__context__ is None
 
 
+@pytest.mark.parametrize(
+    ("body", "headers"),
+    [
+        (b"{not-json", {"Content-Type": "application/json"}),
+        (
+            b'{"schemaVersion":"1","schemaVersion":"1"}',
+            {"Content-Type": "application/json"},
+        ),
+        (b"\xff", {"Content-Type": "application/json"}),
+        (_decision_bytes(_request()), {"Content-Type": "text/plain"}),
+        (
+            _decision_bytes(_request()),
+            {"Content-Type": "application/json", "Content-Encoding": "gzip"},
+        ),
+        (
+            _decision_bytes(_request()),
+            {
+                "Content-Type": "application/json",
+                "Content-Length": str(wire.MAX_WIRE_BYTES + 1),
+            },
+        ),
+    ],
+)
+def test_async_malformed_oversize_and_metadata_fail_closed(
+    body: bytes,
+    headers: dict[str, str],
+) -> None:
+    request = _request()
+
+    async def exercise() -> None:
+        async def handler(incoming: httpx.Request) -> httpx.Response:
+            del incoming
+            return httpx.Response(200, headers=headers, content=body)
+
+        transport = _async_transport(handler)
+        try:
+            with pytest.raises(InvalidDecision) as captured:
+                await transport.decide(
+                    request,
+                    client_scope_hash=_scope_hash(request),
+                )
+        finally:
+            await transport.aclose()
+        assert captured.value.__cause__ is None
+        assert captured.value.__context__ is None
+
+    asyncio.run(exercise())
+
+
+@pytest.mark.parametrize(
+    ("kind", "expected"),
+    [
+        ("binding", InvalidDecision),
+        ("redirect", InvalidDecision),
+        ("network", AuthorizationUnavailable),
+    ],
+)
+def test_async_binding_redirect_and_network_fail_closed(
+    kind: str,
+    expected: type[Exception],
+) -> None:
+    request = _request()
+
+    async def exercise() -> None:
+        async def handler(incoming: httpx.Request) -> httpx.Response:
+            del incoming
+            if kind == "binding":
+                document = _decision_document(request)
+                document["requestId"] = "req_01J5ABCDEFGHJKMNPQRSTVWXY9"
+                return httpx.Response(200, json=document)
+            if kind == "redirect":
+                return httpx.Response(
+                    307,
+                    headers={"Location": "http://evil.test/stolen"},
+                )
+            raise httpx.ReadTimeout("secret https://internal.test")
+
+        transport = _async_transport(handler)
+        try:
+            with pytest.raises(expected) as captured:
+                await transport.decide(
+                    request,
+                    client_scope_hash=_scope_hash(request),
+                )
+        finally:
+            await transport.aclose()
+        rendered = f"{captured.value!s} {captured.value!r}"
+        assert "internal.test" not in rendered
+        assert "evil.test" not in rendered
+        assert captured.value.__cause__ is None
+        assert captured.value.__context__ is None
+
+    asyncio.run(exercise())
+
+
+def test_async_credential_failure_makes_no_request_and_retry_reuses_attempt() -> None:
+    request = _request()
+
+    async def exercise() -> None:
+        calls = 0
+
+        async def forbidden(incoming: httpx.Request) -> httpx.Response:
+            nonlocal calls
+            del incoming
+            calls += 1
+            return _ok_response(request)
+
+        failed = _async_transport(
+            forbidden,
+            provider=_AsyncProvider(failure=RuntimeError("provider-secret")),
+        )
+        try:
+            with pytest.raises(AuthenticationFailed) as captured:
+                await failed.decide(
+                    request,
+                    client_scope_hash=_scope_hash(request),
+                )
+        finally:
+            await failed.aclose()
+        assert calls == 0
+        assert "provider-secret" not in str(captured.value)
+        assert captured.value.__context__ is None
+
+        attempts: list[tuple[bytes, str, str | None]] = []
+
+        async def retrying(incoming: httpx.Request) -> httpx.Response:
+            attempts.append(
+                (
+                    incoming.content,
+                    incoming.headers["idempotency-key"],
+                    incoming.headers.get("cookie"),
+                )
+            )
+            if len(attempts) == 1:
+                return httpx.Response(
+                    503,
+                    headers={"Retry-After": "0", "Set-Cookie": "identity=bad"},
+                )
+            return _ok_response(request)
+
+        retry = RetryPolicy._for_testing(
+            random_source=lambda: 0.5,
+            max_attempts=2,
+            initial_delay=0.0,
+        )
+        transport = _async_transport(retrying, retry_policy=retry)
+        try:
+            decision = await transport.decide(
+                request,
+                client_scope_hash=_scope_hash(request),
+            )
+        finally:
+            await transport.aclose()
+        assert decision.outcome is wire.DecisionOutcome.ALLOW
+        assert attempts == [attempts[0], attempts[0]]
+
+    asyncio.run(exercise())
+
+
+def test_async_protocol_error_binding_maps_only_a_valid_safe_error() -> None:
+    request = _request()
+
+    async def exercise() -> None:
+        document = json.loads(ERROR_VECTOR.read_text(encoding="utf-8"))
+        document.update(
+            {
+                "code": "authentication_failed",
+                "safeMessage": "Authentication failed.",
+                "retryable": False,
+                "actionId": str(request.action_id),
+                "requestId": str(request.request_id),
+                "correlationId": str(request.correlation_id),
+            }
+        )
+
+        async def handler(incoming: httpx.Request) -> httpx.Response:
+            del incoming
+            return httpx.Response(401, json=document)
+
+        transport = _async_transport(handler)
+        try:
+            with pytest.raises(AuthenticationFailed) as captured:
+                await transport.decide(
+                    request,
+                    client_scope_hash=_scope_hash(request),
+                )
+        finally:
+            await transport.aclose()
+        assert captured.value.request_id == str(request.request_id)
+        assert captured.value.correlation_id == str(request.correlation_id)
+        assert captured.value.__context__ is None
+
+    asyncio.run(exercise())
+
+
 def test_sync_cancellation_stops_before_credentials_or_network() -> None:
     request = _request()
     provider = _SyncProvider()
@@ -715,8 +937,11 @@ def test_deadline_bounds_each_http_timeout_and_is_rechecked_after_io() -> None:
         seen_timeout.update(incoming.extensions["timeout"])
         return _ok_response(request)
 
-    client = httpx.Client(
-        transport=httpx.MockTransport(handler),
+    async def async_handler(incoming: httpx.Request) -> httpx.Response:
+        return handler(incoming)
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(async_handler),
         follow_redirects=False,
         trust_env=False,
     )
@@ -744,6 +969,74 @@ def test_deadline_bounds_each_http_timeout_and_is_rechecked_after_io() -> None:
     }
 
 
+def test_sync_absolute_deadline_stops_a_trickled_body_and_closes_stream() -> None:
+    request = _request()
+    body = _decision_bytes(request)
+    stream = _SlowAsyncStream(body, chunks=20, interval=0.015)
+
+    def handler(incoming: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            stream=stream,
+        )
+
+    transport = _sync_transport(handler)
+    started = time.monotonic()
+    try:
+        with pytest.raises(concurrent.futures.CancelledError):
+            transport.decide(
+                request,
+                client_scope_hash=_scope_hash(request),
+                deadline=started + 0.04,
+            )
+    finally:
+        transport.close()
+    elapsed = time.monotonic() - started
+    assert elapsed < 0.15
+    assert stream.emitted < 20
+    assert stream.closed.is_set()
+
+
+def test_sync_deadline_cancels_slow_headers_and_close_joins_runtime_thread() -> None:
+    request = _request()
+    handler_cancelled = threading.Event()
+
+    async def handler(incoming: httpx.Request) -> httpx.Response:
+        del incoming
+        try:
+            await asyncio.Event().wait()
+        finally:
+            handler_cancelled.set()
+        return _ok_response(request)
+
+    client = httpx.AsyncClient(
+        transport=httpx.MockTransport(handler),
+        follow_redirects=False,
+        trust_env=False,
+    )
+    transport = HTTPAuthorizationTransport._for_testing(
+        config=_config(),
+        credential_provider=_SyncProvider(),
+        retry_policy=RetryPolicy(max_attempts=1),
+        client=client,
+    )
+    runtime_thread = transport._runtime._thread
+    started = time.monotonic()
+    try:
+        with pytest.raises(concurrent.futures.CancelledError):
+            transport.decide(
+                request,
+                client_scope_hash=_scope_hash(request),
+                deadline=started + 0.03,
+            )
+        assert handler_cancelled.wait(timeout=0.05)
+    finally:
+        transport.close()
+    assert time.monotonic() - started < 0.15
+    assert not runtime_thread.is_alive()
+
+
 def test_async_task_cancellation_propagates_promptly() -> None:
     request = _request()
     started = asyncio.Event()
@@ -767,6 +1060,113 @@ def test_async_task_cancellation_propagates_promptly() -> None:
             with pytest.raises(asyncio.CancelledError):
                 await asyncio.wait_for(pending, timeout=1)
         finally:
+            await transport.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_async_absolute_deadline_cancels_slow_headers_and_drains_handler() -> None:
+    request = _request()
+    handler_started = asyncio.Event()
+    handler_cancelled = asyncio.Event()
+
+    async def handler(incoming: httpx.Request) -> httpx.Response:
+        handler_started.set()
+        try:
+            await asyncio.Event().wait()
+        finally:
+            handler_cancelled.set()
+        return _ok_response(request)
+
+    async def exercise() -> None:
+        transport = _async_transport(handler)
+        started = time.monotonic()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(
+                    transport.decide(
+                        request,
+                        client_scope_hash=_scope_hash(request),
+                        deadline=started + 0.03,
+                    ),
+                    timeout=0.2,
+                )
+            await asyncio.wait_for(handler_cancelled.wait(), timeout=0.05)
+            assert time.monotonic() - started < 0.12
+        finally:
+            await transport.aclose()
+
+    asyncio.run(exercise())
+
+
+def test_async_absolute_deadline_stops_trickle_and_closes_stream() -> None:
+    request = _request()
+    stream = _SlowAsyncStream(
+        _decision_bytes(request),
+        chunks=20,
+        interval=0.015,
+    )
+
+    async def handler(incoming: httpx.Request) -> httpx.Response:
+        return httpx.Response(
+            200,
+            headers={"Content-Type": "application/json"},
+            stream=stream,
+        )
+
+    async def exercise() -> None:
+        transport = _async_transport(handler)
+        started = time.monotonic()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await transport.decide(
+                    request,
+                    client_scope_hash=_scope_hash(request),
+                    deadline=started + 0.04,
+                )
+        finally:
+            await transport.aclose()
+        assert time.monotonic() - started < 0.15
+        assert stream.emitted < 20
+        assert stream.closed.is_set()
+
+    asyncio.run(exercise())
+
+
+def test_async_callback_cancels_inflight_headers_and_drains_handler() -> None:
+    request = _request()
+
+    async def exercise() -> None:
+        handler_started = asyncio.Event()
+        handler_cancelled = asyncio.Event()
+        cancellation = False
+
+        async def handler(incoming: httpx.Request) -> httpx.Response:
+            del incoming
+            handler_started.set()
+            try:
+                await asyncio.Event().wait()
+            finally:
+                handler_cancelled.set()
+            return _ok_response(request)
+
+        transport = _async_transport(handler)
+        pending = asyncio.create_task(
+            transport.decide(
+                request,
+                client_scope_hash=_scope_hash(request),
+                cancelled=lambda: cancellation,
+            )
+        )
+        try:
+            await asyncio.wait_for(handler_started.wait(), timeout=0.1)
+            cancellation = True
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(pending, timeout=0.15)
+            await asyncio.wait_for(handler_cancelled.wait(), timeout=0.05)
+        finally:
+            pending.cancel()
+            await asyncio.gather(pending, return_exceptions=True)
             await transport.aclose()
 
     asyncio.run(exercise())
@@ -807,26 +1207,24 @@ def test_async_close_and_context_management_are_idempotent_and_fail_closed() -> 
 def test_public_clients_force_tls_verification_and_ignore_proxy_environment(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    captured_sync: dict[str, Any] = {}
-    captured_async: dict[str, Any] = {}
-    real_sync = httpx.Client
+    captured_clients: list[dict[str, Any]] = []
     real_async = httpx.AsyncClient
 
-    def sync_factory(**kwargs: Any) -> httpx.Client:
-        captured_sync.update(kwargs)
-        return real_sync(
-            transport=httpx.MockTransport(lambda request: httpx.Response(500)),
-            trust_env=False,
-        )
+    def forbidden_sync_factory(**kwargs: Any) -> Any:
+        del kwargs
+        raise AssertionError("sync HTTPX cannot enforce a total deadline")
 
     def async_factory(**kwargs: Any) -> httpx.AsyncClient:
-        captured_async.update(kwargs)
+        captured_clients.append(dict(kwargs))
         return real_async(
             transport=httpx.MockTransport(lambda request: httpx.Response(500)),
             trust_env=False,
         )
 
-    monkeypatch.setattr("palonexus.transports.http.httpx.Client", sync_factory)
+    monkeypatch.setattr(
+        "palonexus.transports.http.httpx.Client",
+        forbidden_sync_factory,
+    )
     monkeypatch.setattr(
         "palonexus.transports.http.httpx.AsyncClient",
         async_factory,
@@ -847,7 +1245,8 @@ def test_public_clients_force_tls_verification_and_ignore_proxy_environment(
     )
     sync.close()
     asyncio.run(async_transport.aclose())
-    for captured in (captured_sync, captured_async):
+    assert len(captured_clients) == 2
+    for captured in captured_clients:
         assert captured["verify"] is True
         assert captured["trust_env"] is False
         assert captured["follow_redirects"] is False
