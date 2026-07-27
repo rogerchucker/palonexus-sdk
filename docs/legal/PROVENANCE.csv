@@ -220,3 +220,17 @@ guard/internal/decision/client_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard
 guard/internal/decision/errors.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/decision/errors.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/guard/check.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/guard/check.go,PaloNexus,yes,new,MIT,rogerchucker
 guard/internal/guard/check_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/guard/check_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/socket/fifo_unix_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/socket/fifo_unix_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/socket/fuzz_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/socket/fuzz_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/socket/peer_darwin.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/socket/peer_darwin.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/socket/peer_linux.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/socket/peer_linux.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/socket/peer_other_unix.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/socket/peer_other_unix.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/socket/peer_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/socket/peer_test.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/socket/peer_unix.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/socket/peer_unix.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/socket/rename_darwin.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/socket/rename_darwin.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/socket/rename_linux.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/socket/rename_linux.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/socket/rename_other_unix.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/socket/rename_other_unix.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/socket/runtime_unix.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/socket/runtime_unix.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/socket/runtime_unsupported.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/socket/runtime_unsupported.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/socket/server.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/socket/server.go,PaloNexus,yes,new,MIT,rogerchucker
+guard/internal/socket/server_test.go,rogerchucker/palonexus-sdk,WORKTREE,guard/internal/socket/server_test.go,PaloNexus,yes,new,MIT,rogerchucker
