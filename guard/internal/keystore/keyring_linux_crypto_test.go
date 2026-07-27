@@ -2,6 +2,7 @@ package keystore
 
 import (
 	"bytes"
+	"crypto/aes"
 	"math/big"
 	"testing"
 )
@@ -21,6 +22,27 @@ func TestLinuxDecryptRejectsMalformedAndNeverReturnsEmptySuccess(t *testing.T) {
 		plaintext, err := decryptLinuxSecret(key, input.iv, input.ciphertext)
 		if err == nil || len(plaintext) != 0 {
 			t.Fatalf("decrypt malformed = %x, %v", plaintext, err)
+		}
+	}
+}
+
+func TestLinuxWireBoundsAndContentTypes(t *testing.T) {
+	key := bytes.Repeat([]byte{1}, 16)
+	if value, err := decryptLinuxSecret(key, bytes.Repeat([]byte{2}, 17), bytes.Repeat([]byte{3}, 16)); err == nil || value != nil {
+		t.Fatalf("oversized parameters = %x, %v", value, err)
+	}
+	if value, err := decryptLinuxSecret(key, bytes.Repeat([]byte{2}, 16),
+		bytes.Repeat([]byte{3}, MaxSecretBytes+2*aes.BlockSize)); err == nil || value != nil {
+		t.Fatalf("oversized ciphertext = %x, %v", value, err)
+	}
+	for _, value := range []string{"text/plain", "text/plain; charset=utf-8", "TEXT/PLAIN;CHARSET=UTF8"} {
+		if !allowedLinuxContentType(value) {
+			t.Fatalf("rejected %q", value)
+		}
+	}
+	for _, value := range []string{"application/octet-stream", "text/html", ""} {
+		if allowedLinuxContentType(value) {
+			t.Fatalf("accepted %q", value)
 		}
 	}
 }

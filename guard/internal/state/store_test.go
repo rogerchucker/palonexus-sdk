@@ -274,6 +274,43 @@ func TestLogoutDeletesCorruptScopedRecordsAndIgnoresJunk(t *testing.T) {
 	}
 }
 
+func TestCleanupTempsUsesIndependentDirectoryOffset(t *testing.T) {
+	store := newTestStore(t)
+	impl := store.impl.(*unixStore)
+	first := ".state-tmp-11111111111111111111111111111111"
+	second := ".state-tmp-22222222222222222222222222222222"
+	writeAnchoredTestRecord(t, store, first, []byte("first"))
+	if err := impl.cleanupTemps(); err != nil {
+		t.Fatal(err)
+	}
+	writeAnchoredTestRecord(t, store, second, []byte("second"))
+	if err := impl.cleanupTemps(); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Fstatat(impl.rootFD, second, &unix.Stat_t{}, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
+		t.Fatalf("later orphan survived cleanup: %v", err)
+	}
+}
+
+func TestLogoutPurgesB379LegacyStateWithoutDecodingPayload(t *testing.T) {
+	store := newTestStore(t)
+	binding := Binding{Tenant: "tenant", Account: "account"}
+	for _, kind := range []Kind{KindRouting, KindSession, KindReconciliation} {
+		document := []byte(`{"version":1,"tenant":"tenant","account":"account","kind":"` + string(kind) +
+			`","payload":{"contentType":"application/octet-stream","value":"opaque"}}`)
+		writeAnchoredTestRecord(t, store, legacyRecordName(binding, kind), document)
+	}
+	if err := store.DeleteAccount(context.Background(), binding); err != nil {
+		t.Fatal(err)
+	}
+	for _, kind := range []Kind{KindRouting, KindSession, KindReconciliation} {
+		if err := unix.Fstatat(store.impl.(*unixStore).rootFD, legacyRecordName(binding, kind),
+			&unix.Stat_t{}, unix.AT_SYMLINK_NOFOLLOW); !errors.Is(err, unix.ENOENT) {
+			t.Fatalf("legacy %s survived: %v", kind, err)
+		}
+	}
+}
+
 func TestStoreSerializesAcrossProcesses(t *testing.T) {
 	root := filepath.Join(canonicalTempDir(t), "state")
 	store, err := New(root)

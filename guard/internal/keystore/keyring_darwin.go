@@ -12,7 +12,6 @@ import "C"
 import (
 	"context"
 	"errors"
-	"sync"
 
 	keychain "github.com/keybase/go-keychain"
 )
@@ -95,6 +94,10 @@ func (b *darwinBackend) Get(ctx context.Context, service, account string) ([]byt
 	}
 	if value == nil {
 		return nil, ErrUnavailable
+	}
+	if err := ctx.Err(); err != nil {
+		Zero(value)
+		return nil, err
 	}
 	return value, nil
 }
@@ -199,14 +202,19 @@ func nativeDarwinError(err error) error {
 	}
 }
 
-var darwinInteractionMu sync.Mutex
+var darwinInteractionGate = func() chan struct{} {
+	gate := make(chan struct{}, 1)
+	gate <- struct{}{}
+	return gate
+}()
 
 func withInteractionDisabled(ctx context.Context, operation func() error) error {
-	if err := ctx.Err(); err != nil {
-		return err
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-darwinInteractionGate:
 	}
-	darwinInteractionMu.Lock()
-	defer darwinInteractionMu.Unlock()
+	defer func() { darwinInteractionGate <- struct{}{} }()
 	var previous C.Boolean
 	if status := C.SecKeychainGetUserInteractionAllowed(&previous); status != 0 {
 		return ErrUnavailable
@@ -218,9 +226,5 @@ func withInteractionDisabled(ctx context.Context, operation func() error) error 
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	err := operation()
-	if err != nil {
-		return err
-	}
-	return ctx.Err()
+	return operation()
 }

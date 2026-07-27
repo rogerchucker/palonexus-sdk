@@ -146,6 +146,18 @@ func (s *unixStore) GetMetadata(ctx context.Context, binding Binding, kind Kind)
 	err := s.withLock(ctx, func() error {
 		name, _ := s.recordName(binding, kind)
 		document, err := s.readRaw(name)
+		if errors.Is(err, ErrNotFound) {
+			purgeErr := unlinkRegularAt(s.rootFD, legacyRecordName(binding, kind))
+			if purgeErr != nil && !errors.Is(purgeErr, ErrNotFound) {
+				return purgeErr
+			}
+			if purgeErr == nil {
+				if syncErr := syncRoot(s.rootFD); syncErr != nil {
+					return syncErr
+				}
+			}
+			return ErrNotFound
+		}
 		if err != nil {
 			return err
 		}
@@ -179,6 +191,10 @@ func (s *unixStore) DeleteAccount(ctx context.Context, binding Binding) error {
 		for _, kind := range []Kind{KindRouting, KindSession, KindReconciliation} {
 			name, _ := s.recordName(binding, kind)
 			err := unlinkRegularAt(s.rootFD, name)
+			if err != nil && !errors.Is(err, ErrNotFound) {
+				return err
+			}
+			err = unlinkRegularAt(s.rootFD, legacyRecordName(binding, kind))
 			if err != nil && !errors.Is(err, ErrNotFound) {
 				return err
 			}
@@ -376,7 +392,7 @@ func decodeAndMigrate(document []byte) (wireEnvelope, bool, error) {
 }
 
 func (s *unixStore) cleanupTemps() error {
-	duplicate, err := unix.Dup(s.rootFD)
+	duplicate, err := unix.Openat(s.rootFD, ".", unix.O_RDONLY|unix.O_DIRECTORY|unix.O_CLOEXEC|unix.O_NOFOLLOW, 0)
 	if err != nil {
 		return ErrUnsafePath
 	}
@@ -395,6 +411,11 @@ func (s *unixStore) cleanupTemps() error {
 		}
 	}
 	return nil
+}
+
+func legacyRecordName(binding Binding, kind Kind) string {
+	sum := sha256.Sum256([]byte(binding.Tenant + "\x00" + binding.Account + "\x00" + string(kind)))
+	return "state-" + hex.EncodeToString(sum[:]) + ".json"
 }
 
 func validateDirectoryFD(fd int) error {

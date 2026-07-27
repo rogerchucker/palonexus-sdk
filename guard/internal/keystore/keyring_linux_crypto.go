@@ -4,12 +4,23 @@ import (
 	"crypto/aes"
 	"crypto/cipher"
 	"math/big"
+	"strings"
 )
+
+func allowedLinuxContentType(value string) bool {
+	normalized := strings.ToLower(strings.ReplaceAll(strings.TrimSpace(value), " ", ""))
+	switch normalized {
+	case "text/plain", "text/plain;charset=utf-8", "text/plain;charset=utf8", "text/plain;charset=us-ascii":
+		return true
+	default:
+		return false
+	}
+}
 
 func decryptLinuxSecret(key, iv, ciphertext []byte) ([]byte, error) {
 	block, err := aes.NewCipher(key)
 	if err != nil || len(iv) != aes.BlockSize || len(ciphertext) < aes.BlockSize ||
-		len(ciphertext)%aes.BlockSize != 0 {
+		len(ciphertext)%aes.BlockSize != 0 || len(ciphertext) > MaxSecretBytes+aes.BlockSize {
 		return nil, errLinuxMalformedSecret
 	}
 	padded := append([]byte(nil), ciphertext...)
@@ -21,7 +32,8 @@ func decryptLinuxSecret(key, iv, ciphertext []byte) ([]byte, error) {
 	}
 	result := append([]byte(nil), plaintext...)
 	Zero(padded)
-	if len(result) == 0 {
+	if len(result) == 0 || len(result) > MaxSecretBytes {
+		Zero(result)
 		return nil, errLinuxMalformedSecret
 	}
 	return result, nil

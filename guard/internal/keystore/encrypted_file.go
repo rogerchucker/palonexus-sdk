@@ -15,9 +15,15 @@ type encryptedFiles interface {
 	Delete(context.Context, string) error
 }
 
+const encryptedDocumentVersionBytes = 1
+
 type encryptedFileBackend struct {
 	aead  cipher.AEAD
 	files encryptedFiles
+}
+
+func (b *encryptedFileBackend) maxDocumentBytes() int {
+	return encryptedDocumentVersionBytes + b.aead.NonceSize() + MaxSecretBytes + b.aead.Overhead()
 }
 
 func newEncryptedFileBackend(options EncryptedFileOptions) (Backend, error) {
@@ -60,6 +66,9 @@ func (b *encryptedFileBackend) Get(ctx context.Context, service, account string)
 		return nil, err
 	}
 	defer Zero(document)
+	if len(document) > b.maxDocumentBytes() {
+		return nil, ErrUnavailable
+	}
 	if len(document) < 1+b.aead.NonceSize() || document[0] != 1 {
 		return nil, ErrUnavailable
 	}

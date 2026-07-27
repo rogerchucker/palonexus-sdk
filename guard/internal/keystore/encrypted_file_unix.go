@@ -19,6 +19,8 @@ import (
 
 var encryptedRecordName = regexp.MustCompile(`^credential-[0-9a-f]{64}\.enc$`)
 
+const maxEncryptedDocumentBytes = encryptedDocumentVersionBytes + 12 + MaxSecretBytes + 16
+
 type unixEncryptedFiles struct {
 	rootFD int
 	gate   chan struct{}
@@ -151,8 +153,13 @@ func (f *unixEncryptedFiles) Get(ctx context.Context, name string) ([]byte, erro
 		}
 		file := os.NewFile(uintptr(fd), name)
 		defer file.Close()
-		result, err = io.ReadAll(io.LimitReader(file, 1<<20))
+		result, err = io.ReadAll(io.LimitReader(file, maxEncryptedDocumentBytes+1))
 		if err != nil {
+			return ErrUnavailable
+		}
+		if len(result) > maxEncryptedDocumentBytes {
+			Zero(result)
+			result = nil
 			return ErrUnavailable
 		}
 		if err := ctx.Err(); err != nil {

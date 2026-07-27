@@ -158,7 +158,9 @@ func (f *nativeLinuxFacade) Get(ctx context.Context, item linuxItem) ([]byte, er
 	}
 	defer Zero(secret.Parameters)
 	defer Zero(secret.Value)
-	if secret.Session != session.path || secret.ContentType != "text/plain" {
+	if secret.Session != session.path || !allowedLinuxContentType(secret.ContentType) ||
+		len(secret.Parameters) != aes.BlockSize || len(secret.Value) == 0 ||
+		len(secret.Value)%aes.BlockSize != 0 || len(secret.Value) > MaxSecretBytes+aes.BlockSize {
 		return nil, errLinuxMalformedSecret
 	}
 	return session.decrypt(secret)

@@ -85,6 +85,9 @@ func (s *Store) Get(ctx context.Context, key Key) ([]byte, error) {
 	}
 	temporary, err := s.backend.Get(ctx, s.service, accountName(key))
 	if err != nil {
+		if errors.Is(err, ErrNotFound) {
+			_ = s.backend.Delete(ctx, s.service, legacyAccountName(key))
+		}
 		return nil, sanitizeBackendError(err)
 	}
 	defer Zero(temporary)
@@ -109,8 +112,13 @@ func (s *Store) Delete(ctx context.Context, key Key) error {
 	if err := s.backend.Delete(ctx, s.service, accountName(key)); err != nil {
 		return sanitizeBackendError(err)
 	}
+	if err := s.backend.Delete(ctx, s.service, legacyAccountName(key)); err != nil {
+		return sanitizeBackendError(err)
+	}
 	return nil
 }
+
+func legacyAccountName(key Key) string { return key.Tenant + ":" + key.Account }
 
 func validateKey(key Key) error {
 	if !validBindingPart(key.Tenant) || !validBindingPart(key.Account) {

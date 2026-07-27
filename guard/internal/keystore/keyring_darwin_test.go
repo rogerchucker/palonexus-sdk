@@ -103,6 +103,50 @@ func TestDarwinBackendCancellationWhileWaitingForOperationLock(t *testing.T) {
 	backend.gate <- struct{}{}
 }
 
+func TestDarwinInteractionCancellationWhileWaiting(t *testing.T) {
+	<-darwinInteractionGate
+	defer func() { darwinInteractionGate <- struct{}{} }()
+	ctx, cancel := context.WithTimeout(context.Background(), time.Millisecond)
+	defer cancel()
+	called := false
+	err := withInteractionDisabled(ctx, func() error {
+		called = true
+		return nil
+	})
+	if !errors.Is(err, context.DeadlineExceeded) || called {
+		t.Fatalf("interaction wait = %v, called=%v", err, called)
+	}
+}
+
+func TestDarwinGetZerosValueOnLateCancellation(t *testing.T) {
+	value := []byte("secret")
+	ctx, cancel := context.WithCancel(context.Background())
+	backend := newDarwinBackend(lateCancelDarwinFacade{value: value, cancel: cancel})
+	got, err := backend.Get(ctx, "service", "account")
+	if !errors.Is(err, context.Canceled) || got != nil {
+		t.Fatalf("late-canceled Get = %x, %v", got, err)
+	}
+	if !allZero(value) {
+		t.Fatalf("late-canceled value not zeroed: %x", value)
+	}
+}
+
+func TestDarwinSuccessfulMutationsWinOverLateCancellation(t *testing.T) {
+	for _, operation := range []string{"put", "delete"} {
+		ctx, cancel := context.WithCancel(context.Background())
+		backend := newDarwinBackend(lateCancelDarwinFacade{cancel: cancel, cancelOperation: operation})
+		var err error
+		if operation == "put" {
+			err = backend.Put(ctx, "service", "account", []byte("secret"))
+		} else {
+			err = backend.Delete(ctx, "service", "account")
+		}
+		if err != nil {
+			t.Fatalf("%s reported failure after successful mutation: %v", operation, err)
+		}
+	}
+}
+
 func TestDarwinFacadeReceivesInjectiveEncodedBindings(t *testing.T) {
 	t.Parallel()
 	facade := &fakeDarwinFacade{}
@@ -135,6 +179,39 @@ type fakeDarwinFacade struct {
 	deleteError  error
 	added        darwinItem
 	updated      []darwinItem
+}
+
+type lateCancelDarwinFacade struct {
+	value           []byte
+	cancel          context.CancelFunc
+	cancelOperation string
+}
+
+func (f lateCancelDarwinFacade) Update(context.Context, darwinItem) error {
+	if f.cancelOperation == "put" {
+		f.cancel()
+	}
+	return nil
+}
+func (f lateCancelDarwinFacade) Add(context.Context, darwinItem) error { return nil }
+func (f lateCancelDarwinFacade) Get(context.Context, darwinItem) ([]byte, error) {
+	f.cancel()
+	return f.value, nil
+}
+func (f lateCancelDarwinFacade) Delete(context.Context, darwinItem) error {
+	if f.cancelOperation == "delete" {
+		f.cancel()
+	}
+	return nil
+}
+
+func allZero(value []byte) bool {
+	for _, element := range value {
+		if element != 0 {
+			return false
+		}
+	}
+	return true
 }
 
 func (f *fakeDarwinFacade) Update(_ context.Context, item darwinItem) error {
