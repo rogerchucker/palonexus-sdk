@@ -84,6 +84,9 @@ type unixQueue struct {
 	afterTransactionRecord  func() error
 	afterCheckpointCreate   func() error
 	beforeTransactionRemove func(string) error
+	afterTransactionRename  func() error
+	afterTransactionDirSync func() error
+	afterTransactionVerify  func() error
 }
 
 var rootCoordinators sync.Map
@@ -338,6 +341,10 @@ func isQuarantineName(name string) bool {
 }
 func isTransactionName(name string) bool {
 	return len(name) == len(".txn-")+32 && strings.HasPrefix(name, ".txn-") && validHex(name[len(".txn-"):])
+}
+
+func isDoneTransactionName(name string) bool {
+	return len(name) == len(".done-")+32 && strings.HasPrefix(name, ".done-") && validHex(name[len(".done-"):])
 }
 
 func validHex(value string) bool {
@@ -1085,7 +1092,8 @@ func (q *unixQueue) names() ([]string, error) {
 	}
 	var records []string
 	for _, name := range names {
-		if name == ".queue.lock" || isTempName(name) || isQuarantineName(name) || isCheckpointName(name) || isTransactionName(name) {
+		if name == ".queue.lock" || isTempName(name) || isQuarantineName(name) || isCheckpointName(name) ||
+			isTransactionName(name) || isDoneTransactionName(name) {
 			continue
 		}
 		if !isRecordName(name) {
@@ -1131,7 +1139,8 @@ func (q *unixQueue) usage() (int, int64, error) {
 		if n == ".queue.lock" || isTempName(n) {
 			continue
 		}
-		if !isRecordName(n) && !isQuarantineName(n) && !isCheckpointName(n) && !isTransactionName(n) {
+		if !isRecordName(n) && !isQuarantineName(n) && !isCheckpointName(n) &&
+			!isTransactionName(n) && !isDoneTransactionName(n) {
 			return 0, 0, ErrCorrupt
 		}
 		var st unix.Stat_t
@@ -1173,7 +1182,7 @@ func (q *unixQueue) validateAll() error {
 			}
 			continue
 		}
-		if isTransactionName(n) {
+		if isTransactionName(n) || isDoneTransactionName(n) {
 			return ErrCorrupt
 		}
 		if isCheckpointName(n) {
@@ -1449,7 +1458,7 @@ func (q *unixQueue) recoverTransactions(ctx context.Context) error {
 	}
 	count := 0
 	for _, name := range entries {
-		if !isTransactionName(name) {
+		if !isTransactionName(name) && !isDoneTransactionName(name) {
 			continue
 		}
 		count++
@@ -1462,6 +1471,9 @@ func (q *unixQueue) recoverTransactions(ctx context.Context) error {
 				if quarantineErr := q.quarantine(name); quarantineErr != nil {
 					return errors.Join(readErr, quarantineErr)
 				}
+				if isDoneTransactionName(name) {
+					return ErrCorrupt
+				}
 				continue
 			}
 			return readErr
@@ -1470,6 +1482,21 @@ func (q *unixQueue) recoverTransactions(ctx context.Context) error {
 		if decodeErr != nil {
 			if quarantineErr := q.quarantine(name); quarantineErr != nil {
 				return errors.Join(ErrCorrupt, quarantineErr)
+			}
+			if isDoneTransactionName(name) {
+				return ErrCorrupt
+			}
+			continue
+		}
+		if isDoneTransactionName(name) {
+			if verifyErr := q.verifyAppliedTransaction(transaction); verifyErr != nil {
+				if quarantineErr := q.quarantine(name); quarantineErr != nil {
+					return errors.Join(verifyErr, quarantineErr)
+				}
+				return errors.Join(ErrCorrupt, verifyErr)
+			}
+			if removeErr := q.finishTransaction(name, snapshot); removeErr != nil {
+				return removeErr
 			}
 			continue
 		}
@@ -1482,6 +1509,68 @@ func (q *unixQueue) recoverTransactions(ctx context.Context) error {
 			}
 			return err
 		}
+	}
+	return nil
+}
+
+func (q *unixQueue) verifyAppliedTransaction(transaction batchTransaction) error {
+	if transaction.Operation != "ack" && transaction.Operation != "enqueue" {
+		return ErrCorrupt
+	}
+	if transaction.Version != envelopeVersion || transaction.NewEnvelope.Version != envelopeVersion ||
+		transaction.NewCheckpoint.Version != envelopeVersion ||
+		!isRecordName(transaction.RecordName) || !isCheckpointName(transaction.CheckpointName) ||
+		recordName(transaction.NewEnvelope.Record.ReconciliationID) != transaction.RecordName ||
+		checkpointName(transaction.NewCheckpoint.BatchID) != transaction.CheckpointName ||
+		transaction.NewEnvelope.Record.BatchID != transaction.NewCheckpoint.BatchID ||
+		!validHex(transaction.NewEnvelope.TenantHash) || len(transaction.NewEnvelope.TenantHash) != 64 ||
+		!validHex(transaction.NewEnvelope.SubjectHash) || len(transaction.NewEnvelope.SubjectHash) != 64 {
+		return ErrCorrupt
+	}
+	if transaction.Operation == "ack" {
+		if err := validateTransactionShape(transaction, q.config.MaxRecords, q.config.MaxRecordBytes); err != nil {
+			return err
+		}
+		if !validHex(transaction.OldRecordDigest) || len(transaction.OldRecordDigest) != 64 ||
+			!validHex(transaction.OldCheckpointDigest) || len(transaction.OldCheckpointDigest) != 64 {
+			return ErrCorrupt
+		}
+	} else if transaction.NewEnvelope.Record.State != p.ReconciliationStatePending ||
+		transaction.NewEnvelope.Record.AttemptCount != 0 ||
+		transaction.NewEnvelope.HoldClass != "" ||
+		transaction.NewCheckpoint.ExpectedNextSequence < 0 ||
+		transaction.NewCheckpoint.ExpectedNextSequence > p.JSONInteger(q.config.MaxRecords) ||
+		len(transaction.NewCheckpoint.CompletedPrefix) != int(transaction.NewCheckpoint.ExpectedNextSequence) {
+		return ErrCorrupt
+	}
+	for sequence := p.JSONInteger(0); sequence < transaction.NewCheckpoint.ExpectedNextSequence; sequence++ {
+		entry, ok := transaction.NewCheckpoint.CompletedPrefix[strconv.FormatInt(int64(sequence), 10)]
+		if !ok || entry.ReconciliationID == "" || entry.EvidenceHash == "" {
+			return ErrCorrupt
+		}
+	}
+	if _, err := validateRecord(transaction.NewEnvelope.Record, q.config.MaxRecordBytes); err != nil {
+		return ErrCorrupt
+	}
+	hash, err := evidenceHash(transaction.NewEnvelope.Record)
+	if err != nil || hash != transaction.NewEnvelope.EvidenceHash {
+		return ErrCorrupt
+	}
+	recordWire, err := json.Marshal(transaction.NewEnvelope)
+	if err != nil || len(recordWire) > q.config.MaxRecordBytes {
+		return ErrCorrupt
+	}
+	record, err := q.read(transaction.RecordName)
+	if err != nil || record.digest != sha256.Sum256(recordWire) {
+		return ErrConflict
+	}
+	checkpointWire, err := json.Marshal(transaction.NewCheckpoint)
+	if err != nil || len(checkpointWire) > q.config.MaxRecordBytes {
+		return ErrCorrupt
+	}
+	checkpoint, err := q.readCheckpointByName(transaction.CheckpointName)
+	if err != nil || checkpoint.digest != sha256.Sum256(checkpointWire) {
+		return ErrConflict
 	}
 	return nil
 }
@@ -1765,12 +1854,27 @@ func (q *unixQueue) finishTransaction(name string, snapshot fileSnapshot) error 
 	if err := quarantineAtomicNoReplace(q.rootFD, name, quarantined); err != nil {
 		return err
 	}
+	if q.afterTransactionRename != nil {
+		if err := q.afterTransactionRename(); err != nil {
+			return err
+		}
+	}
 	if unix.Fsync(q.rootFD) != nil {
 		return ErrDurabilityIndeterminate
+	}
+	if q.afterTransactionDirSync != nil {
+		if err := q.afterTransactionDirSync(); err != nil {
+			return err
+		}
 	}
 	_, movedSnapshot, readErr := q.readSafeFile(quarantined, maxTransactionBytes)
 	if readErr != nil || movedSnapshot != snapshot {
 		return ErrDurabilityIndeterminate
+	}
+	if q.afterTransactionVerify != nil {
+		if err := q.afterTransactionVerify(); err != nil {
+			return err
+		}
 	}
 	if unix.Unlinkat(q.rootFD, quarantined, 0) != nil {
 		return ErrUnsafePath

@@ -1232,6 +1232,71 @@ func TestCraftedEnqueueJournalCannotCreateSequenceGapBeforeFailing(t *testing.T)
 	}
 }
 
+func TestOpenRecoversDoneTransactionAtEveryRemovalCrashBoundary(t *testing.T) {
+	tests := []struct {
+		name string
+		hook func(*unixQueue)
+	}{
+		{"after rename", func(q *unixQueue) {
+			q.afterTransactionRename = func() error { return errors.New("crash after rename") }
+		}},
+		{"after directory sync", func(q *unixQueue) {
+			q.afterTransactionDirSync = func() error { return errors.New("crash after directory sync") }
+		}},
+		{"after moved verification", func(q *unixQueue) {
+			q.afterTransactionVerify = func() error { return errors.New("crash after moved verification") }
+		}},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			root := queueRoot(t)
+			config := Config{Root: root, MaxRecords: 8, MaxBytes: 1 << 20}
+			q, err := Open(config)
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.hook(q.impl.(*unixQueue))
+			if err = q.Enqueue(context.Background(), b1, pending()); err == nil {
+				t.Fatal("crash hook ignored")
+			}
+			if closeErr := q.Close(); closeErr != nil {
+				t.Fatal(closeErr)
+			}
+			entries, err := os.ReadDir(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			done := 0
+			for _, entry := range entries {
+				if isDoneTransactionName(entry.Name()) {
+					done++
+				}
+			}
+			if done != 1 {
+				t.Fatalf("want one durable done journal, got %d", done)
+			}
+			q, err = Open(config)
+			if err != nil {
+				t.Fatalf("reopen did not recover done journal: %v", err)
+			}
+			defer q.Close()
+			if got, getErr := q.Get(context.Background(), b1, pending().ReconciliationID); getErr != nil ||
+				got.ReconciliationID != pending().ReconciliationID {
+				t.Fatalf("applied state lost: %#v %v", got, getErr)
+			}
+			entries, err = os.ReadDir(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, entry := range entries {
+				if isDoneTransactionName(entry.Name()) || isTransactionName(entry.Name()) {
+					t.Fatalf("transaction artifact survived recovery: %s", entry.Name())
+				}
+			}
+		})
+	}
+}
+
 func TestQueueRejectsHardlinkFIFOAndUnsafeControlFiles(t *testing.T) {
 	t.Run("hardlink record", func(t *testing.T) {
 		root := queueRoot(t)
