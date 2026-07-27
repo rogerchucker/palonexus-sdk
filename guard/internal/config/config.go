@@ -170,18 +170,33 @@ func validateCertificates(data []byte) error {
 	rest := data
 	count := 0
 	for len(bytes.TrimSpace(rest)) != 0 {
+		rest = bytes.TrimSpace(rest)
+		if !bytes.HasPrefix(rest, []byte("-----BEGIN CERTIFICATE-----")) {
+			return errors.New("unexpected data outside certificate PEM")
+		}
 		block, remaining := pem.Decode(rest)
-		if block == nil || block.Type != "CERTIFICATE" {
+		if block == nil || block.Type != "CERTIFICATE" || len(block.Headers) != 0 {
 			return errors.New("invalid certificate PEM")
 		}
-		if _, err := x509.ParseCertificate(block.Bytes); err != nil {
+		certificate, err := x509.ParseCertificate(block.Bytes)
+		if err != nil {
 			return errors.New("invalid X.509 certificate")
+		}
+		if !certificate.BasicConstraintsValid || !certificate.IsCA {
+			return errors.New("certificate is not a CA")
+		}
+		if certificate.KeyUsage != 0 && certificate.KeyUsage&x509.KeyUsageCertSign == 0 {
+			return errors.New("certificate cannot sign certificates")
 		}
 		count++
 		rest = remaining
 	}
 	if count == 0 {
 		return errors.New("no certificates")
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(data) {
+		return errors.New("certificate bundle is unusable")
 	}
 	return nil
 }

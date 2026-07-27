@@ -35,19 +35,36 @@ func validConfig(endpoint string) string {
 }
 
 func testCertificatePEM(t *testing.T) []byte {
+	return testCertificateWithUsagePEM(t, true, x509.KeyUsageCertSign)
+}
+
+func testCertificateWithUsagePEM(t *testing.T, isCA bool, usage x509.KeyUsage) []byte {
+	return testCertificatePEMOptions(t, isCA, true, usage)
+}
+
+func testCertificatePEMOptions(
+	t *testing.T,
+	isCA bool,
+	basicConstraintsValid bool,
+	usage x509.KeyUsage,
+) []byte {
 	t.Helper()
 	key, err := rsa.GenerateKey(rand.Reader, 2048)
 	if err != nil {
 		t.Fatal(err)
 	}
+	serial, err := rand.Int(rand.Reader, new(big.Int).Lsh(big.NewInt(1), 120))
+	if err != nil {
+		t.Fatal(err)
+	}
 	template := &x509.Certificate{
-		SerialNumber:          big.NewInt(1),
-		Subject:               pkix.Name{CommonName: "test CA"},
+		SerialNumber:          serial,
+		Subject:               pkix.Name{CommonName: "test CA " + serial.String()},
 		NotBefore:             time.Now().Add(-time.Hour),
 		NotAfter:              time.Now().Add(time.Hour),
-		IsCA:                  true,
-		BasicConstraintsValid: true,
-		KeyUsage:              x509.KeyUsageCertSign,
+		IsCA:                  isCA,
+		BasicConstraintsValid: basicConstraintsValid,
+		KeyUsage:              usage,
 	}
 	der, err := x509.CreateCertificate(rand.Reader, template, template, &key.PublicKey, key)
 	if err != nil {
@@ -177,6 +194,51 @@ func TestLoadRejectsEmptyAndMalformedTrustedCA(t *testing.T) {
 		if _, err := Load(writeConfig(t, body), Options{}); err == nil {
 			t.Fatal("accepted invalid CA material")
 		}
+	}
+}
+
+func TestLoadRejectsJunkAndNonCATrustAnchors(t *testing.T) {
+	valid := testCertificatePEM(t)
+	leaf := testCertificateWithUsagePEM(t, false, x509.KeyUsageDigitalSignature)
+	caWithoutBasicConstraints := testCertificatePEMOptions(t, true, false, x509.KeyUsageCertSign)
+	caWithoutSigningUsage := testCertificateWithUsagePEM(t, true, x509.KeyUsageDigitalSignature)
+	cases := [][]byte{
+		append([]byte("junk-prefix"), valid...),
+		append(append(append([]byte(nil), valid...), []byte("\ninter-block-junk\n")...), valid...),
+		leaf,
+		caWithoutBasicConstraints,
+		caWithoutSigningUsage,
+		append(append([]byte(nil), valid...), leaf...),
+	}
+	for _, data := range cases {
+		ca := filepath.Join(t.TempDir(), "ca.pem")
+		if err := os.WriteFile(ca, data, 0o600); err != nil {
+			t.Fatal(err)
+		}
+		body := strings.Replace(validConfig("https://decision.example.com"), `"trusted_ca_file": ""`, `"trusted_ca_file": "`+ca+`"`, 1)
+		if _, err := Load(writeConfig(t, body), Options{}); err == nil {
+			t.Fatal("accepted invalid trust-anchor bundle")
+		}
+	}
+}
+
+func TestLoadAcceptsWhitespaceSeparatedMultipleCAsConsumableByCertPool(t *testing.T) {
+	first := testCertificatePEM(t)
+	second := testCertificateWithUsagePEM(t, true, 0)
+	bundle := append(append(append([]byte(" \n\t"), first...), []byte("\n\n")...), second...)
+	bundle = append(bundle, []byte(" \n")...)
+	ca := filepath.Join(t.TempDir(), "ca.pem")
+	if err := os.WriteFile(ca, bundle, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	body := strings.Replace(validConfig("https://decision.example.com"), `"trusted_ca_file": ""`, `"trusted_ca_file": "`+ca+`"`, 1)
+	cfg, err := Load(writeConfig(t, body), Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	pool := x509.NewCertPool()
+	if !pool.AppendCertsFromPEM(cfg.TrustedCAPEM()) {
+		t.Fatal("retained CA material cannot populate a fresh CertPool")
 	}
 }
 
