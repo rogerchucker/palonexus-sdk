@@ -55,6 +55,7 @@ Changelog = "https://github.com/rogerchucker/palonexus-sdk/blob/main/CHANGELOG.m
 langchain = [
     "langchain>=1,<2",
     "langchain-core>=1,<2",
+    "langgraph>=1,<2",
 ]
 langgraph = [
     "langchain-core>=1,<2",
@@ -63,6 +64,9 @@ langgraph = [
 ]
 deepagents = [
     "deepagents>=0.3,<1",
+    "langchain>=1,<2",
+    "langchain-core>=1,<2",
+    "langgraph>=1,<2",
 ]
 
 [tool.hatch.version]
@@ -70,7 +74,6 @@ source = "vcs"
 
 [tool.hatch.version.raw-options]
 search_parent_directories = true
-fallback_version = "0.0.0"
 
 [tool.hatch.build.hooks.vcs]
 version-file = "src/palonexus/_version.py"

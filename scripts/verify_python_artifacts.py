@@ -4,14 +4,22 @@
 from __future__ import annotations
 
 import argparse
+import email.policy
 import os
+import re
 import shutil
+import stat
 import subprocess
 import tarfile
 import tempfile
+import unicodedata
 import zipfile
 from collections.abc import Iterable
+from email.parser import BytesParser
 from pathlib import Path, PurePosixPath
+
+from packaging.utils import parse_sdist_filename, parse_wheel_filename
+from packaging.version import InvalidVersion, Version
 
 ROOT = Path(__file__).resolve().parents[1]
 FORBIDDEN_PATH_PARTS = frozenset(
@@ -36,6 +44,7 @@ FORBIDDEN_BYTE_MARKERS = (
     b"sk-proj-",
 )
 SMOKE = """\
+import os
 from importlib.metadata import metadata, version
 from importlib.resources import files
 
@@ -44,12 +53,47 @@ from palonexus import ActionRequestBuilder, AuthorizationClient
 
 distribution = metadata("palonexus")
 assert distribution["License-Expression"] == "MIT"
-assert version("palonexus")
+assert version("palonexus") == os.environ["PALONEXUS_EXPECTED_VERSION"]
 assert files("palonexus").joinpath("py.typed").is_file()
 assert ActionRequestBuilder is palonexus.ActionRequestBuilder
 assert AuthorizationClient is palonexus.AuthorizationClient
 print("ARTIFACT_IMPORT_OK")
 """
+EXTRA_SMOKES = {
+    "langchain": """\
+from palonexus.integrations.langchain import LangChainActionPolicy
+value = LangChainActionPolicy(service="inventory", side_effect="read_only")
+assert value.service == "inventory"
+""",
+    "langgraph": """\
+from palonexus.integrations.langgraph import InMemoryExecutionLedger
+value = InMemoryExecutionLedger(testing_only=True)
+assert value is not None
+""",
+    "deepagents": """\
+from palonexus import TaskContext
+from palonexus.integrations.deepagents import DeepAgentsAuthorizationContext
+from palonexus.integrations.langchain import LangChainAuthorizationContext
+task = TaskContext(
+    task_id="task_01J5ABCDEFGHJKMNPQRSTVWXY2",
+    session_id="session_01J5ABCDEFGHJKMNPQRSTVWXY2",
+)
+authorization = LangChainAuthorizationContext(
+    task=task,
+    correlation_id="corr_01J5ABCDEFGHJKMNPQRSTVWXY8",
+    model_policy_key="offline-model",
+)
+value = DeepAgentsAuthorizationContext(
+    authorization=authorization,
+    accountable_actors={"main": "actor:test:main"},
+)
+assert value.authorization is authorization
+""",
+}
+_VERSION_ASSIGNMENT = re.compile(
+    rb"^__version__\s*=\s*version\s*=\s*['\"]([^'\"]+)['\"]\s*$",
+    re.MULTILINE,
+)
 
 
 def _run(
@@ -74,10 +118,21 @@ def _run(
         )
 
 
-def _safe_member(name: str, *, sdist: bool) -> bool:
+def _normalized_member(name: str) -> str:
+    if not name or "\\" in name or "\x00" in name or re.match(r"^[A-Za-z]:", name):
+        raise RuntimeError(f"non-portable artifact member name: {name!r}")
     path = PurePosixPath(name)
     if path.is_absolute() or ".." in path.parts:
-        return False
+        raise RuntimeError(f"unsafe artifact member name: {name!r}")
+    normalized = unicodedata.normalize("NFC", str(path))
+    expected = name[:-1] if name.endswith("/") else name
+    if normalized != unicodedata.normalize("NFC", expected):
+        raise RuntimeError(f"non-normalized artifact member name: {name!r}")
+    return normalized
+
+
+def _safe_member(name: str, *, sdist: bool) -> bool:
+    path = PurePosixPath(_normalized_member(name))
     relevant_parts = path.parts[1:] if sdist else path.parts
     return not FORBIDDEN_PATH_PARTS.intersection(relevant_parts)
 
@@ -88,30 +143,123 @@ def _verify_payload(name: str, payload: bytes) -> None:
             raise RuntimeError(f"forbidden private marker in artifact member: {name}")
 
 
-def _verify_wheel(path: Path) -> None:
+def _metadata_version(payload: bytes, *, member: str) -> Version:
+    metadata = BytesParser(policy=email.policy.default).parsebytes(payload)
+    raw_version = metadata.get("Version")
+    if not isinstance(raw_version, str):
+        raise RuntimeError(f"missing Version in {member}")
+    try:
+        return Version(raw_version)
+    except InvalidVersion as error:
+        raise RuntimeError(f"invalid Version in {member}") from error
+
+
+def _generated_version(payload: bytes, *, member: str) -> Version:
+    match = _VERSION_ASSIGNMENT.search(payload)
+    if match is None:
+        raise RuntimeError(f"missing generated version assignment in {member}")
+    try:
+        return Version(match.group(1).decode("ascii"))
+    except (InvalidVersion, UnicodeDecodeError) as error:
+        raise RuntimeError(f"invalid generated version in {member}") from error
+
+
+def _expected_version(raw: str) -> Version:
+    try:
+        version = Version(raw)
+    except InvalidVersion as error:
+        raise RuntimeError("expected version is not valid PEP 440") from error
+    if version == Version("0.0.0"):
+        raise RuntimeError("fallback version is forbidden")
+    if str(version) != raw:
+        raise RuntimeError("expected version must use canonical PEP 440 spelling")
+    return version
+
+
+def _require_version(actual: Version, expected: Version, *, source: str) -> None:
+    if actual != expected:
+        raise RuntimeError(
+            f"version mismatch in {source}: expected {expected}, got {actual}"
+        )
+
+
+def _verify_wheel(path: Path, expected_version: Version | None = None) -> None:
     with zipfile.ZipFile(path) as archive:
-        names = archive.namelist()
+        members = archive.infolist()
+        names = [member.filename for member in members]
+        normalized_names: set[str] = set()
+        for member in members:
+            normalized = _normalized_member(member.filename)
+            if normalized in normalized_names:
+                raise RuntimeError(f"duplicate wheel member: {normalized}")
+            normalized_names.add(normalized)
+            mode = member.external_attr >> 16
+            if member.is_dir():
+                if mode and not stat.S_ISDIR(mode):
+                    raise RuntimeError(
+                        f"invalid wheel directory mode: {member.filename}"
+                    )
+            elif stat.S_IFMT(mode) not in {0, stat.S_IFREG}:
+                raise RuntimeError(f"non-regular wheel member: {member.filename}")
         if "palonexus/py.typed" not in names:
             raise RuntimeError("wheel does not contain palonexus/py.typed")
         for name in names:
+            if not (
+                name.startswith("palonexus/")
+                or (name.startswith("palonexus-") and ".dist-info/" in name)
+            ):
+                raise RuntimeError(f"wheel crossed distribution boundary: {name}")
             if not _safe_member(name, sdist=False):
                 raise RuntimeError(f"wheel crossed package boundary: {name}")
             if not name.endswith("/"):
                 _verify_payload(name, archive.read(name))
+        if expected_version is not None:
+            _, filename_version, _, _ = parse_wheel_filename(path.name)
+            _require_version(filename_version, expected_version, source=path.name)
+            metadata_names = [
+                name for name in names if name.endswith(".dist-info/METADATA")
+            ]
+            generated_names = [
+                name for name in names if name == "palonexus/_version.py"
+            ]
+            if len(metadata_names) != 1 or len(generated_names) != 1:
+                raise RuntimeError("wheel version evidence is incomplete")
+            _require_version(
+                _metadata_version(
+                    archive.read(metadata_names[0]),
+                    member=metadata_names[0],
+                ),
+                expected_version,
+                source=metadata_names[0],
+            )
+            _require_version(
+                _generated_version(
+                    archive.read(generated_names[0]),
+                    member=generated_names[0],
+                ),
+                expected_version,
+                source=generated_names[0],
+            )
 
 
-def _verify_sdist(path: Path) -> None:
+def _verify_sdist(path: Path, expected_version: Version | None = None) -> None:
     with tarfile.open(path, "r:gz") as archive:
         members = archive.getmembers()
-        roots = {PurePosixPath(member.name).parts[0] for member in members}
+        normalized_names: set[str] = set()
+        for member in members:
+            normalized = _normalized_member(member.name)
+            if normalized in normalized_names:
+                raise RuntimeError(f"duplicate sdist member: {normalized}")
+            normalized_names.add(normalized)
+            if not (member.isfile() or member.isdir()):
+                raise RuntimeError(f"non-regular sdist member: {member.name}")
+        roots = {PurePosixPath(name).parts[0] for name in normalized_names}
         if len(roots) != 1:
             raise RuntimeError("sdist must have exactly one top-level directory")
         marker_found = False
         for member in members:
             if not _safe_member(member.name, sdist=True):
                 raise RuntimeError(f"sdist crossed package boundary: {member.name}")
-            if member.issym() or member.islnk():
-                raise RuntimeError(f"sdist contains a link: {member.name}")
             if not member.isfile():
                 continue
             if member.name.endswith("/src/palonexus/py.typed"):
@@ -122,17 +270,52 @@ def _verify_sdist(path: Path) -> None:
             _verify_payload(member.name, stream.read())
         if not marker_found:
             raise RuntimeError("sdist does not contain src/palonexus/py.typed")
+        if expected_version is not None:
+            _, filename_version = parse_sdist_filename(path.name)
+            _require_version(filename_version, expected_version, source=path.name)
+            metadata_members = [
+                member
+                for member in members
+                if member.name.count("/") == 1 and member.name.endswith("/PKG-INFO")
+            ]
+            generated_members = [
+                member
+                for member in members
+                if member.name.endswith("/src/palonexus/_version.py")
+            ]
+            if len(metadata_members) != 1 or len(generated_members) != 1:
+                raise RuntimeError("sdist version evidence is incomplete")
+            for member, parser in (
+                (metadata_members[0], _metadata_version),
+                (generated_members[0], _generated_version),
+            ):
+                stream = archive.extractfile(member)
+                if stream is None:
+                    raise RuntimeError(f"cannot read sdist member: {member.name}")
+                _require_version(
+                    parser(stream.read(), member=member.name),
+                    expected_version,
+                    source=member.name,
+                )
 
 
 def _python_in(venv: Path) -> Path:
     return venv / ("Scripts/python.exe" if os.name == "nt" else "bin/python")
 
 
-def _install_and_smoke(artifact: Path, clean_root: Path) -> None:
+def _install_and_smoke(
+    artifact: Path,
+    clean_root: Path,
+    *,
+    expected_version: Version,
+    extra: str | None = None,
+) -> None:
     environment = os.environ.copy()
     environment.pop("PYTHONPATH", None)
     environment.pop("VIRTUAL_ENV", None)
-    venv = clean_root / f"venv-{artifact.name.replace('.', '-')}"
+    environment["PALONEXUS_EXPECTED_VERSION"] = str(expected_version)
+    profile = "base" if extra is None else extra
+    venv = clean_root / f"venv-{artifact.name.replace('.', '-')}-{profile}"
     _run(
         ["uv", "venv", "--python", os.environ.get("UV_PYTHON", "3.12"), str(venv)],
         cwd=clean_root,
@@ -145,13 +328,13 @@ def _install_and_smoke(artifact: Path, clean_root: Path) -> None:
             "install",
             "--python",
             str(python),
-            str(artifact),
+            str(artifact) if extra is None else f"{artifact}[{extra}]",
         ],
         cwd=clean_root,
         env=environment,
     )
     smoke = clean_root / f"smoke-{artifact.name}.py"
-    smoke.write_text(SMOKE, encoding="utf-8")
+    smoke.write_text(SMOKE + EXTRA_SMOKES.get(profile, ""), encoding="utf-8")
     _run([str(python), "-I", str(smoke)], cwd=clean_root, env=environment)
     for profile in ("python-basic", "python-async"):
         example = clean_root / f"{artifact.name}-{profile}.py"
@@ -166,7 +349,8 @@ def _exactly_one(paths: Iterable[Path], kind: str) -> Path:
     return candidates[0]
 
 
-def verify(*, keep_build: Path | None = None) -> None:
+def verify(*, expected_version: str, keep_build: Path | None = None) -> None:
+    checked_version = _expected_version(expected_version)
     with tempfile.TemporaryDirectory(prefix="palonexus-artifacts-") as directory:
         clean_root = Path(directory)
         dist = clean_root / "dist"
@@ -184,10 +368,16 @@ def verify(*, keep_build: Path | None = None) -> None:
         )
         wheel = _exactly_one(dist.glob("palonexus-*.whl"), "wheel")
         sdist = _exactly_one(dist.glob("palonexus-*.tar.gz"), "sdist")
-        _verify_wheel(wheel)
-        _verify_sdist(sdist)
-        _install_and_smoke(wheel, clean_root)
-        _install_and_smoke(sdist, clean_root)
+        _verify_wheel(wheel, checked_version)
+        _verify_sdist(sdist, checked_version)
+        for artifact in (wheel, sdist):
+            for extra in (None, *EXTRA_SMOKES):
+                _install_and_smoke(
+                    artifact,
+                    clean_root,
+                    expected_version=checked_version,
+                    extra=extra,
+                )
         if keep_build is not None:
             keep_build.mkdir(parents=True, exist_ok=True)
             shutil.copy2(wheel, keep_build / wheel.name)
@@ -196,13 +386,20 @@ def verify(*, keep_build: Path | None = None) -> None:
 
 def main() -> int:
     parser = argparse.ArgumentParser()
+    parser.add_argument("--expected-version", required=True)
     parser.add_argument(
         "--keep-build",
         type=Path,
         help="copy verified artifacts to this directory",
     )
     arguments = parser.parse_args()
-    verify(keep_build=arguments.keep_build)
+    try:
+        verify(
+            expected_version=arguments.expected_version,
+            keep_build=arguments.keep_build,
+        )
+    except RuntimeError as error:
+        parser.error(str(error))
     print("Python wheel and sdist passed clean-room verification.")
     return 0
 

@@ -52,4 +52,10 @@ jobs:
           uv run --frozen --no-sync mypy python/src
           uv run --frozen --no-sync python scripts/verify_legal.py
       - name: Verify clean-room distributions
-        run: uv run --frozen --no-sync python scripts/verify_python_artifacts.py
+        run: |
+          expected_version=$(
+            uv run --frozen --no-sync python -c \
+              'from importlib.metadata import version; print(version("palonexus"))'
+          )
+          uv run --frozen --no-sync python scripts/verify_python_artifacts.py \
+            --expected-version "$expected_version"
