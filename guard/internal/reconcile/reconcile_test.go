@@ -433,7 +433,7 @@ func TestQueueRejectsUnsafeRootsAndRecordInodes(t *testing.T) {
 
 func TestQueueBoundsCancellationAndAuthorizedDiscard(t *testing.T) {
 	ctx := context.Background()
-	q, err := Open(Config{Root: queueRoot(t), MaxRecords: 3, MaxBytes: 1 << 20, Authority: testAuthority{subject: b1.Subject}})
+	q, err := Open(Config{Root: queueRoot(t), MaxRecords: 1, MaxBytes: 1 << 20, Authority: testAuthority{subject: b1.Subject}})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1359,7 +1359,7 @@ func TestVerifiedDoneReplacementSurvivesWithoutPathnameUnlink(t *testing.T) {
 
 func TestRetainedDoneTombstonesAreCountedAndBounded(t *testing.T) {
 	root := queueRoot(t)
-	q, err := Open(Config{Root: root, MaxRecords: 6, MaxBytes: 1 << 20})
+	q, err := Open(Config{Root: root, MaxRecords: 2, MaxBytes: 1 << 20})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1377,14 +1377,14 @@ func TestRetainedDoneTombstonesAreCountedAndBounded(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if count != 6 || used <= 0 {
+	if count != 2 || used <= 0 {
 		t.Fatalf("unexpected bounded usage: count=%d bytes=%d", count, used)
 	}
 }
 
 func TestCapacityAdmissionReservesEveryFutureAcknowledgement(t *testing.T) {
 	root := queueRoot(t)
-	config := Config{Root: root, MaxRecords: 6, MaxBytes: 1 << 20}
+	config := Config{Root: root, MaxRecords: 2, MaxBytes: 1 << 20}
 	q, err := Open(config)
 	if err != nil {
 		t.Fatal(err)
@@ -1433,6 +1433,47 @@ func TestCapacityAdmissionReservesEveryFutureAcknowledgement(t *testing.T) {
 		t.Fatalf("final restart: %v", err)
 	}
 	defer q.Close()
+}
+
+func TestMaxRecordsOneRemainsOneLogicalRecordWithBoundedControls(t *testing.T) {
+	root := queueRoot(t)
+	config := Config{Root: root, MaxRecords: 1, MaxBytes: 1 << 20}
+	q, err := Open(config)
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := pending()
+	if err = q.Enqueue(context.Background(), b1, record); err != nil {
+		t.Fatalf("first logical record rejected: %v", err)
+	}
+	other := batchRecord(0, '1')
+	other.BatchID = p.BatchID("batch_01J5ABCDEFGHJKMNPQRSTVWXY1")
+	if err = q.Enqueue(context.Background(), b1, other); !errors.Is(err, ErrQueueFull) {
+		t.Fatalf("second logical record admitted: %v", err)
+	}
+	sending, err := q.Claim(context.Background(), b1, t0.Add(time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := testReceipt(sending, "receipt_01J5ABCDEFGHJKMNPQRSTVWXY0", t0.Add(2*time.Second))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = q.Acknowledge(context.Background(), b1, sending.ReconciliationID, receipt); err != nil {
+		t.Fatalf("reserved acknowledgement failed: %v", err)
+	}
+	if err = q.Close(); err != nil {
+		t.Fatal(err)
+	}
+	q, err = Open(config)
+	if err != nil {
+		t.Fatalf("restart at logical capacity: %v", err)
+	}
+	defer q.Close()
+	records, controls, _, err := q.impl.(*unixQueue).artifactUsage()
+	if err != nil || records != 1 || controls > 3 {
+		t.Fatalf("unbounded/miscounted artifacts: records=%d controls=%d err=%v", records, controls, err)
+	}
 }
 
 func TestQueueRejectsHardlinkFIFOAndUnsafeControlFiles(t *testing.T) {

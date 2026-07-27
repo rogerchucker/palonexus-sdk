@@ -402,7 +402,7 @@ func (q *unixQueue) enqueue(ctx context.Context, b Binding, record p.Reconciliat
 		if createCheckpoint {
 			required += int64(len(checkpointWire))
 		}
-		if len(document) > q.config.MaxRecordBytes || len(wire) > q.config.MaxRecordBytes || count > q.config.MaxRecords-3 ||
+		if len(document) > q.config.MaxRecordBytes || len(wire) > q.config.MaxRecordBytes || count >= q.config.MaxRecords ||
 			required > q.config.MaxBytes || used > q.config.MaxBytes-required {
 			return ErrQueueFull
 		}
@@ -1124,30 +1124,39 @@ func (q *unixQueue) entries() ([]string, error) {
 	return names, nil
 }
 func (q *unixQueue) usage() (int, int64, error) {
+	records, _, total, err := q.artifactUsage()
+	return records, total, err
+}
+
+// artifactUsage keeps the public MaxRecords quota independent from bounded
+// queue-control files. Control files are bounded separately by entries().
+func (q *unixQueue) artifactUsage() (int, int, int64, error) {
 	entries, err := q.entries()
 	if err != nil {
-		return 0, 0, err
+		return 0, 0, 0, err
 	}
 	var total int64
-	count := 0
+	records, controls := 0, 0
 	for _, n := range entries {
 		if n == ".queue.lock" || isTempName(n) {
 			continue
 		}
 		if !isRecordName(n) && !isQuarantineName(n) && !isCheckpointName(n) &&
 			!isTransactionName(n) && !isDoneTransactionName(n) {
-			return 0, 0, ErrCorrupt
+			return 0, 0, 0, ErrCorrupt
 		}
 		var st unix.Stat_t
 		if unix.Fstatat(q.rootFD, n, &st, unix.AT_SYMLINK_NOFOLLOW) != nil || st.Mode&unix.S_IFMT != unix.S_IFREG || st.Nlink != 1 {
-			return 0, 0, ErrUnsafePath
+			return 0, 0, 0, ErrUnsafePath
 		}
 		total += st.Size
-		if isRecordName(n) || isDoneTransactionName(n) {
-			count++
+		if isRecordName(n) {
+			records++
+		} else {
+			controls++
 		}
 	}
-	return count, total, nil
+	return records, controls, total, nil
 }
 
 // reservedUsage includes every immutable acknowledgement journal still owed
@@ -1184,7 +1193,7 @@ func (q *unixQueue) reservedUsage() (int, int64, error) {
 			return 0, 0, ErrUnsafePath
 		}
 	}
-	return count + missingAcknowledgements,
+	return count,
 		used + recordGrowthReserve + int64(missingAcknowledgements)*maxTransactionBytes +
 			int64(q.config.MaxRecordBytes), nil
 }
