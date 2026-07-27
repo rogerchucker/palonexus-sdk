@@ -96,6 +96,14 @@ require_commit() {
 
 check_dco_commit() {
     oid=$1
+    # A merge commit is not authored content and carries no sign-off of its own.
+    # GitHub generates one for every "Merge pull request", so requiring a trailer
+    # here fails every push to a branch that receives merges. The commits being
+    # merged are still checked individually.
+    parents=$(git -C "$ROOT" show -s --format=%P "$oid" | wc -w)
+    if [ "$parents" -gt 1 ]; then
+        return 0
+    fi
     author=$(git -C "$ROOT" show -s --format='%an <%ae>' "$oid")
     trailers=$(
         git -C "$ROOT" show -s --format=%B "$oid" |
@@ -113,7 +121,7 @@ check_dco_range() {
     head=$2
     require_commit "$base"
     require_commit "$head"
-    commits=$(git -C "$ROOT" rev-list --reverse "$base..$head")
+    commits=$(git -C "$ROOT" rev-list --reverse --no-merges "$base..$head")
     if [ -z "$commits" ]; then
         printf 'DCO range contains no commits: %s..%s\n' "$base" "$head" >&2
         exit "$EX_DATAERR"
