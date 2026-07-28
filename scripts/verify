@@ -121,6 +121,15 @@ check_dco_commit() {
         return 0
     fi
     author=$(git -C "$ROOT" show -s --format='%an <%ae>' "$oid")
+    # Dependabot cannot add a sign-off trailer, so every one of its pull requests
+    # fails this gate and has to be re-authored by hand. Its commits change pinned
+    # version strings and are not copyrightable contributions. Matched on the exact
+    # canonical bot identity, never a pattern, so a lookalike author still fails.
+    case "$author" in
+        'dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>')
+            return 0
+            ;;
+    esac
     trailers=$(
         git -C "$ROOT" show -s --format=%B "$oid" |
             git -C "$ROOT" interpret-trailers --parse
