@@ -16,6 +16,10 @@ release.
 
 - The `palonexus` distribution is now built and published from this repository
   rather than from `palonexus-platform`.
+- `scripts/verify` now runs the Python SDK suite (`python/tests`) alongside the
+  foundation and protocol suites, so one command covers every test in the
+  repository. Set up the environment with `uv sync --frozen --all-extras`; the
+  SDK integration tests import the optional extras.
 
 ### Removed
 
