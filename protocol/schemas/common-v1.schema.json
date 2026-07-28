@@ -9,7 +9,7 @@
     "safeText": {
       "type": "string",
       "not": {
-        "pattern": "[\\x00-\\x1F\\x7F-\\x9F\u061C\u200E\u200F\u2028-\u202E\u2066-\u2069]"
+        "pattern": "[\\x00-\\x1F\\x7F-\\x9F\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]"
       }
     },
     "schemaVersion": {
@@ -163,8 +163,8 @@
         },
         {
           "type": "number",
-          "minimum": -1e308,
-          "maximum": 1e308
+          "minimum": -1e+308,
+          "maximum": 1e+308
         },
         {
           "type": "boolean"
@@ -254,11 +254,6 @@
           "minLength": 1,
           "maxLength": 2048,
           "allOf": [
-            {
-              "not": {
-                "pattern": "[\\\\]"
-              }
-            },
             {
               "not": {
                 "pattern": "(^|/)\\.{1,2}(/|$)"

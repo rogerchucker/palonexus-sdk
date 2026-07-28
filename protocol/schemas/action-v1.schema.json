@@ -118,6 +118,52 @@
       "if": {
         "properties": {
           "action": {
+            "enum": [
+              "file:read",
+              "file:write",
+              "file:delete"
+            ]
+          }
+        },
+        "required": [
+          "action"
+        ]
+      },
+      "then": {
+        "properties": {
+          "target": {
+            "properties": {
+              "resource": {
+                "allOf": [
+                  {
+                    "pattern": "^path:/"
+                  },
+                  {
+                    "not": {
+                      "pattern": "[\\\\]"
+                    }
+                  },
+                  {
+                    "not": {
+                      "pattern": "(^|/)\\.{1,2}(/|$)"
+                    }
+                  },
+                  {
+                    "not": {
+                      "pattern": "//"
+                    }
+                  }
+                ]
+              }
+            }
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "action": {
             "const": "mcp:call"
           }
         },

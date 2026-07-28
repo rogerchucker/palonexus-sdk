@@ -62,6 +62,20 @@ run_python() {
 
 run_go() {
     select_go_toolchain
+    # The encrypted-file keystore and the state store both refuse to sit under a
+    # world-writable ancestor, walking every path component from "/" down. The
+    # Linux default TMPDIR is /tmp, mode 1777, so `t.TempDir()` roots the suite
+    # somewhere the product is designed to reject. macOS already hands out a 0700
+    # per-user TMPDIR, which is why this only ever failed on Linux.
+    #
+    # Point the suite at a private temp root instead. This mirrors production,
+    # where the store lives under the user's home and never under /tmp.
+    go_test_tmp="${HOME:-$ROOT}/.cache/palonexus-guard-tests"
+    mkdir -p "$go_test_tmp"
+    chmod 700 "$go_test_tmp"
+    TMPDIR="$go_test_tmp"
+    export TMPDIR
+
     unformatted=$("$go_root/bin/gofmt" -l guard)
     if [ -n "$unformatted" ]; then
         printf 'Go files require gofmt 1.25.12:\n%s\n' "$unformatted" >&2

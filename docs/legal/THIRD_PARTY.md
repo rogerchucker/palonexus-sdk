@@ -35,9 +35,13 @@ Python standard library.
 
 ## Dependency review inventory
 
-Versions are exact resolutions in `uv.lock`, including the Python build and
-development dependency closure. “Retain notices” means preserving the
-dependency's copyright and license text when its code is redistributed.
+Versions are exact resolutions in `uv.lock` for Python and exact requirements
+in `go.mod` reconciled to both content and metadata hashes in `go.sum` for Go.
+This includes the Python build/development dependency closure and direct plus
+indirect Go modules. Go replacements, local/private module paths, floating
+versions, checksum gaps, and unexpected checksum entries fail verification.
+“Retain notices” means preserving the dependency's copyright and license text
+when its code is redistributed.
 “Include supplied NOTICE” applies when an upstream Apache NOTICE file is
 present.
 
@@ -76,6 +80,14 @@ locked distribution without contacting the network.
 | filetype | 1.2.0 | MIT | reviewed | Retain supplied license | None supplied | PyPI |
 | google-auth | 2.56.2 | Apache-2.0 | reviewed | Retain supplied license | None supplied | PyPI |
 | google-genai | 2.14.0 | Apache-2.0 | reviewed | Retain supplied license | None supplied | PyPI |
+| github.com/coreos/go-oidc/v3 | v3.20.0 | Apache-2.0 | reviewed | Retain supplied license and copyright notices | None supplied | Go module proxy |
+| github.com/go-jose/go-jose/v4 | v4.1.4 | Apache-2.0 | reviewed | Retain supplied license and copyright notices | None supplied | Go module proxy |
+| github.com/keybase/dbus | v0.0.0-20220506165403-5aa21ea2c23a | BSD-2-Clause | reviewed | Retain supplied license and copyright notices | None supplied | Go module proxy |
+| golang.org/x/crypto | v0.54.0 | BSD-3-Clause | reviewed | Retain supplied license and copyright notices | None supplied | Go module proxy |
+| golang.org/x/net | v0.57.0 | BSD-3-Clause | reviewed | Retain supplied license and copyright notices | None supplied | Go module proxy |
+| golang.org/x/oauth2 | v0.36.0 | BSD-3-Clause | reviewed | Retain supplied license and copyright notices | None supplied | Go module proxy |
+| golang.org/x/sys | v0.47.0 | BSD-3-Clause | reviewed | Retain supplied license and copyright notices | None supplied | Go module proxy |
+| golang.org/x/text | v0.40.0 | BSD-3-Clause | reviewed | Retain supplied license and copyright notices | None supplied | Go module proxy |
 | hatch-vcs | 0.5.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | hatchling | 1.31.0 | MIT | reviewed | Retain notices | None identified | PyPI |
 | h11 | 0.16.0 | MIT | reviewed | Retain notices | None identified | PyPI |

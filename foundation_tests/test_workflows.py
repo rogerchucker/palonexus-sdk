@@ -153,7 +153,11 @@ def test_ci_runs_complete_supported_foundation_matrix_without_unsafe_caches() ->
     assert "enable-cache: false" in text
     assert "cache: false" in text
     assert "actions/cache" not in text
-    assert text.count("uv sync --frozen") == 1
+    # Both suites sync: the Go suite differentially tests against the Python
+    # reference canonicalizer, so it needs the same locked environment.
+    assert text.count("uv sync --frozen") == 2
+    assert "uv sync --frozen" in _steps_text(python)
+    assert "uv sync --frozen" in go_commands
     assert "uv run " not in text
     setup_go_steps = [
         step
@@ -214,7 +218,10 @@ def test_codeql_covers_python_and_go_with_only_required_write_permission() -> No
     assert setup_go["with"] == {"go-version": "1.25.12", "cache": "false"}
     manual_build = next(step for step in steps if step.get("name") == "Build Go")
     assert manual_build["if"] == "matrix.language == 'go'"
-    assert manual_build["run"] == "GOTOOLCHAIN=go1.25.12+auto go test ./..."
+    # CodeQL needs the product code compiled under its tracer, not exercised. The
+    # suite itself runs in Foundation CI, which owns the private temp root the
+    # keystore and state store require.
+    assert manual_build["run"] == "GOTOOLCHAIN=go1.25.12+auto go build ./..."
     init_index = next(
         index
         for index, step in enumerate(steps)
