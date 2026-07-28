@@ -78,6 +78,7 @@ def test_workflows_are_valid_yaml_with_least_privilege_and_immutable_actions() -
         WORKFLOWS / "codeql.yml",
         WORKFLOWS / "dependency-review.yml",
         WORKFLOWS / "python.yml",
+        WORKFLOWS / "release.yml",
     }
     for path, text in texts.items():
         workflow = _yaml(path)
