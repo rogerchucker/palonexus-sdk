@@ -48,7 +48,9 @@ jobs:
           python-version: ${{ matrix.python-version }}
           enable-cache: false
       - name: Sync locked dependencies
-        run: uv sync --frozen
+        # The extras are required: scripts/verify runs python/tests, whose
+        # integration modules import langchain, langgraph, and deepagents.
+        run: uv sync --frozen --all-extras
       - name: Verify Python and protocol foundation
         run: scripts/verify --python-only
 

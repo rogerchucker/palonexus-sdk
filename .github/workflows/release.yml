@@ -62,7 +62,8 @@ jobs:
           python-version: "3.12"
           enable-cache: false
       - name: Sync locked dependencies
-        run: uv sync --frozen
+        # scripts/verify runs python/tests, which imports the optional extras.
+        run: uv sync --frozen --all-extras
       - name: Run the complete verification suite
         run: scripts/verify
 

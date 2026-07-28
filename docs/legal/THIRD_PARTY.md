@@ -48,7 +48,7 @@ build environments so their resolver cannot float a transitive build tool.
 The verifier derives that closure from `uv.lock` and requires every member to
 be present as an exact build requirement.
 
-After one explicit `uv sync --frozen`, verification runs
+After one explicit `uv sync --frozen --all-extras`, verification runs
 `uv lock --check --offline`; every `uv run` uses
 `--frozen --offline --no-sync`. It checks every manifest constraint against the
 locked version, requires the canonical PyPI registry and
