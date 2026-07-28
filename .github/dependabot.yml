@@ -8,6 +8,12 @@ updates:
     labels:
       - dependencies
       - ci
+    # Every workflow pins the same actions, so separate PRs all edit the same
+    # few lines of ci.yml and conflict with each other. One PR per week instead.
+    groups:
+      github-actions:
+        patterns:
+          - "*"
   - package-ecosystem: pip
     directory: /
     schedule:
@@ -19,6 +25,14 @@ updates:
     groups:
       python-development:
         dependency-type: development
+        # unicodedata2 is a protocol constant, not a dev dependency.
+        # palonexus._canonicalize raises at import unless the Unicode data is
+        # exactly 15.1.0, and the version drives the golden protocol vectors.
+        # Changing it is a protocol change under CONTRIBUTING.md.
+        exclude-patterns:
+          - unicodedata2
+    ignore:
+      - dependency-name: unicodedata2
   - package-ecosystem: gomod
     directory: /
     schedule:

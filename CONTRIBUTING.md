@@ -22,9 +22,13 @@ commands. Do not use `pip`, checked-in virtual environments, or ad hoc
 requirements files.
 
 ```console
-uv sync --frozen
+uv sync --frozen --all-extras
 scripts/verify
 ```
+
+`scripts/verify` covers the foundation, protocol, and Python SDK suites, so the
+environment needs the optional extras: the SDK integration tests import
+`langchain`, `langgraph`, and `deepagents`.
 
 The explicit sync is the only verification phase allowed to fetch locked
 artifacts. `scripts/verify` then runs frozen, offline, and without syncing. It

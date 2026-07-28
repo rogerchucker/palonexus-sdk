@@ -120,7 +120,12 @@ def test_ci_runs_complete_supported_foundation_matrix_without_unsafe_caches() ->
         "uv lock --check --offline",
         "uv run --frozen --offline --no-sync ruff format --check",
         "uv run --frozen --offline --no-sync ruff check",
-        "uv run --frozen --offline --no-sync pytest foundation_tests protocol/tests -q",
+        # Pinned whole so the SDK suite cannot silently fall out of the single
+        # verification entrypoint again. `python/tests` was covered only by the
+        # separate Python SDK workflow, so a broken SDK suite looked green to
+        # anyone running `scripts/verify` locally.
+        "uv run --frozen --offline --no-sync pytest \\\n"
+        "        foundation_tests protocol/tests python/tests -q",
         "uv run --frozen --offline --no-sync "
         "python scripts/generate_protocol.py --check",
         "uv run --frozen --offline --no-sync python scripts/verify_legal.py",

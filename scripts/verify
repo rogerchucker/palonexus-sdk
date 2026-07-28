@@ -11,12 +11,13 @@ usage() {
     cat <<'EOF'
 Usage: scripts/verify [MODE]
 
-Without a mode, run the complete foundation and protocol verification suite.
-Run "uv sync --frozen" once first. Verification then keeps every Python
-invocation frozen, offline, and no-sync.
+Without a mode, run the complete foundation, protocol, and SDK suite.
+Run "uv sync --frozen --all-extras" once first; the SDK integration tests
+import the optional extras. Verification then keeps every Python invocation
+frozen, offline, and no-sync.
 
 Modes:
-  --python-only              Run locked Python, protocol, generation, and legal checks.
+  --python-only              Run locked Python, protocol, SDK, generation, and legal checks.
   --go-only                  Run Go 1.25.12 formatting, vet, and tests.
   --host-gate-only           Require and run the trusted Gate 0 fixture verifier.
   --require-host-gate        Run the complete suite and then require Gate 0.
@@ -54,7 +55,8 @@ run_python() {
     uv run --frozen --offline --no-sync ruff check \
         python protocol scripts foundation_tests
     uv run --frozen --offline --no-sync python scripts/generate_protocol.py --check
-    uv run --frozen --offline --no-sync pytest foundation_tests protocol/tests -q
+    uv run --frozen --offline --no-sync pytest \
+        foundation_tests protocol/tests python/tests -q
     uv run --frozen --offline --no-sync python scripts/verify_legal.py
 }
 
