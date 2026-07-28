@@ -66,6 +66,21 @@ jobs:
         with:
           go-version: "1.25.12"
           cache: false
+      # `guard/internal/normalize` differentially tests the Go tokenizer against
+      # the Python reference canonicalizer, so the Go suite needs the locked
+      # Python environment too.
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: "0.11.20"
+          python-version: "3.12"
+          enable-cache: false
+      - name: Sync locked dependencies
+        run: uv sync --frozen
       - name: Verify generated Go protocol types
         run: scripts/verify --go-only
 

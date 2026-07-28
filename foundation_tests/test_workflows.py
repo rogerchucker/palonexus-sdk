@@ -148,7 +148,11 @@ def test_ci_runs_complete_supported_foundation_matrix_without_unsafe_caches() ->
     assert "enable-cache: false" in text
     assert "cache: false" in text
     assert "actions/cache" not in text
-    assert text.count("uv sync --frozen") == 1
+    # Both suites sync: the Go suite differentially tests against the Python
+    # reference canonicalizer, so it needs the same locked environment.
+    assert text.count("uv sync --frozen") == 2
+    assert "uv sync --frozen" in _steps_text(python)
+    assert "uv sync --frozen" in go_commands
     assert "uv run " not in text
     setup_go_steps = [
         step
