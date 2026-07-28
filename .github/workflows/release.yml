@@ -1,0 +1,131 @@
+name: Release
+
+# Tag-triggered publish of the `palonexus` wheel to PyPI via Trusted Publishing.
+#
+# The version is not written anywhere in this repository: `hatch-vcs` derives it
+# from the git tag, so the tag IS the version. `publish` re-checks that the built
+# artifact matches the tag before uploading, because a mismatch here is silent.
+#
+# Publishing uses `uv publish --trusted-publishing always`, which performs the
+# GitHub OIDC exchange itself. That keeps the action set inside the owners the
+# foundation contract approves.
+#
+# One-time setup outside this repository:
+#   PyPI     -> project `palonexus`, trusted publisher for rogerchucker/palonexus-sdk,
+#               workflow `release.yml`, environment `pypi`
+#   TestPyPI -> the same, with environment `testpypi`
+#   GitHub   -> environments `pypi` and `testpypi` must exist on this repository
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      target:
+        description: "Index to publish to (dry-run to TestPyPI by default)"
+        type: choice
+        options: [testpypi, pypi]
+        default: testpypi
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify before release
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Set up Go
+        uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6.5.0
+        with:
+          go-version: "1.25.12"
+          cache: false
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: "0.11.20"
+          python-version: "3.12"
+          enable-cache: false
+      - name: Sync locked dependencies
+        run: uv sync --frozen
+      - name: Run the complete verification suite
+        run: scripts/verify
+
+  publish:
+    name: Publish to ${{ (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi') && 'TestPyPI' || 'PyPI' }}
+    needs: [verify]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    environment: ${{ (github.event_name == 'workflow_dispatch' && inputs.target == 'testpypi') && 'testpypi' || 'pypi' }}
+    permissions:
+      # Job-level permissions replace the workflow-level block, so both are listed.
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out source
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          # hatch-vcs reads the tag history to derive the version.
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@37802adc94f370d6bfd71619e3f0bf239e1f3b78 # v7.6.0
+        with:
+          version: "0.11.20"
+          python-version: "3.12"
+          enable-cache: false
+      - name: Build the wheel and sdist
+        run: uv build --out-dir dist python
+      - name: Check artifact metadata
+        run: uvx twine check dist/*
+      - name: Require the built version to match the tag
+        if: github.event_name == 'push'
+        env:
+          GIT_TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          expected="${GIT_TAG#v}"
+          built=$(ls dist/*.whl | sed -E 's|.*/palonexus-([^-]+)-py3.*|\1|')
+          if [ "$built" != "$expected" ]; then
+            printf 'tag %s expects version %s but the wheel is %s\n' \
+              "$GIT_TAG" "$expected" "$built" >&2
+            exit 1
+          fi
+          printf 'version %s matches tag %s\n' "$built" "$GIT_TAG"
+      - name: Resolve the target index
+        id: index
+        env:
+          TARGET: ${{ inputs.target }}
+          EVENT: ${{ github.event_name }}
+        run: |
+          set -euo pipefail
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$TARGET" = "testpypi" ]; then
+            echo "url=https://test.pypi.org/legacy/" >>"$GITHUB_OUTPUT"
+          else
+            echo "url=https://upload.pypi.org/legacy/" >>"$GITHUB_OUTPUT"
+          fi
+      - name: Publish with Trusted Publishing
+        run: >-
+          uv publish
+          --trusted-publishing always
+          --publish-url "${{ steps.index.outputs.url }}"
+          dist/*
