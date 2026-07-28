@@ -213,7 +213,9 @@ def test_codeql_covers_python_and_go_with_only_required_write_permission() -> No
     assert setup_go["with"] == {"go-version": "1.25.12", "cache": "false"}
     manual_build = next(step for step in steps if step.get("name") == "Build Go")
     assert manual_build["if"] == "matrix.language == 'go'"
-    assert manual_build["run"] == "GOTOOLCHAIN=go1.25.12+auto go test ./..."
+    # Compile every package and test binary for CodeQL without executing tests:
+    # analysis needs the build, and the suite already runs in Foundation CI.
+    assert manual_build["run"] == "GOTOOLCHAIN=go1.25.12+auto go test -run '^$' ./..."
     init_index = next(
         index
         for index, step in enumerate(steps)
