@@ -48,6 +48,6 @@ jobs:
           build-mode: ${{ matrix.build-mode }}
       - name: Build Go
         if: matrix.language == 'go'
-        run: GOTOOLCHAIN=go1.25.12+auto go test -run '^$' ./...
+        run: GOTOOLCHAIN=go1.25.12+auto go build ./...
       - name: Analyze
         uses: github/codeql-action/analyze@c793b717bc78562f491db7b0e93a3a178b099162 # v4.32.5
