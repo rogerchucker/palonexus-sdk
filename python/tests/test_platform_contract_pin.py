@@ -156,12 +156,18 @@ def test_release_verifies_reviewed_mirror_without_private_repo_credentials() -> 
         for step in publish_steps
         if step.get("name") == "Build the wheel and sdist"
     )
+    metadata = next(
+        step for step in publish_steps if step.get("name") == "Check artifact metadata"
+    )
     upload = next(
         step
         for step in publish_steps
         if step.get("name") == "Publish with Trusted Publishing"
     )
     assert build["run"] == "uv build --out-dir dist python"
+    assert metadata["run"] == "uvx twine check dist/*.whl dist/*.tar.gz"
+    assert upload["run"].endswith("dist/*.whl dist/*.tar.gz")
+    assert "dist/*\n" not in upload["run"]
     assert publish_steps.index(build) < publish_steps.index(upload)
 
 
