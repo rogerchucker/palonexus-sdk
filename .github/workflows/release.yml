@@ -46,6 +46,27 @@ jobs:
         with:
           fetch-depth: 0
           persist-credentials: false
+      - name: Resolve the pinned platform contract
+        id: platform-contract
+        shell: bash
+        run: |
+          set -euo pipefail
+          pin=contracts/platform-contract-sha.txt
+          if ! grep -Eq '^[0-9a-f]{40}$' "$pin" \
+            || [ "$(wc -l <"$pin")" -ne 1 ] \
+            || [ "$(wc -c <"$pin")" -ne 41 ]; then
+            printf 'platform contract pin must be exactly one lowercase 40-character SHA\n' >&2
+            exit 1
+          fi
+          printf 'sha=%s\n' "$(tr -d '\n' <"$pin")" >>"$GITHUB_OUTPUT"
+      - name: Check out the pinned platform contract
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          repository: rogerchucker/palonexus-platform
+          ref: ${{ steps.platform-contract.outputs.sha }}
+          path: platform-contract
+          fetch-depth: 1
+          persist-credentials: false
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -64,6 +85,24 @@ jobs:
       - name: Sync locked dependencies
         # scripts/verify runs python/tests, which imports the optional extras.
         run: uv sync --frozen --all-extras
+      - name: Byte-compare canonical developer schemas
+        run: >-
+          uv run --frozen python scripts/verify_platform_contracts.py
+          --sdk-root .
+          --platform-root platform-contract
+      - name: Run SDK contract tests
+        shell: bash
+        run: |
+          set -euo pipefail
+          mapfile -t contract_tests < <(
+            find python/tests -maxdepth 1 -type f -name 'test_*contract*.py' -print \
+              | LC_ALL=C sort
+          )
+          if [ "${#contract_tests[@]}" -eq 0 ]; then
+            printf 'no SDK contract tests found\n' >&2
+            exit 1
+          fi
+          uv run --frozen python -m pytest "${contract_tests[@]}" -q
       - name: Run the complete verification suite
         run: scripts/verify
 
@@ -77,6 +116,8 @@ jobs:
       # Job-level permissions replace the workflow-level block, so both are listed.
       contents: read
       id-token: write
+    outputs:
+      version: ${{ steps.built-version.outputs.version }}
     steps:
       - name: Check out source
         uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
@@ -98,20 +139,24 @@ jobs:
         run: uv build --out-dir dist python
       - name: Check artifact metadata
         run: uvx twine check dist/*
-      - name: Require the built version to match the tag
-        if: github.event_name == 'push'
+      - name: Resolve and validate the built version
+        id: built-version
         env:
           GIT_TAG: ${{ github.ref_name }}
+          EVENT: ${{ github.event_name }}
         run: |
           set -euo pipefail
-          expected="${GIT_TAG#v}"
           built=$(ls dist/*.whl | sed -E 's|.*/palonexus-([^-]+)-py3.*|\1|')
-          if [ "$built" != "$expected" ]; then
-            printf 'tag %s expects version %s but the wheel is %s\n' \
-              "$GIT_TAG" "$expected" "$built" >&2
-            exit 1
+          if [ "$EVENT" = "push" ]; then
+            expected="${GIT_TAG#v}"
+            if [ "$built" != "$expected" ]; then
+              printf 'tag %s expects version %s but the wheel is %s\n' \
+                "$GIT_TAG" "$expected" "$built" >&2
+              exit 1
+            fi
+            printf 'version %s matches tag %s\n' "$built" "$GIT_TAG"
           fi
-          printf 'version %s matches tag %s\n' "$built" "$GIT_TAG"
+          echo "version=$built" >>"$GITHUB_OUTPUT"
       - name: Resolve the target index
         id: index
         env:
@@ -130,3 +175,73 @@ jobs:
           --trusted-publishing always
           --publish-url "${{ steps.index.outputs.url }}"
           dist/*
+
+  verify-published:
+    name: Verify fresh published developer workflow
+    needs: [publish]
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    env:
+      EXPECTED_VERSION: ${{ needs.publish.outputs.version }}
+      EXPECTED_REVISION: ${{ github.sha }}
+    steps:
+      - name: Check out verifier
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Set up Python
+        uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
+        with:
+          python-version: "3.12"
+      - name: Set up uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.20"
+          python-version: "3.12"
+          enable-cache: false
+      - name: Install and verify the published release
+        shell: bash
+        env:
+          EVENT: ${{ github.event_name }}
+          TARGET: ${{ inputs.target }}
+        run: |
+          set -euo pipefail
+          export HOME="$RUNNER_TEMP/pnxs-home"
+          export UV_TOOL_DIR="$RUNNER_TEMP/pnxs-tool"
+          export UV_TOOL_BIN_DIR="$RUNNER_TEMP/pnxs-bin"
+          export UV_CACHE_DIR="$RUNNER_TEMP/pnxs-cache"
+          export UV_NO_CONFIG=1
+          export UV_INDEX_STRATEGY=first-index
+          mkdir -m 700 "$HOME" "$UV_TOOL_DIR" "$UV_TOOL_BIN_DIR" "$UV_CACHE_DIR"
+
+          if [ "$EVENT" = "workflow_dispatch" ] && [ "$TARGET" = "testpypi" ]; then
+            package_json="https://test.pypi.org/pypi/palonexus/${EXPECTED_VERSION}/json"
+            export UV_INDEX="https://test.pypi.org/simple"
+            export UV_DEFAULT_INDEX="https://pypi.org/simple"
+          else
+            package_json="https://pypi.org/pypi/palonexus/${EXPECTED_VERSION}/json"
+            unset UV_INDEX
+            export UV_DEFAULT_INDEX="https://pypi.org/simple"
+          fi
+
+          available=0
+          for attempt in 1 2 3 4 5 6; do
+            if curl --fail --silent --show-error --max-time 20 "$package_json" >/dev/null; then
+              available=1
+              break
+            fi
+            sleep $((attempt * 5))
+          done
+          [ "$available" -eq 1 ] || {
+            printf 'published version %s is not visible at %s\n' \
+              "$EXPECTED_VERSION" "$package_json" >&2
+            exit 1
+          }
+
+          uv tool install --no-config --index-strategy first-index \
+            "palonexus==${EXPECTED_VERSION}"
+          python scripts/verify_published_developer_workflow.py \
+            --expected-version "$EXPECTED_VERSION" \
+            --expected-revision "$EXPECTED_REVISION" \
+            --pnxs "$UV_TOOL_BIN_DIR/pnxs" \
+            --workspace "$RUNNER_TEMP/pnxs-workspace"
