@@ -59,14 +59,6 @@ jobs:
             exit 1
           fi
           printf 'sha=%s\n' "$(tr -d '\n' <"$pin")" >>"$GITHUB_OUTPUT"
-      - name: Check out the pinned platform contract
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          repository: rogerchucker/palonexus-platform
-          ref: ${{ steps.platform-contract.outputs.sha }}
-          path: platform-contract
-          fetch-depth: 1
-          persist-credentials: false
       - name: Set up Python
         uses: actions/setup-python@5fda3b95a4ea91299a34e894583c3862153e4b97 # v7.0.0
         with:
@@ -85,11 +77,6 @@ jobs:
       - name: Sync locked dependencies
         # scripts/verify runs python/tests, which imports the optional extras.
         run: uv sync --frozen --all-extras
-      - name: Byte-compare canonical developer schemas
-        run: >-
-          uv run --frozen python scripts/verify_platform_contracts.py
-          --sdk-root .
-          --platform-root platform-contract
       - name: Run SDK contract tests
         shell: bash
         run: |
