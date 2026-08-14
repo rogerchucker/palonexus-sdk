@@ -23,7 +23,6 @@ PACKAGE = ROOT / "python"
 PIN = ROOT / "contracts/platform-contract-sha.txt"
 RELEASE_WORKFLOW = ROOT / ".github/workflows/release.yml"
 CONTRACT_VERIFIER = ROOT / "scripts/verify_platform_contracts.py"
-PLATFORM_REPOSITORY = "rogerchucker/palonexus-platform"
 BUILD_METADATA_PREFIX = "platform-contract-sha:"
 SCHEMA_PATH = "contracts/developer/action.schema.json"
 
@@ -119,7 +118,7 @@ def test_wheel_metadata_records_the_platform_contract_not_its_own_digest(
     )
 
 
-def test_release_checks_out_and_byte_compares_the_pinned_platform_contract() -> None:
+def test_release_verifies_reviewed_mirror_without_private_repo_credentials() -> None:
     platform_sha = _platform_sha()
     project = _project()
     workflow = _workflow()
@@ -128,16 +127,6 @@ def test_release_checks_out_and_byte_compares_the_pinned_platform_contract() -> 
     assert isinstance(steps, list)
 
     resolve = next(step for step in steps if step.get("id") == "platform-contract")
-    platform_checkout = next(
-        step
-        for step in steps
-        if step.get("name") == "Check out the pinned platform contract"
-    )
-    verifier = next(
-        step
-        for step in steps
-        if step.get("name") == "Byte-compare canonical developer schemas"
-    )
     contract_tests = next(
         step for step in steps if step.get("name") == "Run SDK contract tests"
     )
@@ -149,25 +138,14 @@ def test_release_checks_out_and_byte_compares_the_pinned_platform_contract() -> 
 
     assert project["keywords"] == [f"{BUILD_METADATA_PREFIX}{platform_sha}"]
     assert "contracts/platform-contract-sha.txt" in resolve["run"]
-    assert platform_checkout["uses"].startswith("actions/checkout@")
-    assert platform_checkout["with"] == {
-        "repository": PLATFORM_REPOSITORY,
-        "ref": "${{ steps.platform-contract.outputs.sha }}",
-        "path": "platform-contract",
-        "fetch-depth": "1",
-        "persist-credentials": "false",
-    }
-    assert verifier["run"] == (
-        "uv run --frozen python scripts/verify_platform_contracts.py "
-        "--sdk-root . --platform-root platform-contract"
+    assert not any(
+        step.get("with", {}).get("repository") == "rogerchucker/palonexus-platform"
+        for step in steps
     )
     assert "uv run --frozen python -m pytest" in contract_tests["run"]
     assert complete_suite["run"] == "scripts/verify"
-    assert steps.index(resolve) < steps.index(platform_checkout) < steps.index(verifier)
     assert (
-        steps.index(verifier)
-        < steps.index(contract_tests)
-        < steps.index(complete_suite)
+        steps.index(resolve) < steps.index(contract_tests) < steps.index(complete_suite)
     )
 
     publish = workflow["jobs"]["publish"]

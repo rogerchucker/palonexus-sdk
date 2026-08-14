@@ -244,6 +244,7 @@ def test_nested_denial_never_invokes_child_handler() -> None:
 def test_approval_signal_propagates_without_execution_or_secret_state() -> None:
     middleware, _ = _authorization(ScriptedEngine.approval_required())
     calls = 0
+    secret_item_id = "private-item-value-must-not-escape"
 
     def handler(request: ToolCallRequest) -> ToolMessage:
         del request
@@ -252,10 +253,12 @@ def test_approval_signal_propagates_without_execution_or_secret_state() -> None:
         raise AssertionError("approval-pending action must not execute")
 
     with pytest.raises(LangChainApprovalRequired) as raised:
-        middleware.wrap_tool_call(_request("coordinator"), handler)
+        middleware.wrap_tool_call(
+            _request("coordinator", item_id=secret_item_id), handler
+        )
     assert calls == 0
     assert raised.value.correlation_id == CORRELATION
-    assert "42" not in str(raised.value)
+    assert secret_item_id not in str(raised.value)
     assert not hasattr(raised.value, "action")
 
 
