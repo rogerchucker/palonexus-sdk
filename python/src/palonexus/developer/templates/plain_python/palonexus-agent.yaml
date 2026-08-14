@@ -1,0 +1,33 @@
+schemaVersion: palonexus.agent/v1
+name: release-risk-reviewer
+version: 0.1.0
+entrypoint:
+  module: agent
+  symbol: review_release
+inputSchema:
+  type: object
+  additionalProperties: false
+  required: [change_id, risk, summary]
+  properties:
+    change_id: { type: string }
+    risk: { type: string, enum: [low, medium, high] }
+    summary: { type: string }
+outputSchema: &assessmentPayload
+  type: object
+  additionalProperties: false
+  required: [assessment]
+  properties:
+    assessment:
+      type: object
+      additionalProperties: false
+      required: [risk, score]
+      properties:
+        risk: { type: string, enum: [low, medium, high] }
+        score: { type: number, minimum: 0, maximum: 1 }
+actions:
+  - action: release.assessment.publish
+    resource: release/demo
+    target: release-assessments
+    approval: exact-action
+    constraints: { max_risk_score: 1 }
+    argumentSchema: *assessmentPayload

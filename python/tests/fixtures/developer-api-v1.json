@@ -1,0 +1,151 @@
+{
+  "developer_agent_registration": {
+    "schema_version": "palonexus.developer-agent/v1",
+    "name": "release-risk-reviewer",
+    "descriptor_digest": "bd6e7b087ed88820cb23d1fcbc8120bb44f6427f75526e0b7f21d7b85bebaa98",
+    "public_key_jwk": {
+      "kty": "OKP",
+      "crv": "Ed25519",
+      "x": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA",
+      "kid": "agent-key-1",
+      "use": "sig",
+      "alg": "EdDSA"
+    },
+    "proof": {
+      "alg": "EdDSA",
+      "key_thumbprint": "1111111111111111111111111111111111111111111111111111111111111111",
+      "signature": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+    }
+  },
+  "capability_ceiling_request": {
+    "schema_version": "palonexus.ceiling-request/v1",
+    "agent_id": "agent-demo-1",
+    "agent_generation": 1,
+    "descriptor_digest": "bd6e7b087ed88820cb23d1fcbc8120bb44f6427f75526e0b7f21d7b85bebaa98",
+    "rules": [
+      {
+        "schema_version": "palonexus.requested-capability/v1",
+        "canonical_action": "release.assessment.publish",
+        "resource": "release/demo",
+        "constraints": {"max_risk_score": 1},
+        "logical_target_id": "release-assessments"
+      }
+    ]
+  },
+  "create_action_request": {
+    "schema_version": "palonexus.action-request/v1",
+    "agent_id": "agent-demo-1",
+    "agent_generation": 1,
+    "lease_id": "lease-demo-1",
+    "descriptor_digest": "bd6e7b087ed88820cb23d1fcbc8120bb44f6427f75526e0b7f21d7b85bebaa98",
+    "input_digest": "1bf21246760cc3c03ca96f638b424f6422f236877ac8fc7f692fc7e447d7d9c1",
+    "canonical_action": "release.assessment.publish",
+    "resource": "release/demo",
+    "payload": {"assessment": {"risk": "low", "score": 0.12}},
+    "payload_digest": "944a45e84064aa1b414ff73bb748ecd15b65aeccbd98e5664824c1ba962810b5",
+    "idempotency_key": "effect-demo-1"
+  },
+  "developer_action": {
+    "schema_version": "palonexus.action/v1",
+    "run_id": "run-demo-1",
+    "root_action_id": "root-action-demo-1",
+    "action_id": "action-demo-1",
+    "request": {
+      "schema_version": "palonexus.action-request/v1",
+      "agent_id": "agent-demo-1",
+      "agent_generation": 1,
+      "lease_id": "lease-demo-1",
+      "descriptor_digest": "bd6e7b087ed88820cb23d1fcbc8120bb44f6427f75526e0b7f21d7b85bebaa98",
+      "input_digest": "1bf21246760cc3c03ca96f638b424f6422f236877ac8fc7f692fc7e447d7d9c1",
+      "canonical_action": "release.assessment.publish",
+      "resource": "release/demo",
+      "payload": {"assessment": {"risk": "low", "score": 0.12}},
+      "payload_digest": "944a45e84064aa1b414ff73bb748ecd15b65aeccbd98e5664824c1ba962810b5",
+      "idempotency_key": "effect-demo-1"
+    },
+    "state": "pending"
+  },
+  "exact_leaf_authority_v1": {
+    "schema_version": "1",
+    "delegation_id": "leaf-demo-1",
+    "tenant_id": "tenant-demo-1",
+    "agent_name": "release-risk-reviewer",
+    "accountable_owner": "member-developer-1",
+    "run_requester": "member-developer-1",
+    "run_sponsor": "member-developer-1",
+    "parent_authority_ref": "grant-demo-1",
+    "run_id": "run-demo-1",
+    "task_id": "task-demo-1",
+    "root_action_id": "root-action-demo-1",
+    "canonical_action": "release.assessment.publish",
+    "exact_resource": "release/demo",
+    "target": {
+      "schema_version": "1",
+      "registration_id": "target-demo-1",
+      "version": 1,
+      "mapping_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+      "target": "release-assessments",
+      "target_kind": "artifact",
+      "canonical_action": "release.assessment.publish",
+      "audience": "release-assessments",
+      "downstream_scope": "assessment:publish"
+    },
+    "ceiling_approver": "member-owner-1",
+    "action_approver": "member-owner-1",
+    "approval_ref": "approval-demo-1",
+    "issued_at": "2026-08-12T12:00:00Z",
+    "expires_at": "2026-08-12T12:05:00Z"
+  },
+  "canonical_json_vectors": [
+    {"name": "object-order-unicode-escaping", "value": {"z": 1, "a": "é", "escape": "line\nquote\""}, "canonical_utf8": "{\"a\":\"é\",\"escape\":\"line\\nquote\\\"\",\"z\":1}", "sha256": "728fe05f08b33b622fdaec1c0e53f812e8c7d6c1ba97510d49dd1c14f3b84d34"},
+    {"name": "utf16-key-order", "value": {"": 1, "𐀀": 2}, "canonical_utf8": "{\"𐀀\":2,\"\":1}", "sha256": "9d4cdc71dda603c42f9b21d88d0c2ffc31a76cd1bd461d7359406cf169845f1e"},
+    {"name": "negative-zero", "value": -0.0, "canonical_utf8": "0", "sha256": "5feceb66ffc86f38d952786c6d696c79c2dbc239dd4e91b46729d73a27fb57e9"},
+    {"name": "integer", "value": 1, "canonical_utf8": "1", "sha256": "6b86b273ff34fce19d6b804eff5a3f5747ada4eaa22f1d49c01e52ddb7875b4b"},
+    {"name": "fraction", "value": 1.5, "canonical_utf8": "1.5", "sha256": "9f29a130438b81170b92a42650f9a94291ecad60bd47af2a3886e75f7f728725"},
+    {"name": "small-exponent", "value": 1e-7, "canonical_utf8": "1e-7", "sha256": "5b33e02f2c5103a05d32f6ba9cb058294452bfbf393967f68bb30c1bdcbbab22"},
+    {"name": "integer-rendered-float", "value": 1e20, "canonical_utf8": "100000000000000000000", "sha256": "c344e9487bfbd5c4e03c9fb90d62a5dde5e00b54d55c46e9f4a803aea162b80c"},
+    {"name": "large-exponent", "value": 1e21, "canonical_utf8": "1e+21", "sha256": "241c4643fa70b1dcde1205b71be4e3bebb17e9f880c8e1a33d0ead6c27271d3c"},
+    {"name": "rounded-binary64", "value": 333333333.33333329, "canonical_utf8": "333333333.3333333", "sha256": "6bd9be1c141028789cc35db62f1b43e80d5d4ee24d6d542e775deb16799ff4c7"}
+  ],
+  "timestamp_vectors": {
+    "valid": ["2026-08-12T12:00:00Z", "2026-08-12T12:00:00.123456Z", "2026-08-12T12:00:00+05:30", "2026-08-12T12:00:00-07:00"],
+    "invalid": ["2026-08-12 12:00:00Z", "2026-08-12T12:00:00+0000", "2026-08-12t12:00:00Z", "2026-08-12T12:00:00z", " 2026-08-12T12:00:00Z", "2026-08-12T12:00:00Z ", "2026-08-12T12:00:00.Z", "2026-02-30T12:00:00Z", "2026-08-12T25:00:00Z", "2026-08-12T12:00:00", "٢٠٢٦-08-12T12:00:00Z"]
+  },
+  "exact_action_leaf_authority_v2": {
+    "schema_version": "palonexus.exact-action/v2",
+    "delegation_id": "leaf-demo-2",
+    "tenant_id": "tenant-demo-1",
+    "agent_name": "release-risk-reviewer",
+    "accountable_owner": "member-developer-1",
+    "run_requester": "member-developer-1",
+    "run_sponsor": "member-developer-1",
+    "parent_authority_ref": "grant-demo-1",
+    "run_id": "run-demo-1",
+    "task_id": "task-demo-1",
+    "root_action_id": "root-action-demo-1",
+    "canonical_action": "release.assessment.publish",
+    "exact_resource": "release/demo",
+    "target": {
+      "schema_version": "1",
+      "registration_id": "target-demo-1",
+      "version": 1,
+      "mapping_hash": "2222222222222222222222222222222222222222222222222222222222222222",
+      "target": "release-assessments",
+      "target_kind": "artifact",
+      "canonical_action": "release.assessment.publish",
+      "audience": "release-assessments",
+      "downstream_scope": "assessment:publish"
+    },
+    "ceiling_approver": "member-owner-1",
+    "action_approver": "member-owner-1",
+    "approval_ref": "approval-demo-1",
+    "issued_at": "2026-08-12T12:00:00Z",
+    "expires_at": "2026-08-12T12:05:00Z",
+    "action_id": "action-demo-1",
+    "payload_digest": "944a45e84064aa1b414ff73bb748ecd15b65aeccbd98e5664824c1ba962810b5",
+    "effect_idempotency_key": "effect-demo-1",
+    "agent_generation": 1,
+    "authority_profile": "exact-action-v2",
+    "proxy_proof_key_thumbprint": "3333333333333333333333333333333333333333333333333333333333333333"
+  }
+}

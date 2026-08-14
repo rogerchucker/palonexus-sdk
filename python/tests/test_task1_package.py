@@ -20,7 +20,11 @@ def test_runtime_dependency_has_a_reviewed_compatible_range() -> None:
         "cryptography>=46.0.5,<47",
         "httpx>=0.28.1,<0.29",
         "idna==3.18",
+        "keyring>=25.7.0,<26",
+        "packaging>=26,<27",
         "pydantic>=2.13.4,<3",
+        "pyyaml==6.0.3",
+        "rfc8785>=0.1.4,<0.2",
         "unicodedata2==15.1.0",
     ]
 

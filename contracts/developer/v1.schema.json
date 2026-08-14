@@ -1,0 +1,209 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palonexus.cloud/developer/v1.schema.json",
+  "title": "PaloNexus reusable developer contracts v1",
+  "$comment": "Developer v1 payloads and requested-capability constraints use RFC 8785 JSON Canonicalization Scheme (JCS) UTF-8 bytes; payload_digest is SHA-256 over those exact bytes. This developer-only rule does not change pre-existing harness v1 canonicalization. Object names are sorted by UTF-16 code units, strings use JCS escaping without Unicode normalization, negative zero serializes as 0, numbers are finite IEEE-754 binary64 values, and integer-valued inputs are limited to the interoperable safe-integer domain. Duplicate object names are rejected before validation. JSON Schema cannot express JCS serialization, duplicate-name rejection, binary64 conversion, or the integer-vs-number source representation; runtime validation is authoritative for those annotated semantics.",
+  "x-palonexus-canonical-json": "RFC 8785 JCS",
+  "x-palonexus-canonical-json-media-type": "application/json",
+  "x-palonexus-canonical-json-encoding": "UTF-8",
+  "x-palonexus-duplicate-object-names": "reject",
+  "oneOf": [
+    {"$ref": "#/$defs/DeveloperAgentRegistration"},
+    {"$ref": "#/$defs/CapabilityCeilingRequest"},
+    {"$ref": "#/$defs/CreateActionRequest"},
+    {"$ref": "#/$defs/DeveloperAction"},
+    {"$ref": "#/$defs/ExactActionLeafAuthority"}
+  ],
+  "$defs": {
+    "CanonicalId": {
+      "type": "string",
+      "pattern": "^[A-Za-z0-9][A-Za-z0-9._:@~-]{0,127}$"
+    },
+    "CanonicalName": {
+      "type": "string",
+      "maxLength": 256,
+      "pattern": "^[a-z0-9][a-z0-9]*(?:[._:/-][a-z0-9]+)*$"
+    },
+    "Sha256Digest": {
+      "type": "string",
+      "pattern": "^[0-9a-f]{64}$"
+    },
+    "NonblankCanonicalString": {
+      "type": "string",
+      "pattern": "^(?:\\S|\\S[\\s\\S]*\\S)$"
+    },
+    "CanonicalRfc3339Timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
+    },
+    "JsonValue": {
+      "anyOf": [
+        {"type": "null"},
+        {"type": "boolean"},
+        {"type": "integer"},
+        {"type": "number"},
+        {"type": "string"},
+        {"type": "array", "items": {"$ref": "#/$defs/JsonValue"}},
+        {"type": "object", "additionalProperties": {"$ref": "#/$defs/JsonValue"}}
+      ]
+    },
+    "GovernedJsonValue": {
+      "$ref": "#/$defs/JsonValue",
+      "$comment": "Runtime validation additionally requires finite numbers, at most 64 levels, at most 100000 nodes, at most 1048576 processable bytes, and an exact SHA-256 match to payload_digest; JSON Schema cannot express those graph, byte-accounting, or cross-field digest constraints.",
+      "x-palonexus-finite-numbers": true,
+      "x-palonexus-max-depth": 64,
+      "x-palonexus-max-nodes": 100000,
+      "x-palonexus-max-processable-bytes": 1048576,
+      "x-palonexus-digest-field": "payload_digest"
+    },
+    "Ed25519PublicJWK": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kty", "crv", "x"],
+      "properties": {
+        "kty": {"const": "OKP"},
+        "crv": {"const": "Ed25519"},
+        "x": {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$", "$comment": "Runtime decodes and re-encodes unpadded base64url and requires byte-for-byte equality, rejecting aliases and nonzero trailing bits.", "x-palonexus-canonical-base64url": true},
+        "kid": {"$ref": "#/$defs/CanonicalId"},
+        "use": {"const": "sig"},
+        "alg": {"const": "EdDSA"}
+      }
+    },
+    "DetachedProof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alg", "key_thumbprint", "signature"],
+      "properties": {
+        "alg": {"const": "EdDSA"},
+        "key_thumbprint": {"$ref": "#/$defs/Sha256Digest"},
+        "signature": {"type": "string", "pattern": "^[A-Za-z0-9_-]{86}$", "$comment": "Runtime decodes and re-encodes unpadded base64url and requires byte-for-byte equality, rejecting aliases and nonzero trailing bits.", "x-palonexus-canonical-base64url": true}
+      }
+    },
+    "DeveloperAgentRegistration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "name", "descriptor_digest", "public_key_jwk", "proof"],
+      "properties": {
+        "schema_version": {"const": "palonexus.developer-agent/v1"},
+        "name": {"$ref": "#/$defs/CanonicalName"},
+        "descriptor_digest": {"$ref": "#/$defs/Sha256Digest"},
+        "public_key_jwk": {"$ref": "#/$defs/Ed25519PublicJWK"},
+        "proof": {"$ref": "#/$defs/DetachedProof"}
+      }
+    },
+    "RequestedCapabilityRule": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "canonical_action", "resource", "constraints", "logical_target_id"],
+      "properties": {
+        "schema_version": {"const": "palonexus.requested-capability/v1"},
+        "canonical_action": {"$ref": "#/$defs/CanonicalName"},
+        "resource": {"$ref": "#/$defs/CanonicalName"},
+        "constraints": {
+          "type": "object",
+          "maxProperties": 1024,
+          "additionalProperties": {"$ref": "#/$defs/JsonValue"},
+          "$comment": "Runtime validation additionally applies the governed JSON finite-number, depth, node, and processable-byte bounds."
+        },
+        "logical_target_id": {"$ref": "#/$defs/CanonicalId"}
+      }
+    },
+    "CapabilityCeilingRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "agent_id", "agent_generation", "descriptor_digest", "rules"],
+      "properties": {
+        "schema_version": {"const": "palonexus.ceiling-request/v1"},
+        "agent_id": {"$ref": "#/$defs/CanonicalId"},
+        "agent_generation": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "descriptor_digest": {"$ref": "#/$defs/Sha256Digest"},
+        "rules": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1024,
+          "items": {"$ref": "#/$defs/RequestedCapabilityRule"}
+        }
+      }
+    },
+    "CreateActionRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "agent_id", "agent_generation", "lease_id", "descriptor_digest", "input_digest", "canonical_action", "resource", "payload", "payload_digest", "idempotency_key"],
+      "properties": {
+        "schema_version": {"const": "palonexus.action-request/v1"},
+        "agent_id": {"$ref": "#/$defs/CanonicalId"},
+        "agent_generation": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "lease_id": {"$ref": "#/$defs/CanonicalId"},
+        "descriptor_digest": {"$ref": "#/$defs/Sha256Digest"},
+        "input_digest": {"$ref": "#/$defs/Sha256Digest"},
+        "canonical_action": {"$ref": "#/$defs/CanonicalName"},
+        "resource": {"$ref": "#/$defs/CanonicalName"},
+        "payload": {"$ref": "#/$defs/GovernedJsonValue"},
+        "payload_digest": {"$ref": "#/$defs/Sha256Digest"},
+        "idempotency_key": {"$ref": "#/$defs/CanonicalId"}
+      }
+    },
+    "DeveloperAction": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "run_id", "root_action_id", "action_id", "request", "state"],
+      "properties": {
+        "schema_version": {"const": "palonexus.action/v1"},
+        "run_id": {"$ref": "#/$defs/CanonicalId"},
+        "root_action_id": {"$ref": "#/$defs/CanonicalId"},
+        "action_id": {"$ref": "#/$defs/CanonicalId"},
+        "request": {"$ref": "#/$defs/CreateActionRequest"},
+        "state": {"enum": ["pending", "approved", "denied", "executing", "completed", "failed", "expired", "canceled"]}
+      }
+    },
+    "TargetRegistrationRef": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "registration_id", "version", "mapping_hash", "target", "target_kind", "canonical_action", "audience", "downstream_scope"],
+      "properties": {
+        "schema_version": {"const": "1"},
+        "registration_id": {"$ref": "#/$defs/NonblankCanonicalString"},
+        "version": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "mapping_hash": {"$ref": "#/$defs/Sha256Digest"},
+        "target": {"$ref": "#/$defs/NonblankCanonicalString"},
+        "target_kind": {"enum": ["tool", "mcp-server", "model", "agent", "filesystem", "memory", "artifact", "sandbox", "harness"]},
+        "canonical_action": {"$ref": "#/$defs/NonblankCanonicalString"},
+        "audience": {"$ref": "#/$defs/NonblankCanonicalString"},
+        "downstream_scope": {"$ref": "#/$defs/NonblankCanonicalString"}
+      }
+    },
+    "ExactActionLeafAuthority": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "delegation_id", "tenant_id", "agent_name", "accountable_owner", "run_requester", "run_sponsor", "parent_authority_ref", "run_id", "task_id", "root_action_id", "canonical_action", "exact_resource", "target", "ceiling_approver", "action_approver", "approval_ref", "issued_at", "expires_at", "action_id", "payload_digest", "effect_idempotency_key", "agent_generation", "authority_profile", "proxy_proof_key_thumbprint"],
+      "properties": {
+        "schema_version": {"const": "palonexus.exact-action/v2"},
+        "delegation_id": {"$ref": "#/$defs/NonblankCanonicalString"},
+        "tenant_id": {"$ref": "#/$defs/NonblankCanonicalString"},
+        "agent_name": {"$ref": "#/$defs/NonblankCanonicalString"},
+        "accountable_owner": {"$ref": "#/$defs/NonblankCanonicalString"},
+        "run_requester": {"$ref": "#/$defs/NonblankCanonicalString"},
+        "run_sponsor": {"$ref": "#/$defs/NonblankCanonicalString"},
+        "parent_authority_ref": {"$ref": "#/$defs/NonblankCanonicalString"},
+        "run_id": {"$ref": "#/$defs/NonblankCanonicalString"},
+        "task_id": {"$ref": "#/$defs/NonblankCanonicalString"},
+        "root_action_id": {"$ref": "#/$defs/NonblankCanonicalString"},
+        "canonical_action": {"$ref": "#/$defs/NonblankCanonicalString"},
+        "exact_resource": {"$ref": "#/$defs/NonblankCanonicalString"},
+        "target": {"$ref": "#/$defs/TargetRegistrationRef"},
+        "ceiling_approver": {"$ref": "#/$defs/NonblankCanonicalString"},
+        "action_approver": {"anyOf": [{"$ref": "#/$defs/NonblankCanonicalString"}, {"type": "null"}]},
+        "approval_ref": {"anyOf": [{"$ref": "#/$defs/NonblankCanonicalString"}, {"type": "null"}]},
+        "issued_at": {"$ref": "#/$defs/CanonicalRfc3339Timestamp"},
+        "expires_at": {"$ref": "#/$defs/CanonicalRfc3339Timestamp"},
+        "action_id": {"$ref": "#/$defs/CanonicalId"},
+        "payload_digest": {"$ref": "#/$defs/Sha256Digest"},
+        "effect_idempotency_key": {"$ref": "#/$defs/CanonicalId"},
+        "agent_generation": {"type": "integer", "minimum": 1, "maximum": 2147483647},
+        "authority_profile": {"const": "exact-action-v2"},
+        "proxy_proof_key_thumbprint": {"$ref": "#/$defs/Sha256Digest"}
+      }
+    }
+  }
+}

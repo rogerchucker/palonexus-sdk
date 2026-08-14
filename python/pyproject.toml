@@ -29,6 +29,7 @@ license-files = ["LICENSE"]
 authors = [
   { name = "PaloNexus maintainers" },
 ]
+keywords = ["platform-contract-sha:8d2547c7aaa66bb5d418b39b894ddc207026b1af"]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
   "License :: OSI Approved :: MIT License",
@@ -40,9 +41,16 @@ dependencies = [
   "cryptography>=46.0.5,<47",
   "httpx>=0.28.1,<0.29",
   "idna==3.18",
+  "keyring>=25.7.0,<26",
+  "packaging>=26,<27",
   "pydantic>=2.13.4,<3",
+  "pyyaml==6.0.3",
+  "rfc8785>=0.1.4,<0.2",
   "unicodedata2==15.1.0",
 ]
+
+[project.scripts]
+pnxs = "palonexus.cli.main:entrypoint"
 
 [project.urls]
 Homepage = "https://github.com/rogerchucker/palonexus-sdk"
@@ -78,12 +86,23 @@ search_parent_directories = true
 [tool.hatch.build.hooks.vcs]
 version-file = "src/palonexus/_version.py"
 
+[tool.hatch.build.hooks.custom]
+path = "hatch_build.py"
+
 [tool.hatch.build.targets.wheel]
 packages = ["src/palonexus"]
 
 [tool.hatch.build.targets.sdist]
 include = [
   "LICENSE",
+  "hatch_build.py",
   "pyproject.toml",
   "src/palonexus",
 ]
+
+[tool.palonexus.platform-contract]
+repository = "rogerchucker/palonexus-platform"
+# Task 1 adds canonical developer schemas to both repositories and lists their
+# repository-relative paths here. The release gate rejects missing, extra, or
+# byte-different files as soon as this list is populated.
+schema-paths = ["contracts/developer/v1.schema.json"]
