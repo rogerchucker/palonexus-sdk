@@ -125,7 +125,7 @@ jobs:
       - name: Build the wheel and sdist
         run: uv build --out-dir dist python
       - name: Check artifact metadata
-        run: uvx twine check dist/*
+        run: uvx twine check dist/*.whl dist/*.tar.gz
       - name: Resolve and validate the built version
         id: built-version
         env:
@@ -161,7 +161,7 @@ jobs:
           uv publish
           --trusted-publishing always
           --publish-url "${{ steps.index.outputs.url }}"
-          dist/*
+          dist/*.whl dist/*.tar.gz
 
   verify-published:
     name: Verify fresh published developer workflow
