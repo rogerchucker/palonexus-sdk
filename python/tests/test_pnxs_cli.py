@@ -492,6 +492,7 @@ def test_device_login_uses_strict_wire_contract_and_keeps_secrets_in_custody(
     requests: list[httpx.Request] = []
     stored: dict[str, dict[str, str]] = {}
     expected_jkt = ""
+    owner_subject = "okta:tenant-demo:~" + "a" * 218 + "~"
 
     class Store:
         def save(self, name: str, value: dict[str, str]) -> None:
@@ -553,6 +554,7 @@ def test_device_login_uses_strict_wire_contract_and_keeps_secrets_in_custody(
                 "tenant_id": "tenant-demo",
                 "account_id": "account-server-only",
                 "membership_id": "membership-demo",
+                "owner_subject": owner_subject,
                 "role": "member",
                 "device_jkt": expected_jkt,
                 "created_at": "2026-08-12T12:00:00Z",
@@ -574,6 +576,7 @@ def test_device_login_uses_strict_wire_contract_and_keeps_secrets_in_custody(
         }
     ]
     assert stored["session"]["session_token"] == "pnx_dev_session-secret"
+    assert stored["session"]["owner_subject"] == owner_subject
     assert stored["session"]["issuer_origin"] == "https://auth.example"
     assert "device_private_key" in stored["session"]
     wire = b"\n".join(request.content for request in requests)
@@ -638,6 +641,7 @@ def test_device_login_revokes_session_when_approved_tenant_misses_hint(
                     "tenant_id": "tenant-other",
                     "account_id": "account-server-only",
                     "membership_id": "membership-demo",
+                    "owner_subject": "okta:tenant-other:robin.singh",
                     "role": "member",
                     "device_jkt": expected_jkt,
                     "created_at": "2026-08-12T12:00:00Z",
@@ -879,13 +883,16 @@ def test_redeemed_session_is_bound_to_the_local_device_key() -> None:
         "tenant_id": "tenant-demo",
         "account_id": "account-server-only",
         "membership_id": "membership-demo",
+        "owner_subject": "okta:tenant-demo:robin.singh",
         "role": "member",
         "device_jkt": jkt,
         "created_at": "2026-08-12T12:00:00Z",
         "expires_at": "2026-08-12T20:00:00Z",
         "session_token": "pnx_dev_session-secret",
     }
-    assert _validate_device_session(valid, jkt)["device_jkt"] == jkt
+    session = _validate_device_session(valid, jkt)
+    assert session["device_jkt"] == jkt
+    assert session["owner_subject"] == "okta:tenant-demo:robin.singh"
     for field, replacement in (
         ("kind", "member"),
         ("role", "operator"),
@@ -1477,17 +1484,36 @@ def test_version_json_is_strict_and_contains_release_identity(
 def _registration_response(
     descriptor_digest: str, key_thumbprint: str
 ) -> dict[str, object]:
+    profile = _registration_profile()
     return {
         "schema_version": "palonexus.developer-agent/v1",
         "agent_id": "release-risk-reviewer",
         "name": "release-risk-reviewer",
         "tenant_id": "tenant-a",
-        "accountable_owner": "member-1",
+        "accountable_owner": "okta:tenant-a:robin-singh",
         "descriptor_digest": descriptor_digest,
         "key_thumbprint": key_thumbprint,
         "generation": 1,
         "status": "registered",
         "capabilities": [],
+        "descriptor_version": profile["descriptor_version"],
+        "runtime_profile": profile["runtime_profile"],
+        "composition_digest": profile["composition_digest"],
+        "harness_adapter_contracts": profile["harness_adapter_contracts"],
+        "not_before": profile["not_before"],
+        "expires_at": profile["expires_at"],
+    }
+
+
+def _registration_profile() -> dict[str, object]:
+    return {
+        "schema_version": "palonexus.agent-registration-profile/v1",
+        "descriptor_version": "0.2.0",
+        "runtime_profile": {"kind": "plain-python"},
+        "composition_digest": "b" * 64,
+        "harness_adapter_contracts": ["palonexus.actions/v1"],
+        "not_before": "2026-08-21T00:00:00Z",
+        "expires_at": "2027-08-21T00:00:00Z",
     }
 
 
@@ -1844,9 +1870,14 @@ def test_agent_registration_uses_exact_pop_contract_and_zero_authority() -> None
             "session_token": "pnx_dev_session",
             "tenant_id": "tenant-a",
             "membership_id": "member-1",
+            "owner_subject": "okta:tenant-a:robin-singh",
         },
         credential,
-        {"name": "release-risk-reviewer", "descriptor_digest": descriptor_digest},
+        {
+            "name": "release-risk-reviewer",
+            "descriptor_digest": descriptor_digest,
+            "authority_profile": _registration_profile(),
+        },
     )
 
     assert result["capabilities"] == []
@@ -1863,6 +1894,12 @@ def test_agent_registration_uses_exact_pop_contract_and_zero_authority() -> None
         "name",
         "descriptor_digest",
         "public_key_jwk",
+        "descriptor_version",
+        "runtime_profile",
+        "composition_digest",
+        "harness_adapter_contracts",
+        "not_before",
+        "expires_at",
         "proof",
     }
     assert "private" not in json.dumps(body).lower()
@@ -1872,6 +1909,14 @@ def test_agent_registration_uses_exact_pop_contract_and_zero_authority() -> None
             "key_thumbprint": thumbprint,
             "name": "release-risk-reviewer",
             "purpose": "palonexus.developer-agent-registration.v1",
+            "authority_profile": {
+                "descriptor_version": "0.2.0",
+                "runtime_profile": {"kind": "plain-python"},
+                "composition_digest": "b" * 64,
+                "harness_adapter_contracts": ["palonexus.actions/v1"],
+                "not_before": "2026-08-21T00:00:00Z",
+                "expires_at": "2027-08-21T00:00:00Z",
+            },
         },
         sort_keys=True,
         separators=(",", ":"),
@@ -1884,6 +1929,35 @@ def test_agent_registration_uses_exact_pop_contract_and_zero_authority() -> None
             credential["private_key"] + "=" * (-len(credential["private_key"]) % 4)
         )
     ).public_key().verify(signature, message)
+
+
+def test_registered_agent_resolves_owner_bound_identity() -> None:
+    response = _registration_response("a" * 64, "b" * 64)
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=response)
+
+    client = DeveloperClient(
+        "https://api.palonexus.cloud", transport=httpx.MockTransport(handler)
+    )
+    resolved = client.registered_agent(
+        {
+            "session_token": "pnx_dev_session",
+            "tenant_id": "tenant-a",
+            "owner_subject": "okta:tenant-a:robin-singh",
+        },
+        "release-risk-reviewer",
+    )
+
+    assert resolved == response
+    assert len(seen) == 1
+    assert seen[0].method == "GET"
+    assert seen[0].url == (
+        "https://api.palonexus.cloud/v1/developer/agents/release-risk-reviewer"
+    )
+    assert seen[0].headers["authorization"] == "Bearer pnx_dev_session"
 
 
 def test_ceiling_request_and_status_use_exact_router_contract() -> None:
@@ -2361,6 +2435,7 @@ def test_developer_action_delivery_capability_fails_closed(
         lambda value: {**value, "tenant_id": "tenant-b"},
         lambda value: {**value, "generation": True},
         lambda value: {**value, "capabilities": ["release.assessment.publish"]},
+        lambda value: {**value, "descriptor_version": "other-contract"},
     ],
 )
 def test_agent_registration_response_fails_closed_on_unsafe_or_malformed_data(
@@ -2382,9 +2457,14 @@ def test_agent_registration_response_fails_closed_on_unsafe_or_malformed_data(
                 "session_token": "pnx_dev_session",
                 "tenant_id": "tenant-a",
                 "membership_id": "member-1",
+                "owner_subject": "okta:tenant-a:robin-singh",
             },
             credential,
-            {"name": "release-risk-reviewer", "descriptor_digest": "a" * 64},
+            {
+                "name": "release-risk-reviewer",
+                "descriptor_digest": "a" * 64,
+                "authority_profile": _registration_profile(),
+            },
         )
 
 
@@ -2462,3 +2542,27 @@ actions:
     )
     with pytest.raises(CommandError, match="descriptor"):
         _project_descriptor(descriptor_path)
+
+
+def test_registration_profile_is_explicit_strict_and_required(
+    tmp_path: Path,
+) -> None:
+    from palonexus.cli.commands import _project_registration_profile
+
+    profile_path = tmp_path / "palonexus-registration.yaml"
+    profile_path.write_text(
+        """schema_version: palonexus.agent-registration-profile/v1
+descriptor_version: 0.2.0
+runtime_profile: {kind: plain-python}
+composition_digest: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+harness_adapter_contracts: [palonexus.actions/v1]
+not_before: '2026-08-21T00:00:00Z'
+expires_at: '2027-08-21T00:00:00Z'
+""",
+        encoding="utf-8",
+    )
+    assert _project_registration_profile(profile_path) == _registration_profile()
+
+    profile_path.unlink()
+    with pytest.raises(CommandError, match="palonexus-registration.yaml is required"):
+        _project_registration_profile(profile_path)

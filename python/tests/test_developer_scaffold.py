@@ -38,6 +38,7 @@ def test_scaffold_pins_installed_version_without_local_source(
         "fixtures",
         "fixtures/release-change.json",
         "palonexus-agent.yaml",
+        "palonexus-registration.yaml",
         "pyproject.toml",
         "uv.lock",
     ]
@@ -62,6 +63,15 @@ def test_scaffold_pins_installed_version_without_local_source(
     assert descriptor["inputSchema"]["required"] == ["change_id", "risk", "summary"]
     assert descriptor["outputSchema"] == descriptor["actions"][0]["argumentSchema"]
     assert descriptor["actions"][0]["constraints"] == {"max_risk_score": 1}
+    registration = yaml.safe_load(
+        (project / "palonexus-registration.yaml").read_text()
+    )
+    assert registration["schema_version"] == "palonexus.agent-registration-profile/v1"
+    assert registration["descriptor_version"] == "palonexus.agent-descriptor/v1"
+    assert registration["runtime_profile"] == {"kind": "plain-python"}
+    assert registration["composition_digest"] == "REPLACE_WITH_SHA256"
+    assert registration["not_before"] == "REPLACE_WITH_RFC3339"
+    assert registration["expires_at"] == "REPLACE_WITH_RFC3339"
 
 
 def test_scaffold_rejects_bad_version_existing_content_and_invalid_name(
