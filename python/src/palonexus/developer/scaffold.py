@@ -61,6 +61,7 @@ def initialize_plain_python(
         for source_name, destination in (
             ("agent.py", stage / "agent.py"),
             ("palonexus-agent.yaml", stage / "palonexus-agent.yaml"),
+            ("palonexus-registration.yaml", stage / "palonexus-registration.yaml"),
             ("fixtures/release-change.json", stage / "fixtures/release-change.json"),
         ):
             destination.parent.mkdir(parents=True, exist_ok=True)

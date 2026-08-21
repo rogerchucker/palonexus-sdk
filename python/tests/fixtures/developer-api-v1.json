@@ -3,6 +3,12 @@
     "schema_version": "palonexus.developer-agent/v1",
     "name": "release-risk-reviewer",
     "descriptor_digest": "bd6e7b087ed88820cb23d1fcbc8120bb44f6427f75526e0b7f21d7b85bebaa98",
+    "descriptor_version": "palonexus.agent-descriptor/v1",
+    "runtime_profile": {"kind": "plain-python", "version": "1"},
+    "composition_digest": "2222222222222222222222222222222222222222222222222222222222222222",
+    "harness_adapter_contracts": ["palonexus.harness-adapter/plain-python-v1"],
+    "not_before": "2026-08-12T12:00:00Z",
+    "expires_at": "2026-09-12T12:00:00Z",
     "public_key_jwk": {
       "kty": "OKP",
       "crv": "Ed25519",
@@ -111,8 +117,8 @@
     "valid": ["2026-08-12T12:00:00Z", "2026-08-12T12:00:00.123456Z", "2026-08-12T12:00:00+05:30", "2026-08-12T12:00:00-07:00"],
     "invalid": ["2026-08-12 12:00:00Z", "2026-08-12T12:00:00+0000", "2026-08-12t12:00:00Z", "2026-08-12T12:00:00z", " 2026-08-12T12:00:00Z", "2026-08-12T12:00:00Z ", "2026-08-12T12:00:00.Z", "2026-02-30T12:00:00Z", "2026-08-12T25:00:00Z", "2026-08-12T12:00:00", "٢٠٢٦-08-12T12:00:00Z"]
   },
-  "exact_action_leaf_authority_v2": {
-    "schema_version": "palonexus.exact-action/v2",
+  "exact_action_leaf_authority_v3": {
+    "schema_version": "palonexus.exact-action/v3",
     "delegation_id": "leaf-demo-2",
     "tenant_id": "tenant-demo-1",
     "agent_name": "release-risk-reviewer",
@@ -145,7 +151,7 @@
     "payload_digest": "944a45e84064aa1b414ff73bb748ecd15b65aeccbd98e5664824c1ba962810b5",
     "effect_idempotency_key": "effect-demo-1",
     "agent_generation": 1,
-    "authority_profile": "exact-action-v2",
+    "authority_profile": "palonexus.exact-action/v3",
     "proxy_proof_key_thumbprint": "3333333333333333333333333333333333333333333333333333333333333333"
   }
 }

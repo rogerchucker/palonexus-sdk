@@ -39,7 +39,7 @@ def test_canonical_platform_vector_validates_without_platform_imports() -> None:
         "capability_ceiling_request": CapabilityCeilingRequest,
         "create_action_request": CreateActionRequest,
         "developer_action": DeveloperAction,
-        "exact_action_leaf_authority_v2": ExactActionLeafAuthority,
+        "exact_action_leaf_authority_v3": ExactActionLeafAuthority,
     }.items():
         value = fixture[key]
         assert model.model_validate(value).model_dump(mode="json") == value
@@ -58,7 +58,7 @@ def test_contracts_are_immutable_strict_and_closed() -> None:
         "capability_ceiling_request": CapabilityCeilingRequest,
         "create_action_request": CreateActionRequest,
         "developer_action": DeveloperAction,
-        "exact_action_leaf_authority_v2": ExactActionLeafAuthority,
+        "exact_action_leaf_authority_v3": ExactActionLeafAuthority,
     }.items():
         value = copy.deepcopy(fixture[key])
         value["unknown"] = True
@@ -144,7 +144,7 @@ def test_ids_digests_and_canonical_json_fail_closed() -> None:
 def test_exact_action_v2_rejects_v1_downgrade_and_wrong_profile() -> None:
     fixture = _fixture()
     _reject(ExactActionLeafAuthority, fixture["exact_leaf_authority_v1"])
-    original = fixture["exact_action_leaf_authority_v2"]
+    original = fixture["exact_action_leaf_authority_v3"]
     for field, replacement in (
         ("schema_version", "1"),
         ("authority_profile", "customer-runtime-v1"),
@@ -160,7 +160,7 @@ def test_exact_action_v2_rejects_v1_downgrade_and_wrong_profile() -> None:
 
 
 def test_exact_action_v2_validates_all_shared_v1_leaf_fields() -> None:
-    original = _fixture()["exact_action_leaf_authority_v2"]
+    original = _fixture()["exact_action_leaf_authority_v3"]
     for field, replacement in (
         ("delegation_id", ""),
         ("tenant_id", ""),
@@ -244,7 +244,7 @@ def test_json_processable_byte_boundary_matches_platform() -> None:
 
 
 def test_exact_action_target_registration_matches_platform_contract() -> None:
-    original = _fixture()["exact_action_leaf_authority_v2"]
+    original = _fixture()["exact_action_leaf_authority_v3"]
     for field in (
         "registration_id",
         "target",
@@ -305,10 +305,10 @@ def test_runtime_and_schema_reject_wire_coercions_and_bad_timestamps() -> None:
     bytes_id = copy.deepcopy(fixture["create_action_request"])
     bytes_id["agent_id"] = b"agent-demo-1"
     corpus.append((CreateActionRequest, bytes_id))
-    integer_time = copy.deepcopy(fixture["exact_action_leaf_authority_v2"])
+    integer_time = copy.deepcopy(fixture["exact_action_leaf_authority_v3"])
     integer_time["issued_at"] = 1_660_000_000
     corpus.append((ExactActionLeafAuthority, integer_time))
-    invalid_time = copy.deepcopy(fixture["exact_action_leaf_authority_v2"])
+    invalid_time = copy.deepcopy(fixture["exact_action_leaf_authority_v3"])
     invalid_time["expires_at"] = "not-a-time"
     corpus.append((ExactActionLeafAuthority, invalid_time))
     for model, value in corpus:
@@ -332,7 +332,7 @@ def test_exact_action_timestamps_match_schema_rfc3339_grammar() -> None:
         json.loads(SCHEMA.read_text(encoding="utf-8")),
         format_checker=Draft202012Validator.FORMAT_CHECKER,
     )
-    original = fixture["exact_action_leaf_authority_v2"]
+    original = fixture["exact_action_leaf_authority_v3"]
     for timestamp in fixture["timestamp_vectors"]["valid"]:
         value = copy.deepcopy(original)
         value["issued_at"] = timestamp

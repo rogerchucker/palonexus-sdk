@@ -19,6 +19,7 @@ from palonexus.developer.client import (
     DeveloperClient,
     DeveloperClientError,
     _origin,
+    _registration_authority_profile,
     canonical_json,
     decode_strict_json,
     generate_agent_credential,
@@ -96,6 +97,7 @@ def installed_sdk_version() -> str:
 
 
 _DESCRIPTOR_MAX_BYTES = 64 * 1024
+_REGISTRATION_PROFILE_MAX_BYTES = 16 * 1024
 _CEILING_BODY_FIELDS = {
     "schemaVersion",
     "agentGeneration",
@@ -105,21 +107,21 @@ _CEILING_BODY_FIELDS = {
 }
 
 
-def _reject_yaml_duplicates(node: Any) -> None:
+def _reject_yaml_duplicates(node: Any, label: str = "agent descriptor") -> None:
     if isinstance(node, yaml.MappingNode):
         keys: set[str] = set()
         for key_node, value_node in node.value:
             if not isinstance(key_node, yaml.ScalarNode) or not isinstance(
                 key_node.value, str
             ):
-                raise CommandError("agent descriptor is invalid")
+                raise CommandError(f"{label} is invalid")
             if key_node.value in keys:
-                raise CommandError("agent descriptor contains a duplicate field")
+                raise CommandError(f"{label} contains a duplicate field")
             keys.add(key_node.value)
-            _reject_yaml_duplicates(value_node)
+            _reject_yaml_duplicates(value_node, label)
     elif isinstance(node, yaml.SequenceNode):
         for item in node.value:
-            _reject_yaml_duplicates(item)
+            _reject_yaml_duplicates(item, label)
 
 
 def _strict_keys(value: object, expected: set[str]) -> dict[str, Any]:
@@ -217,6 +219,7 @@ def _project_descriptor(
         raise CommandError("agent output and action schemas must match")
     return {
         "name": name,
+        "version": version,
         "descriptor_digest": hashlib.sha256(raw).hexdigest(),
         "rules": [rule],
         "input_schema": input_schema,
@@ -228,6 +231,28 @@ def _project_descriptor(
         "resource": action["resource"],
         "constraints": action["constraints"],
     }
+
+
+def _project_registration_profile(
+    path: Path = Path("palonexus-registration.yaml"),
+) -> dict[str, Any]:
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise CommandError("palonexus-registration.yaml is required") from error
+    if not raw or len(raw) > _REGISTRATION_PROFILE_MAX_BYTES:
+        raise CommandError("agent registration profile is empty or too large")
+    try:
+        text = raw.decode("utf-8")
+        node = yaml.compose(text, Loader=yaml.SafeLoader)
+        if node is None:
+            raise CommandError("agent registration profile is invalid")
+        _reject_yaml_duplicates(node, "agent registration profile")
+        profile = yaml.safe_load(text)
+        validated = _registration_authority_profile(profile)
+    except (UnicodeDecodeError, yaml.YAMLError, DeveloperClientError) as error:
+        raise CommandError("agent registration profile is invalid") from error
+    return {**profile, **validated}
 
 
 def _project_client(
@@ -268,6 +293,7 @@ def _print_json(value: dict[str, Any]) -> None:
 def agents_register(args: Namespace) -> int:
     client, store, session, agent, descriptor = _project_client(args)
     try:
+        descriptor["authority_profile"] = _project_registration_profile()
         result = client.register_agent(session, agent, descriptor)
         agent["agent_id"] = str(result["agent_id"])
         agent["agent_generation"] = str(result["generation"])

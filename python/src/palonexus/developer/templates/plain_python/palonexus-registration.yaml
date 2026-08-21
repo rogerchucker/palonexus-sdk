@@ -1,0 +1,10 @@
+# Deployment-bound identity inputs. Replace every REPLACE_WITH_* value before registration.
+schema_version: palonexus.agent-registration-profile/v1
+descriptor_version: palonexus.agent-descriptor/v1
+runtime_profile:
+  kind: plain-python
+composition_digest: REPLACE_WITH_SHA256
+harness_adapter_contracts:
+  - palonexus.actions/v1
+not_before: REPLACE_WITH_RFC3339
+expires_at: REPLACE_WITH_RFC3339
