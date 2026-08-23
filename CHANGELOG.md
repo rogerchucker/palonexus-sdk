@@ -14,6 +14,9 @@ release.
 
 ### Changed
 
+- Agent registration now validates accountable ownership against the canonical
+  workforce subject when a developer session also carries a distinct membership
+  identifier.
 - The `palonexus` distribution is now built and published from this repository
   rather than from `palonexus-platform`.
 - `scripts/verify` now runs the Python SDK suite (`python/tests`) alongside the

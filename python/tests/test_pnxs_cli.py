@@ -1886,6 +1886,34 @@ def test_agent_registration_uses_exact_pop_contract_and_zero_authority() -> None
     ).public_key().verify(signature, message)
 
 
+def test_agent_registration_binds_canonical_owner_subject_not_membership_id() -> None:
+    descriptor_digest = "a" * 64
+    credential = generate_agent_credential()
+    public_jwk = json.loads(credential["public_key_jwk"])
+    thumbprint = hashlib.sha256(
+        json.dumps(public_jwk, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    response = _registration_response(descriptor_digest, thumbprint)
+    response["accountable_owner"] = "okta:tenant-a:employee-1"
+    client = DeveloperClient(
+        "https://api.palonexus.cloud",
+        transport=httpx.MockTransport(lambda _: httpx.Response(201, json=response)),
+    )
+
+    result = client.register_agent(
+        {
+            "session_token": "pnx_dev_session",
+            "tenant_id": "tenant-a",
+            "membership_id": "member-1",
+            "owner_subject": "okta:tenant-a:employee-1",
+        },
+        credential,
+        {"name": "release-risk-reviewer", "descriptor_digest": descriptor_digest},
+    )
+
+    assert result["accountable_owner"] == "okta:tenant-a:employee-1"
+
+
 def test_ceiling_request_and_status_use_exact_router_contract() -> None:
     descriptor_digest = "a" * 64
     response = _ceiling_response(descriptor_digest)
