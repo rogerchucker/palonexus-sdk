@@ -758,6 +758,45 @@ mechanism.
   owner values, accept only the canonical owner in the registration response,
   and retain the legacy missing-field fallback.
 
+#### Recoverable registration mutations
+
+- **Failure mode:** The service committed an agent registration, but a newer
+  response field caused the CLI to reject the response before it saved local
+  state. A retry then looked like a conflicting second registration.
+- **Boundary:** A successful POST response is not the only proof of a committed
+  registration. The tenant service is authoritative for the registration;
+  local credential custody and the registration workspace are authoritative
+  for the key and intent used to create it.
+- **Rule:** Persist safe intent before the request. After an ambiguous or
+  locally rejected response, read the named registration and accept it only
+  when tenant, canonical owner, name, key thumbprint, descriptor digest, and
+  full authority profile match the local intent. Preserve the original error
+  when exact reconciliation fails.
+- **Review question:** Can every registration mutation recover after the server
+  commits and the client fails before saving, without accepting another user's
+  registration or silently changing the requested authority?
+- **Regression proof:** Reject the original POST response, return the exact
+  committed registration from GET, and prove local state is recovered. Change
+  each binding field in turn and prove reconciliation fails closed.
+
+#### Registration CLI provenance
+
+- **Failure mode:** Installing the SDK in an agent project's virtual
+  environment silently selected an older `pnxs` command and changed the
+  registration protocol.
+- **Boundary:** Agent runtime dependencies belong to the project. The
+  security-sensitive registration client is a separately managed operator
+  tool.
+- **Rule:** Before registration mutation, reject a `pnxs` executable owned by
+  the active project environment and direct the user to a standalone command.
+  A future service-advertised minimum CLI version provides the corresponding
+  server-side compatibility gate.
+- **Review question:** Does registration prove which CLI executable and
+  protocol version are active before it creates credentials or server state?
+- **Regression proof:** Invoke the preflight with a project-environment binary,
+  prove no mutation occurs, and identify an executable outside that
+  environment as the remedy.
+
 ### Credential storage
 
 - macOS uses Keychain.

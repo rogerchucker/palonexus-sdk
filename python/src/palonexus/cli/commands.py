@@ -4,7 +4,9 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import re
 import sys
+import tempfile
 import time
 import uuid
 import webbrowser
@@ -48,6 +50,61 @@ class CommandError(RuntimeError):
 
 def credential_store(*, allow_file_fallback: bool = False) -> CredentialStore:
     return CredentialStore(allow_file_fallback=allow_file_fallback)
+
+
+def _path_is_within(path: Path, parent: Path) -> bool:
+    try:
+        path.relative_to(parent)
+    except ValueError:
+        return False
+    return True
+
+
+def _standalone_cli_preflight(
+    *, invocation: Path, virtual_env: Path, search_path: str
+) -> None:
+    """Reject a project-managed pnxs before a registration mutation."""
+    resolved_invocation = invocation.resolve(strict=False)
+    resolved_environment = virtual_env.resolve(strict=False)
+    if not _path_is_within(resolved_invocation, resolved_environment):
+        return
+
+    replacement: Path | None = None
+    for raw_directory in search_path.split(os.pathsep):
+        if not raw_directory:
+            continue
+        directory = Path(raw_directory).resolve(strict=False)
+        if _path_is_within(directory, resolved_environment):
+            continue
+        for executable_name in ("pnxs", "pnxs.exe"):
+            candidate = directory / executable_name
+            if candidate.is_file() and os.access(candidate, os.X_OK):
+                replacement = candidate
+                break
+        if replacement is not None:
+            break
+
+    remedy = (
+        str(replacement)
+        if replacement is not None
+        else "install the standalone CLI with `uv tool install palonexus`"
+    )
+    raise CommandError(
+        "pnxs is running from the active project environment. No changes were made. "
+        f"Use {remedy} for agent registration."
+    )
+
+
+def _require_standalone_registration_cli() -> None:
+    active_environment = os.environ.get("VIRTUAL_ENV")
+    invocation = Path(sys.argv[0])
+    if active_environment is None or invocation.name not in {"pnxs", "pnxs.exe"}:
+        return
+    _standalone_cli_preflight(
+        invocation=invocation,
+        virtual_env=Path(active_environment),
+        search_path=os.environ.get("PATH", ""),
+    )
 
 
 def login(args: Namespace) -> int:
@@ -124,6 +181,7 @@ def installed_sdk_version() -> str:
 
 _DESCRIPTOR_MAX_BYTES = 64 * 1024
 _REGISTRATION_PROFILE_MAX_BYTES = 16 * 1024
+_AGENT_NAME = re.compile(r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _CEILING_BODY_FIELDS = {
     "schemaVersion",
     "agentGeneration",
@@ -289,6 +347,7 @@ def _project_client(
     dict[str, str],
     dict[str, str],
     dict[str, Any],
+    str,
 ]:
     try:
         store = credential_store(
@@ -296,11 +355,19 @@ def _project_client(
         )
         session = store.load("session")
         descriptor = _project_descriptor()
-        agent = store.load("agent:" + str(descriptor["name"]))
+        if session is None:
+            raise CommandError("pnxs login is required")
+        tenant_id = session.get("tenant_id")
+        if not isinstance(tenant_id, str) or not tenant_id:
+            raise CommandError("stored developer session is invalid")
+        legacy_credential_name = "agent:" + str(descriptor["name"])
+        credential_name = "agent:" + tenant_id + ":" + str(descriptor["name"])
+        agent = store.load(credential_name)
+        if agent is None:
+            credential_name = legacy_credential_name
+            agent = store.load(credential_name)
     except CredentialStoreUnavailable as error:
         raise CommandError(f"credential access failed: {error}") from error
-    if session is None:
-        raise CommandError("pnxs login is required")
     if agent is None:
         raise CommandError("pnxs agents init is required")
     try:
@@ -309,24 +376,232 @@ def _project_client(
         )
     except DeveloperClientError as error:
         raise CommandError(f"tenant API configuration failed: {error}") from error
-    return client, store, session, agent, descriptor
+    return client, store, session, agent, descriptor, credential_name
 
 
 def _print_json(value: dict[str, Any]) -> None:
     print(json.dumps(value, sort_keys=True, separators=(",", ":")))
 
 
-def agents_register(args: Namespace) -> int:
-    client, store, session, agent, descriptor = _project_client(args)
+def _register_with_recovery(
+    client: DeveloperClient,
+    session: dict[str, str],
+    agent: dict[str, str],
+    descriptor: dict[str, Any],
+) -> tuple[dict[str, Any], bool]:
     try:
-        descriptor["authority_profile"] = _project_registration_profile()
-        result = client.register_agent(session, agent, descriptor)
+        return client.register_agent(session, agent, descriptor), False
+    except DeveloperClientError as registration_error:
+        try:
+            recovered = client.reconcile_agent_registration(session, agent, descriptor)
+        except DeveloperClientError:
+            raise registration_error
+        return recovered, True
+
+
+def _registration_source_paths(source: Path) -> tuple[Path, Path]:
+    if source.is_dir():
+        return (
+            source / "palonexus-agent.yaml",
+            source / "palonexus-registration.yaml",
+        )
+    if source.name != "palonexus-agent.yaml":
+        raise CommandError(
+            "--from must name an agent directory or palonexus-agent.yaml"
+        )
+    return source, source.with_name("palonexus-registration.yaml")
+
+
+def _derived_registration_material(source: Path, name: str) -> tuple[bytes, bytes]:
+    if _AGENT_NAME.fullmatch(name) is None:
+        raise CommandError(
+            "agent name must be a lowercase DNS label of at most 63 characters"
+        )
+    descriptor_path, profile_path = _registration_source_paths(source)
+    _project_descriptor(descriptor_path)
+    _project_registration_profile(profile_path)
+    try:
+        descriptor_value = yaml.safe_load(descriptor_path.read_text(encoding="utf-8"))
+        profile_bytes = profile_path.read_bytes()
+    except OSError as error:
+        raise CommandError("agent registration source is unreadable") from error
+    if not isinstance(descriptor_value, dict):
+        raise CommandError("agent descriptor is invalid")
+    descriptor_value["name"] = name
+    descriptor_bytes = yaml.safe_dump(
+        descriptor_value, sort_keys=False, allow_unicode=False
+    ).encode("utf-8")
+    return descriptor_bytes, profile_bytes
+
+
+def _atomic_write(path: Path, content: bytes) -> None:
+    descriptor, temporary_name = tempfile.mkstemp(
+        prefix="." + path.name + "-", suffix=".tmp", dir=path.parent
+    )
+    temporary = Path(temporary_name)
+    try:
+        with os.fdopen(descriptor, "wb") as stream:
+            stream.write(content)
+            stream.flush()
+            os.fsync(stream.fileno())
+        os.chmod(temporary, 0o600)
+        temporary.replace(path)
+        os.chmod(path, 0o600)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+def _write_registration_input(path: Path, content: bytes) -> None:
+    if path.exists():
+        try:
+            current = path.read_bytes()
+        except OSError as error:
+            raise CommandError("registration workspace is unreadable") from error
+        if current != content:
+            raise CommandError(
+                f"registration workspace contains a different {path.name}"
+            )
+        return
+    _atomic_write(path, content)
+
+
+def _prepare_registration_workspace(
+    workspace: Path,
+    descriptor_bytes: bytes,
+    profile_bytes: bytes,
+    intent: dict[str, Any],
+) -> dict[str, Any]:
+    if workspace.is_symlink() or (workspace.exists() and not workspace.is_dir()):
+        raise CommandError("registration workspace must be a directory, not a symlink")
+    try:
+        workspace.mkdir(mode=0o700, parents=True, exist_ok=True)
+        os.chmod(workspace, 0o700)
+    except OSError as error:
+        raise CommandError("registration workspace cannot be created") from error
+    _write_registration_input(workspace / "palonexus-agent.yaml", descriptor_bytes)
+    _write_registration_input(workspace / "palonexus-registration.yaml", profile_bytes)
+    _atomic_write(
+        workspace / "registration-intent.json",
+        canonical_json(intent) + b"\n",
+    )
+    descriptor = _project_descriptor(workspace / "palonexus-agent.yaml")
+    descriptor["authority_profile"] = _project_registration_profile(
+        workspace / "palonexus-registration.yaml"
+    )
+    return descriptor
+
+
+def _confirm_registration(args: Namespace) -> None:
+    if args.yes:
+        return
+    if not sys.stdin.isatty():
+        raise CommandError("confirmation required; rerun with --yes")
+    answer = input("Create this agent registration? [y/N] ").strip().lower()
+    if answer not in {"y", "yes"}:
+        raise CommandError("registration canceled")
+
+
+def agents_add(args: Namespace) -> int:
+    """Create and reconcile one tenant-scoped agent registration workspace."""
+    _require_standalone_registration_cli()
+    source = Path(args.source).expanduser().resolve(strict=False)
+    descriptor_bytes, profile_bytes = _derived_registration_material(source, args.name)
+    try:
+        store = credential_store(
+            allow_file_fallback=getattr(args, "allow_file_credential_store", False)
+        )
+        session = store.load("session")
+    except CredentialStoreUnavailable as error:
+        raise CommandError(f"credential access failed: {error}") from error
+    if session is None:
+        raise CommandError("pnxs login is required")
+    tenant_id = session.get("tenant_id")
+    owner_subject = session.get("owner_subject")
+    if tenant_id != args.tenant:
+        raise CommandError(
+            f"signed-in tenant is {tenant_id!r}, not requested tenant {args.tenant!r}"
+        )
+    if not isinstance(owner_subject, str) or not owner_subject:
+        raise CommandError(
+            "the developer session has no canonical owner identity; sign in again"
+        )
+
+    workspace = (
+        Path(args.workspace).expanduser()
+        if args.workspace
+        else store.state_dir / "agents" / args.tenant / args.name
+    ).resolve(strict=False)
+    source_descriptor, _source_profile = _registration_source_paths(source)
+    if workspace == source_descriptor.parent.resolve(strict=False):
+        raise CommandError("registration workspace must be separate from the source")
+
+    print("Register a new agent identity", file=sys.stderr)
+    print(f"Agent:  {args.name}", file=sys.stderr)
+    print(f"Tenant: {args.tenant}", file=sys.stderr)
+    print(f"Owner:  {owner_subject}", file=sys.stderr)
+    print(f"Source: {source}", file=sys.stderr)
+    print(f"Workspace: {workspace}", file=sys.stderr)
+    print(f"CLI:    {Path(sys.argv[0]).resolve(strict=False)}", file=sys.stderr)
+    _confirm_registration(args)
+
+    intent = {
+        "schema_version": "palonexus.local-registration-intent/v1",
+        "agent_name": args.name,
+        "descriptor_digest": hashlib.sha256(descriptor_bytes).hexdigest(),
+        "tenant_id": args.tenant,
+        "owner_subject": owner_subject,
+        "source": str(source),
+    }
+    descriptor = _prepare_registration_workspace(
+        workspace, descriptor_bytes, profile_bytes, intent
+    )
+    credential_name = f"agent:{args.tenant}:{args.name}"
+    try:
+        store.create_if_absent(credential_name, generate_agent_credential())
+        agent = store.load(credential_name)
+        if agent is None:
+            raise CredentialStoreUnavailable("agent credential was not persisted")
+        client = DeveloperClient(
+            os.environ.get("PNXS_API_URL", "https://api.palonexus.cloud")
+        )
+        result, recovered = _register_with_recovery(client, session, agent, descriptor)
         agent["agent_id"] = str(result["agent_id"])
         agent["agent_generation"] = str(result["generation"])
         agent["registered_descriptor_digest"] = str(result["descriptor_digest"])
-        store.save("agent:" + str(descriptor["name"]), agent)
+        store.save(credential_name, agent)
+        receipt = {
+            "schema_version": "palonexus.local-registration/v1",
+            "registration": result,
+        }
+        _atomic_write(workspace / "registration.json", canonical_json(receipt) + b"\n")
     except (DeveloperClientError, CredentialStoreUnavailable, KeyError) as error:
         raise CommandError(f"agent registration failed: {error}") from error
+    if recovered:
+        print(
+            "The registration already completed; local state was recovered.",
+            file=sys.stderr,
+        )
+    _print_json(result)
+    return 0
+
+
+def agents_register(args: Namespace) -> int:
+    _require_standalone_registration_cli()
+    client, store, session, agent, descriptor, credential_name = _project_client(args)
+    descriptor["authority_profile"] = _project_registration_profile()
+    try:
+        result, recovered = _register_with_recovery(client, session, agent, descriptor)
+        agent["agent_id"] = str(result["agent_id"])
+        agent["agent_generation"] = str(result["generation"])
+        agent["registered_descriptor_digest"] = str(result["descriptor_digest"])
+        store.save(credential_name, agent)
+    except (DeveloperClientError, CredentialStoreUnavailable, KeyError) as error:
+        raise CommandError(f"agent registration failed: {error}") from error
+    if recovered:
+        print(
+            "The registration already completed; local state was recovered.",
+            file=sys.stderr,
+        )
     _print_json(result)
     return 0
 
@@ -359,7 +634,10 @@ def _new_ceiling_request(
 
 
 def _stored_or_new_ceiling_request(
-    store: CredentialStore, agent: dict[str, str], descriptor: dict[str, Any]
+    store: CredentialStore,
+    agent: dict[str, str],
+    descriptor: dict[str, Any],
+    credential_name: str,
 ) -> tuple[str, dict[str, Any]]:
     request_id = agent.get("ceiling_request_id")
     encoded_body = agent.get("ceiling_request_body")
@@ -369,7 +647,7 @@ def _stored_or_new_ceiling_request(
         request_id, body = _new_ceiling_request(agent, descriptor)
         agent["ceiling_request_id"] = request_id
         agent["ceiling_request_body"] = canonical_json(body).decode("utf-8")
-        store.save("agent:" + str(descriptor["name"]), agent)
+        store.save(credential_name, agent)
         return request_id, body
     body = decode_strict_json(encoded_body.encode("utf-8"), _CEILING_BODY_FIELDS)
     if body.get("descriptorDigest") != descriptor["descriptor_digest"]:
@@ -378,10 +656,12 @@ def _stored_or_new_ceiling_request(
 
 
 def agents_request_authority(args: Namespace) -> int:
-    client, store, session, agent, descriptor = _project_client(args)
+    client, store, session, agent, descriptor, credential_name = _project_client(args)
     _require_locally_active_agent(agent)
     try:
-        request_id, body = _stored_or_new_ceiling_request(store, agent, descriptor)
+        request_id, body = _stored_or_new_ceiling_request(
+            store, agent, descriptor, credential_name
+        )
         result = client.request_authority(
             session, str(descriptor["name"]), request_id, body
         )
@@ -392,7 +672,7 @@ def agents_request_authority(args: Namespace) -> int:
 
 
 def agents_status(args: Namespace) -> int:
-    client, _store, session, agent, descriptor = _project_client(args)
+    client, _store, session, agent, descriptor, _credential_name = _project_client(args)
     request_id = agent.get("ceiling_request_id")
     if not request_id:
         raise CommandError("no authority request exists for this agent")
@@ -444,7 +724,7 @@ def _revocation_previous_generation(
 
 
 def agents_revoke(args: Namespace) -> int:
-    client, store, session, agent, descriptor = _project_client(args)
+    client, store, session, agent, descriptor, credential_name = _project_client(args)
     agent_id, previous_generation = _revocation_previous_generation(agent, descriptor)
     try:
         result = client.revoke_agent(
@@ -462,7 +742,7 @@ def agents_revoke(args: Namespace) -> int:
             revocation_cascade_status=str(result["cascade_status"]),
             revocation_cascade_applied_at=str(result["cascade_applied_at"]),
         )
-        store.save("agent:" + str(descriptor["name"]), agent)
+        store.save(credential_name, agent)
     except (DeveloperClientError, CredentialStoreUnavailable, KeyError) as error:
         raise CommandError(f"agent revocation failed: {error}") from error
     _print_json(result)
@@ -492,7 +772,7 @@ def _strict_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
 
 
 def run_agent(args: Namespace) -> int:
-    client, store, session, agent, descriptor = _project_client(args)
+    client, store, session, agent, descriptor, _credential_name = _project_client(args)
     _require_locally_active_agent(agent)
     input_value, input_digest = _strict_input(Path(args.input))
     guard = store.load("guard:" + str(descriptor["name"]))
@@ -613,7 +893,9 @@ def run_agent(args: Namespace) -> int:
 
 
 def actions_wait(args: Namespace) -> int:
-    client, store, session, _agent, _descriptor = _project_client(args)
+    client, store, session, _agent, _descriptor, _credential_name = _project_client(
+        args
+    )
     reference = store.load("action:" + args.action_id)
     if not isinstance(reference, dict) or not isinstance(reference.get("run_id"), str):
         raise CommandError("no persisted run reference exists for this action")

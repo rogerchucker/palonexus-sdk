@@ -561,6 +561,34 @@ def _registration_authority_profile(value: object) -> dict[str, Any]:
     }
 
 
+def _registration_binding(
+    agent: dict[str, str], descriptor: dict[str, Any]
+) -> tuple[dict[str, str], str, str, str, dict[str, Any]]:
+    try:
+        jwk = json.loads(
+            _require_string(agent.get("public_key_jwk"), "agent public key")
+        )
+    except json.JSONDecodeError as error:
+        raise ProtocolError("invalid agent public key") from error
+    if (
+        not isinstance(jwk, dict)
+        or set(jwk) != {"kty", "crv", "x"}
+        or jwk.get("kty") != "OKP"
+        or jwk.get("crv") != "Ed25519"
+        or not all(isinstance(value, str) for value in jwk.values())
+    ):
+        raise ProtocolError("invalid agent public key")
+    thumbprint = hashlib.sha256(canonical_json(jwk)).hexdigest()
+    name = _require_string(descriptor.get("name"), "agent name")
+    digest = _require_string(descriptor.get("descriptor_digest"), "descriptor digest")
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ProtocolError("invalid descriptor digest")
+    authority_profile = _registration_authority_profile(
+        descriptor.get("authority_profile")
+    )
+    return jwk, thumbprint, name, digest, authority_profile
+
+
 def _validate_revocation_response(
     response: dict[str, Any],
     *,
@@ -992,28 +1020,8 @@ class DeveloperClient:
         descriptor: dict[str, Any],
     ) -> dict[str, Any]:
         private = _decode_private_key(agent.get("private_key"))
-        try:
-            jwk = json.loads(
-                _require_string(agent.get("public_key_jwk"), "agent public key")
-            )
-        except json.JSONDecodeError as error:
-            raise ProtocolError("invalid agent public key") from error
-        if (
-            not isinstance(jwk, dict)
-            or set(jwk) != {"kty", "crv", "x"}
-            or jwk.get("kty") != "OKP"
-            or jwk.get("crv") != "Ed25519"
-        ):
-            raise ProtocolError("invalid agent public key")
-        thumbprint = hashlib.sha256(canonical_json(jwk)).hexdigest()
-        name = _require_string(descriptor.get("name"), "agent name")
-        digest = _require_string(
-            descriptor.get("descriptor_digest"), "descriptor digest"
-        )
-        if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
-            raise ProtocolError("invalid descriptor digest")
-        authority_profile = _registration_authority_profile(
-            descriptor.get("authority_profile")
+        jwk, thumbprint, name, digest, authority_profile = _registration_binding(
+            agent, descriptor
         )
         message = canonical_json(
             {
@@ -1049,6 +1057,26 @@ class DeveloperClient:
             expected=201,
             allowed_fields=_REGISTRATION_RESPONSE_FIELDS,
         )
+        return _validate_registration_response(
+            response,
+            session=session,
+            name=name,
+            descriptor_digest=digest,
+            key_thumbprint=thumbprint,
+            authority_profile=authority_profile,
+        )
+
+    def reconcile_agent_registration(
+        self,
+        session: dict[str, str],
+        agent: dict[str, str],
+        descriptor: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Recover only an exact owner-, key-, descriptor-, and profile-bound commit."""
+        _, thumbprint, name, digest, authority_profile = _registration_binding(
+            agent, descriptor
+        )
+        response = self.registered_agent(session, name)
         return _validate_registration_response(
             response,
             session=session,
