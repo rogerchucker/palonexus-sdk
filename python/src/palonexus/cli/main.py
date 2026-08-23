@@ -31,6 +31,14 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument("--name", required=True)
     init.add_argument("--allow-file-credential-store", action="store_true")
     init.set_defaults(handler=commands.agents_init)
+    add = agent_commands.add_parser("add", allow_abbrev=False)
+    add.add_argument("--from", dest="source", required=True)
+    add.add_argument("--name", required=True)
+    add.add_argument("--tenant", required=True)
+    add.add_argument("--workspace")
+    add.add_argument("--yes", action="store_true")
+    add.add_argument("--allow-file-credential-store", action="store_true")
+    add.set_defaults(handler=commands.agents_add)
     for name, handler in (
         ("register", commands.agents_register),
         ("request-authority", commands.agents_request_authority),

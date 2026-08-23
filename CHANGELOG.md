@@ -11,9 +11,18 @@ release.
 
 - Initial public repository governance and Python workspace metadata.
 - Tag-triggered PyPI release workflow using Trusted Publishing.
+- `pnxs agents add` creates a separate tenant-scoped registration workspace
+  from an existing agent definition, confirms the owner and tenant before any
+  server mutation, and preserves agent keys in credential custody.
+- Agent registration retries can reconcile an exact owner-, key-, descriptor-,
+  and authority-profile-bound server commit when the original response could
+  not be accepted locally.
 
 ### Changed
 
+- Registration commands reject a `pnxs` executable shadowed by the active
+  project virtual environment before making changes and point to a standalone
+  executable when one is available.
 - Agent registration now validates accountable ownership against the canonical
   workforce subject when a developer session also carries a distinct membership
   identifier.

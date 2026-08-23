@@ -18,6 +18,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+import yaml
 from cryptography import x509
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import rsa
@@ -92,6 +93,17 @@ def test_pnxs_is_the_only_console_script_and_parser_surface_is_exact() -> None:
             "example",
         ],
         ["agents", "register"],
+        [
+            "agents",
+            "add",
+            "--from",
+            ".",
+            "--name",
+            "example",
+            "--tenant",
+            "tenant-a",
+            "--yes",
+        ],
         ["agents", "request-authority"],
         ["agents", "status"],
         ["agents", "revoke"],
@@ -2019,6 +2031,326 @@ def test_agent_registration_uses_exact_pop_contract_and_zero_authority() -> None
     ).public_key().verify(signature, message)
 
 
+def test_agents_register_recovers_an_exact_server_commit_and_saves_local_state(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    response = _registration_response("a" * 64, "b" * 64)
+    session = {
+        "tenant_id": "tenant-a",
+        "membership_id": "member-1",
+        "owner_subject": "okta:tenant-a:robin-singh",
+    }
+    agent = {"private_key": "local-secret"}
+    descriptor: dict[str, object] = {
+        "name": "release-risk-reviewer",
+        "descriptor_digest": "a" * 64,
+    }
+    saved: dict[str, dict[str, str]] = {}
+
+    class Store:
+        def save(self, name: str, value: dict[str, str]) -> None:
+            saved[name] = dict(value)
+
+    class Client:
+        def register_agent(self, *args: object) -> dict[str, object]:
+            raise ProtocolError("response contains an unknown field")
+
+        def reconcile_agent_registration(
+            self,
+            actual_session: dict[str, str],
+            actual_agent: dict[str, str],
+            actual_descriptor: dict[str, object],
+        ) -> dict[str, object]:
+            assert actual_session == session
+            assert actual_agent == agent
+            assert actual_descriptor["authority_profile"] == _registration_profile()
+            return response
+
+    monkeypatch.setattr(
+        "palonexus.cli.commands._project_client",
+        lambda _: (
+            Client(),
+            Store(),
+            session,
+            agent,
+            descriptor,
+            "agent:release-risk-reviewer",
+        ),
+    )
+    monkeypatch.setattr(
+        "palonexus.cli.commands._project_registration_profile",
+        _registration_profile,
+    )
+
+    assert main(["agents", "register"]) == 0
+    assert saved["agent:release-risk-reviewer"]["agent_id"] == ("release-risk-reviewer")
+    assert saved["agent:release-risk-reviewer"]["agent_generation"] == "1"
+    assert (
+        saved["agent:release-risk-reviewer"]["registered_descriptor_digest"] == "a" * 64
+    )
+    captured = capsys.readouterr()
+    assert "already completed" in captured.err
+    assert json.loads(captured.out) == response
+    assert "local-secret" not in captured.out + captured.err
+
+
+def test_agents_register_preserves_the_original_error_when_reconciliation_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    session = {"tenant_id": "tenant-a"}
+    agent = {"private_key": "local-secret"}
+    descriptor: dict[str, object] = {
+        "name": "release-risk-reviewer",
+        "descriptor_digest": "a" * 64,
+    }
+
+    class Store:
+        def save(self, name: str, value: dict[str, str]) -> None:
+            raise AssertionError((name, value))
+
+    class Client:
+        def register_agent(self, *args: object) -> dict[str, object]:
+            raise ProtocolError("registration response is malformed")
+
+        def reconcile_agent_registration(self, *args: object) -> dict[str, object]:
+            raise ProtocolError("registered agent does not match")
+
+    monkeypatch.setattr(
+        "palonexus.cli.commands._project_client",
+        lambda _: (
+            Client(),
+            Store(),
+            session,
+            agent,
+            descriptor,
+            "agent:release-risk-reviewer",
+        ),
+    )
+    monkeypatch.setattr(
+        "palonexus.cli.commands._project_registration_profile",
+        _registration_profile,
+    )
+
+    assert main(["agents", "register"]) == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == (
+        "agent registration failed: registration response is malformed\n"
+    )
+
+
+def test_agents_add_registers_a_second_identity_without_copying_source_repo(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    source = tmp_path / "source"
+    source.mkdir()
+    template = (
+        Path(__file__).parents[1]
+        / "src/palonexus/developer/templates/plain_python/palonexus-agent.yaml"
+    )
+    (source / "palonexus-agent.yaml").write_text(
+        template.read_text(encoding="utf-8").replace(
+            "release-risk-reviewer", "source-agent"
+        ),
+        encoding="utf-8",
+    )
+    (source / "palonexus-registration.yaml").write_text(
+        """schema_version: palonexus.agent-registration-profile/v1
+descriptor_version: 0.2.0
+runtime_profile: {kind: plain-python}
+composition_digest: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+harness_adapter_contracts: [palonexus.actions/v1]
+not_before: '2026-08-21T00:00:00Z'
+expires_at: '2027-08-21T00:00:00Z'
+""",
+        encoding="utf-8",
+    )
+    source_before = {
+        path.name: path.read_bytes() for path in source.iterdir() if path.is_file()
+    }
+    workspace = tmp_path / "registration"
+    values: dict[str, dict[str, str]] = {
+        "session": {
+            "session_token": "pnx_dev_session-secret",
+            "tenant_id": "tenant-a",
+            "membership_id": "member-1",
+            "owner_subject": "okta:tenant-a:robin-singh",
+        }
+    }
+    created: list[str] = []
+
+    class Store:
+        state_dir = tmp_path / "state"
+
+        def load(self, name: str) -> dict[str, str] | None:
+            value = values.get(name)
+            return dict(value) if value is not None else None
+
+        def create_if_absent(self, name: str, value: dict[str, str]) -> bool:
+            if name in values:
+                return False
+            created.append(name)
+            values[name] = dict(value)
+            return True
+
+        def save(self, name: str, value: dict[str, str]) -> None:
+            values[name] = dict(value)
+
+    class Client:
+        def __init__(self, origin: str) -> None:
+            assert origin == "https://api.palonexus.cloud"
+
+        def register_agent(
+            self,
+            session: dict[str, str],
+            agent: dict[str, str],
+            descriptor: dict[str, object],
+        ) -> dict[str, object]:
+            assert session == values["session"]
+            assert descriptor["name"] == "second-agent"
+            assert descriptor["authority_profile"] == _registration_profile()
+            public_jwk = json.loads(agent["public_key_jwk"])
+            thumbprint = hashlib.sha256(canonical_json(public_jwk)).hexdigest()
+            return {
+                **_registration_response(
+                    str(descriptor["descriptor_digest"]), thumbprint
+                ),
+                "agent_id": "second-agent",
+                "name": "second-agent",
+            }
+
+        def reconcile_agent_registration(self, *args: object) -> dict[str, object]:
+            raise AssertionError("successful registration attempted recovery")
+
+    monkeypatch.setattr("palonexus.cli.commands.credential_store", lambda **_: Store())
+    monkeypatch.setattr("palonexus.cli.commands.DeveloperClient", Client)
+    monkeypatch.setattr(
+        "palonexus.cli.commands._require_standalone_registration_cli", lambda: None
+    )
+
+    argv = [
+        "agents",
+        "add",
+        "--from",
+        str(source),
+        "--name",
+        "second-agent",
+        "--tenant",
+        "tenant-a",
+        "--workspace",
+        str(workspace),
+        "--yes",
+    ]
+    assert main(argv) == 0
+    assert main(argv) == 0
+    assert {
+        path.name: path.read_bytes() for path in source.iterdir() if path.is_file()
+    } == source_before
+
+    credential_name = "agent:tenant-a:second-agent"
+    assert created == [credential_name]
+    assert values[credential_name]["agent_id"] == "second-agent"
+    assert values[credential_name]["agent_generation"] == "1"
+    derived = yaml.safe_load(
+        (workspace / "palonexus-agent.yaml").read_text(encoding="utf-8")
+    )
+    assert derived["name"] == "second-agent"
+    assert (
+        yaml.safe_load(
+            (workspace / "palonexus-registration.yaml").read_text(encoding="utf-8")
+        )["composition_digest"]
+        == "b" * 64
+    )
+    receipt = json.loads((workspace / "registration.json").read_text())
+    assert receipt["registration"]["agent_id"] == "second-agent"
+    all_local_files = "".join(
+        path.read_text(encoding="utf-8")
+        for path in workspace.iterdir()
+        if path.is_file()
+    )
+    assert values[credential_name]["private_key"] not in all_local_files
+    captured = capsys.readouterr()
+    assert "Owner:  okta:tenant-a:robin-singh" in captured.err
+    assert "Tenant: tenant-a" in captured.err
+    assert "Workspace:" in captured.err
+    assert values[credential_name]["private_key"] not in captured.out + captured.err
+
+
+def test_registration_rejects_a_project_virtualenv_cli_before_mutation(
+    tmp_path: Path,
+) -> None:
+    from palonexus.cli.commands import _standalone_cli_preflight
+
+    active = tmp_path / "project/.venv"
+    invocation = active / "bin/pnxs"
+    standalone = tmp_path / "bin/pnxs"
+    invocation.parent.mkdir(parents=True)
+    standalone.parent.mkdir(parents=True)
+    for executable in (invocation, standalone):
+        executable.touch()
+        executable.chmod(0o700)
+    with pytest.raises(CommandError, match=str(standalone)):
+        _standalone_cli_preflight(
+            invocation=invocation,
+            virtual_env=active,
+            search_path=os.pathsep.join((str(active / "bin"), str(standalone.parent))),
+        )
+    _standalone_cli_preflight(
+        invocation=standalone,
+        virtual_env=active,
+        search_path=os.pathsep.join((str(active / "bin"), str(standalone.parent))),
+    )
+
+
+def test_project_client_prefers_tenant_scoped_agent_credentials(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from palonexus.cli.commands import _project_client
+
+    _write_revocation_project(tmp_path)
+    monkeypatch.chdir(tmp_path)
+    values = {
+        "session": {"session_token": "session", "tenant_id": "tenant-a"},
+        "agent:tenant-a:release-risk-reviewer": {"source": "scoped"},
+        "agent:release-risk-reviewer": {"source": "legacy"},
+    }
+    loaded: list[str] = []
+
+    class Store:
+        def load(self, name: str) -> dict[str, str] | None:
+            loaded.append(name)
+            return values.get(name)
+
+    class Client:
+        def __init__(self, origin: str) -> None:
+            assert origin == "https://api.palonexus.cloud"
+
+    monkeypatch.setattr("palonexus.cli.commands.credential_store", lambda **_: Store())
+    monkeypatch.setattr("palonexus.cli.commands.DeveloperClient", Client)
+    args = build_parser().parse_args(["agents", "status"])
+
+    *_, agent, _descriptor, credential_name = _project_client(args)
+    assert agent == {"source": "scoped"}
+    assert credential_name == "agent:tenant-a:release-risk-reviewer"
+    assert loaded == ["session", "agent:tenant-a:release-risk-reviewer"]
+
+    del values["agent:tenant-a:release-risk-reviewer"]
+    loaded.clear()
+    *_, agent, _descriptor, credential_name = _project_client(args)
+    assert agent == {"source": "legacy"}
+    assert credential_name == "agent:release-risk-reviewer"
+    assert loaded == [
+        "session",
+        "agent:tenant-a:release-risk-reviewer",
+        "agent:release-risk-reviewer",
+    ]
+
+
 def test_registered_agent_resolves_owner_bound_identity() -> None:
     response = _registration_response("a" * 64, "b" * 64)
     seen: list[httpx.Request] = []
@@ -2046,6 +2378,44 @@ def test_registered_agent_resolves_owner_bound_identity() -> None:
         "https://api.palonexus.cloud/v1/developer/agents/release-risk-reviewer"
     )
     assert seen[0].headers["authorization"] == "Bearer pnx_dev_session"
+
+
+def test_registered_agent_reconciliation_requires_the_exact_local_binding() -> None:
+    descriptor_digest = "a" * 64
+    credential = generate_agent_credential()
+    public_jwk = json.loads(credential["public_key_jwk"])
+    thumbprint = hashlib.sha256(
+        json.dumps(public_jwk, sort_keys=True, separators=(",", ":")).encode()
+    ).hexdigest()
+    response = _registration_response(descriptor_digest, thumbprint)
+    client = DeveloperClient(
+        "https://api.palonexus.cloud",
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=response)),
+    )
+    session = {
+        "session_token": "pnx_dev_session",
+        "tenant_id": "tenant-a",
+        "membership_id": "member-1",
+        "owner_subject": "okta:tenant-a:robin-singh",
+    }
+    descriptor = {
+        "name": "release-risk-reviewer",
+        "descriptor_digest": descriptor_digest,
+        "authority_profile": _registration_profile(),
+    }
+
+    assert (
+        client.reconcile_agent_registration(session, credential, descriptor) == response
+    )
+    with pytest.raises(ProtocolError):
+        client.reconcile_agent_registration(
+            session,
+            {
+                **credential,
+                "public_key_jwk": generate_agent_credential()["public_key_jwk"],
+            },
+            descriptor,
+        )
 
 
 def test_agent_registration_binds_canonical_owner_subject_not_membership_id() -> None:
