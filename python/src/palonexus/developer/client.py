@@ -86,6 +86,14 @@ class DeveloperClientError(RuntimeError):
     """A fail-closed developer protocol error."""
 
 
+class RequestRejected(DeveloperClientError):
+    """An authenticated developer request was rejected by the server."""
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"server rejected request ({status_code})")
+        self.status_code = status_code
+
+
 class ProtocolError(DeveloperClientError):
     """A peer response violated the strict developer protocol."""
 
@@ -796,9 +804,7 @@ class DeveloperClient:
             ) as response:
                 expected_codes = {expected} if isinstance(expected, int) else expected
                 if response.status_code not in expected_codes:
-                    raise DeveloperClientError(
-                        f"server rejected request ({response.status_code})"
-                    )
+                    raise RequestRejected(response.status_code)
                 chunks: list[bytes] = []
                 received = 0
                 for chunk in response.iter_bytes(chunk_size=MAX_RESPONSE_BYTES + 1):
@@ -946,7 +952,7 @@ class DeveloperClient:
         store.save("session", session)
         return authorization
 
-    def logout(self, credential: dict[str, str]) -> None:
+    def logout(self, credential: dict[str, str]) -> bool:
         token = _require_string(credential.get("session_token"), "session token")
         session_id = _require_string(credential.get("session_id"), "session ID")
         issuer_origin = _require_string(
@@ -954,16 +960,27 @@ class DeveloperClient:
         )
         if _origin(issuer_origin) != issuer_origin or issuer_origin != self.origin:
             raise ProtocolError("session issuer origin does not match")
-        response = self._request(
-            "DELETE",
-            "/v1/developer/sessions/" + quote(session_id, safe=""),
-            headers={"Authorization": "Bearer " + token},
-            allowed_fields={"status", "session_id"},
-        )
+        try:
+            response = self._request(
+                "DELETE",
+                "/v1/developer/sessions/" + quote(session_id, safe=""),
+                headers={"Authorization": "Bearer " + token},
+                allowed_fields={"status", "session_id"},
+            )
+        except RequestRejected as error:
+            # An expired or already-revoked developer session no longer
+            # authorizes this request, so Cloud Auth answers 401. That is the
+            # idempotent logout outcome: no remote authority remains and the
+            # caller may safely clear its local credential. Other status codes
+            # still fail closed because they do not prove inactivity.
+            if error.status_code == 401:
+                return False
+            raise
         if set(response) != {"status", "session_id"}:
             raise ProtocolError("invalid logout response shape")
         if response["status"] != "revoked" or response["session_id"] != session_id:
             raise ProtocolError("invalid logout confirmation")
+        return True
 
     def register_agent(
         self,

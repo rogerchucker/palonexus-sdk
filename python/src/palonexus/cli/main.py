@@ -15,6 +15,12 @@ def build_parser() -> argparse.ArgumentParser:
     login = subcommands.add_parser("login", allow_abbrev=False)
     login.add_argument("--tenant")
     login.add_argument("--auth-url")
+    login.add_argument("--no-browser", action="store_true")
+    login.add_argument(
+        "--register",
+        action="store_true",
+        help="register the agent in the current directory after sign-in",
+    )
     login.add_argument("--allow-file-credential-store", action="store_true")
     login.set_defaults(handler=commands.login)
 
