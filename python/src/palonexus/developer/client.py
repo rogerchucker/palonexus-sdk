@@ -466,13 +466,16 @@ def _validate_registered_agent_projection(
 ) -> dict[str, Any]:
     if set(response) != _REGISTRATION_RESPONSE_FIELDS:
         raise ProtocolError("invalid agent registration response shape")
+    owner_subject = session.get("owner_subject")
+    owner_field = "owner_subject"
+    if owner_subject is None:
+        owner_subject = session.get("membership_id")
+        owner_field = "membership_id"
     expected_strings = {
         "schema_version": "palonexus.developer-agent/v1",
         "name": name,
         "tenant_id": _require_string(session.get("tenant_id"), "tenant_id"),
-        "accountable_owner": _require_string(
-            session.get("owner_subject"), "owner_subject"
-        ),
+        "accountable_owner": _require_string(owner_subject, owner_field),
         "status": "registered",
     }
     if any(response.get(field) != value for field, value in expected_strings.items()):
