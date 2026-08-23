@@ -694,8 +694,27 @@ def test_logout_requires_exact_revocation_confirmation(
         )
 
 
+def test_logout_treats_unauthorized_session_as_already_inactive() -> None:
+    client = DeveloperClient(
+        "https://auth.example",
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(401, json={"error": "unauthorized"})
+        ),
+    )
+    assert (
+        client.logout(
+            {
+                "session_token": "pnx_dev_session-secret",
+                "session_id": "session-demo",
+                "issuer_origin": "https://auth.example",
+            }
+        )
+        is False
+    )
+
+
 def test_logout_uses_stored_issuer_and_rejects_conflict_before_network(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
     credential = {
         "session_token": "pnx_dev_session-secret",
@@ -717,8 +736,9 @@ def test_logout_uses_stored_issuer_and_rejects_conflict_before_network(
         def __init__(self, origin: str) -> None:
             calls.append(origin)
 
-        def logout(self, value: dict[str, str]) -> None:
+        def logout(self, value: dict[str, str]) -> bool:
             assert value is credential
+            return False
 
     monkeypatch.setattr("palonexus.cli.commands.credential_store", lambda **_: Store())
     monkeypatch.setattr("palonexus.cli.commands.DeveloperClient", Client)
@@ -726,6 +746,7 @@ def test_logout_uses_stored_issuer_and_rejects_conflict_before_network(
     assert main(["logout"]) == 0
     assert calls == ["https://issuer.example"]
     assert deleted == ["session"]
+    assert capsys.readouterr().out == "Already signed out. Local session cleared.\n"
 
     calls.clear()
     deleted.clear()
@@ -1196,6 +1217,11 @@ def test_login_output_contains_only_code_and_url_and_never_secret_material(
 
     monkeypatch.setattr(DeveloperClient, "login", fake_login)
     monkeypatch.setenv("PNXS_AUTH_URL", "https://auth.example")
+    opened: list[tuple[str, int]] = []
+    monkeypatch.setattr(
+        "palonexus.cli.commands.webbrowser.open",
+        lambda url, new=0: opened.append((url, new)) or True,
+    )
     monkeypatch.setattr(
         "palonexus.cli.commands.credential_store",
         lambda allow_file_fallback=False: CredentialStore(
@@ -1204,14 +1230,76 @@ def test_login_output_contains_only_code_and_url_and_never_secret_material(
     )
     assert main(["login"]) == 0
     captured = capsys.readouterr()
-    assert captured.err == ""
-    assert captured.out.splitlines() == [
-        "Code: ABCD-EFGH",
-        "Verify: https://auth.example/developer/device-authorizations/ABCD-EFGH",
+    assert captured.out == ""
+    assert captured.err.splitlines() == [
+        "Finish signing in in your browser.",
+        "Open: https://auth.example/developer/device-authorizations/ABCD-EFGH",
+        "Confirm code: ABCD-EFGH",
+        "Sign in as the intended workforce user and approve this device.",
+        "Keep this command running; it will continue automatically.",
+        "Signed in.",
+        "Next: pnxs agents register",
+    ]
+    assert opened == [
+        (
+            "https://auth.example/developer/device-authorizations/ABCD-EFGH",
+            2,
+        )
     ]
     combined = captured.out + captured.err + " ".join(os.environ.values())
     for secret in secret_values.values():
         assert secret not in combined
+
+
+def test_login_can_continue_directly_to_agent_registration(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    class Store:
+        def save(self, _name: str, _value: dict[str, str]) -> None:
+            return None
+
+    def fake_login(
+        self: DeveloperClient,
+        store: Store,
+        *,
+        on_authorization: object,
+    ) -> dict[str, str]:
+        authorization = {
+            "user_code": "ABCD-EFGH",
+            "verification_url": "https://auth.example/developer/device-authorizations/ABCD-EFGH",
+        }
+        on_authorization(authorization)  # type: ignore[operator]
+        return authorization
+
+    registrations: list[str] = []
+
+    def fake_register(args: object) -> int:
+        registrations.append(str(getattr(args, "tenant")))
+        print('{"agent_id":"release-risk-reviewer-r3","status":"registered"}')
+        return 0
+
+    monkeypatch.setattr(DeveloperClient, "login", fake_login)
+    monkeypatch.setattr("palonexus.cli.commands.agents_register", fake_register)
+    monkeypatch.setattr("palonexus.cli.commands.credential_store", lambda **_: Store())
+
+    assert (
+        main(
+            [
+                "login",
+                "--tenant",
+                "demo0",
+                "--no-browser",
+                "--register",
+            ]
+        )
+        == 0
+    )
+    captured = capsys.readouterr()
+    assert "Signed in. Registering the agent in this directory." in captured.err
+    assert captured.out == (
+        '{"agent_id":"release-risk-reviewer-r3","status":"registered"}\n'
+    )
+    assert registrations == ["demo0"]
 
 
 def test_agents_init_custodies_agent_key_without_output_or_project_secret(

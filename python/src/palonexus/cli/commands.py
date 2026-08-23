@@ -4,8 +4,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import time
 import uuid
+import webbrowser
 from argparse import Namespace
 from datetime import UTC, datetime, timedelta
 from importlib import metadata
@@ -56,13 +58,37 @@ def login(args: Namespace) -> int:
     store = credential_store(allow_file_fallback=args.allow_file_credential_store)
 
     def display(authorization: dict[str, str]) -> None:
-        print(f"Code: {authorization['user_code']}")
-        print(f"Verify: {authorization['verification_url']}")
+        verification_url = authorization["verification_url"]
+        print("Finish signing in in your browser.", file=sys.stderr)
+        print(f"Open: {verification_url}", file=sys.stderr)
+        print(f"Confirm code: {authorization['user_code']}", file=sys.stderr)
+        print(
+            "Sign in as the intended workforce user and approve this device.",
+            file=sys.stderr,
+        )
+        print(
+            "Keep this command running; it will continue automatically.",
+            file=sys.stderr,
+        )
+        if not getattr(args, "no_browser", False):
+            try:
+                webbrowser.open(verification_url, new=2)
+            except (OSError, webbrowser.Error):
+                # The exact URL is already visible as the reliable fallback.
+                pass
 
     try:
         client.login(store, on_authorization=display)
     except (DeveloperClientError, CredentialStoreUnavailable) as error:
         raise CommandError(f"login failed: {error}") from error
+    if getattr(args, "register", False):
+        print(
+            "Signed in. Registering the agent in this directory.",
+            file=sys.stderr,
+        )
+        return agents_register(args)
+    print("Signed in.", file=sys.stderr)
+    print("Next: pnxs agents register", file=sys.stderr)
     return 0
 
 
@@ -605,20 +631,26 @@ def logout(args: Namespace) -> int:
     store = credential_store(allow_file_fallback=args.allow_file_credential_store)
     try:
         credential = store.load("session")
-        if credential is not None:
-            stored_origin = _origin(credential.get("issuer_origin", ""))
-            configured_origin = args.auth_url or os.environ.get("PNXS_AUTH_URL")
-            if (
-                configured_origin is not None
-                and _origin(configured_origin) != stored_origin
-            ):
-                raise DeveloperClientError(
-                    "configured auth URL conflicts with the session issuer"
-                )
-            DeveloperClient(stored_origin).logout(credential)
-            store.delete("session")
+        if credential is None:
+            print("Already signed out.")
+            return 0
+        stored_origin = _origin(credential.get("issuer_origin", ""))
+        configured_origin = args.auth_url or os.environ.get("PNXS_AUTH_URL")
+        if (
+            configured_origin is not None
+            and _origin(configured_origin) != stored_origin
+        ):
+            raise DeveloperClientError(
+                "configured auth URL conflicts with the session issuer"
+            )
+        revoked = DeveloperClient(stored_origin).logout(credential)
+        store.delete("session")
     except (DeveloperClientError, CredentialStoreUnavailable) as error:
         raise CommandError(f"logout failed: {error}") from error
+    if revoked:
+        print("Signed out.")
+    else:
+        print("Already signed out. Local session cleared.")
     return 0
 
 
