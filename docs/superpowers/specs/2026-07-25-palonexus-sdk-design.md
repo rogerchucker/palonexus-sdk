@@ -741,6 +741,23 @@ client value included in the authoritative scope. Strong application identity
 requires an organization-managed installation or future platform attestation
 mechanism.
 
+#### Identity reference domains
+
+- **Failure mode:** A client rejected a valid owner-bound response because it
+  compared the canonical workforce subject with the session membership ID.
+- **Boundary:** A developer session can carry both a transport actor reference
+  (`membership_id`) and an authority-bearing workforce reference
+  (`owner_subject`); they identify related records but are not interchangeable.
+- **Rule:** Validate each response identity against the session field from the
+  same semantic domain. Prefer `owner_subject` for accountable ownership and
+  use `membership_id` only when the canonical field is absent for compatibility.
+- **Review question:** Does every identity comparison bind like-for-like
+  references, or does it accidentally compare an owner, actor, membership, and
+  provider subject as though they shared one namespace?
+- **Regression proof:** Exercise a session containing different membership and
+  owner values, accept only the canonical owner in the registration response,
+  and retain the legacy missing-field fallback.
+
 ### Credential storage
 
 - macOS uses Keychain.
