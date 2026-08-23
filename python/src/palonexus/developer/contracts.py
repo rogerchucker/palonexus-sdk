@@ -33,6 +33,8 @@ from ..errors import ModelValidationError
 _DIGEST = re.compile(r"^[0-9a-f]{64}$")
 _ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@~-]{0,127}$")
 _NAME = re.compile(r"^[a-z0-9][a-z0-9]*(?:[._:/-][a-z0-9]+)*$")
+_DESCRIPTOR_VERSION = re.compile(r"^[a-z0-9][a-z0-9._:/-]{0,255}$")
+_HARNESS_ADAPTER_CONTRACT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$")
 _BASE64URL = re.compile(r"^[A-Za-z0-9_-]+$")
 _RFC3339 = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
@@ -68,7 +70,7 @@ class _DeveloperContract(BaseModel):
     @classmethod
     def _reject_wire_coercions(cls, value: object) -> object:
         if isinstance(value, Mapping):
-            for field in ("issued_at", "expires_at"):
+            for field in ("issued_at", "not_before", "expires_at"):
                 timestamp = value.get(field)
                 if timestamp is not None and not isinstance(timestamp, (str, datetime)):
                     raise ValueError(f"{field} must be an RFC 3339 string or datetime")
@@ -402,10 +404,57 @@ class DeveloperAgentRegistration(_DeveloperContract):
     name: str
     descriptor_digest: str
     public_key_jwk: Ed25519PublicJWK
+    descriptor_version: str
+    runtime_profile: Mapping[str, JsonValue]
+    composition_digest: str
+    harness_adapter_contracts: tuple[str, ...]
+    not_before: AwareDatetime
+    expires_at: AwareDatetime
     proof: DetachedProof
 
     _name = field_validator("name")(_canonical_name)
     _descriptor_digest = field_validator("descriptor_digest")(_digest)
+    _composition_digest = field_validator("composition_digest")(_digest)
+
+    @model_validator(mode="before")
+    @classmethod
+    def _preflight_runtime_profile(cls, value: object) -> object:
+        if isinstance(value, Mapping) and "runtime_profile" in value:
+            profile = value["runtime_profile"]
+            if not isinstance(profile, Mapping) or not profile:
+                raise ValueError("runtime_profile must be a non-empty object")
+            _preflight_json(profile)
+            _canonical_json(profile)
+        return value
+
+    @field_validator("descriptor_version")
+    @classmethod
+    def _descriptor_version(cls, value: str) -> str:
+        if _DESCRIPTOR_VERSION.fullmatch(value) is None:
+            raise ValueError("descriptor_version is not canonical")
+        return value
+
+    @field_validator("harness_adapter_contracts")
+    @classmethod
+    def _adapter_contracts(cls, value: tuple[str, ...]) -> tuple[str, ...]:
+        if not 1 <= len(value) <= 64:
+            raise ValueError("harness_adapter_contracts must contain 1 to 64 values")
+        if len(set(value)) != len(value):
+            raise ValueError("harness_adapter_contracts must be unique")
+        if any(_HARNESS_ADAPTER_CONTRACT.fullmatch(item) is None for item in value):
+            raise ValueError("harness_adapter_contracts contains a non-canonical value")
+        return value
+
+    @model_validator(mode="after")
+    def _freeze_profile(self) -> Self:
+        if self.expires_at <= self.not_before:
+            raise ValueError("registration profile validity window is invalid")
+        object.__setattr__(self, "runtime_profile", _freeze(self.runtime_profile))
+        return self
+
+    @field_serializer("runtime_profile")
+    def _serialize_runtime_profile(self, value: Mapping[str, JsonValue]) -> JsonValue:
+        return cast(JsonValue, _thaw(value))
 
 
 class RequestedCapabilityRule(_DeveloperContract):
@@ -627,13 +676,13 @@ class ExactLeafAuthority(_DeveloperContract):
 
 
 class ExactActionLeafAuthority(ExactLeafAuthority):
-    # Intentional additive wire-version override; runtime and schema tests pin it.
-    schema_version: Literal["palonexus.exact-action/v2"]  # type: ignore[assignment]
+    # Exact-action v3 is the only published wire contract.
+    schema_version: Literal["palonexus.exact-action/v3"]  # type: ignore[assignment]
     action_id: str
     payload_digest: str
     effect_idempotency_key: str
     agent_generation: int = Field(strict=True, gt=0, le=2_147_483_647)
-    authority_profile: Literal["exact-action-v2"]
+    authority_profile: Literal["palonexus.exact-action/v3"]
     proxy_proof_key_thumbprint: str
 
     @field_validator("issued_at", "expires_at", mode="before")

@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palonexus.cloud/developer/registration-profile-v1.schema.json",
+  "title": "PaloNexus agent registration authority profile v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "descriptor_version", "runtime_profile", "composition_digest", "harness_adapter_contracts", "not_before", "expires_at"],
+  "properties": {
+    "schema_version": {"const": "palonexus.agent-registration-profile/v1"},
+    "descriptor_version": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._:/-]{0,255}$"},
+    "runtime_profile": {"type": "object", "minProperties": 1},
+    "composition_digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "harness_adapter_contracts": {
+      "type": "array", "minItems": 1, "maxItems": 64, "uniqueItems": true,
+      "items": {"type": "string", "pattern": "^[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}$"}
+    },
+    "not_before": {"type": "string", "format": "date-time"},
+    "expires_at": {"type": "string", "format": "date-time"}
+  }
+}

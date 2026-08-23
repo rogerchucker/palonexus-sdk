@@ -4,8 +4,10 @@ from __future__ import annotations
 import hashlib
 import json
 import os
+import sys
 import time
 import uuid
+import webbrowser
 from argparse import Namespace
 from datetime import UTC, datetime, timedelta
 from importlib import metadata
@@ -19,6 +21,7 @@ from palonexus.developer.client import (
     DeveloperClient,
     DeveloperClientError,
     _origin,
+    _registration_authority_profile,
     canonical_json,
     decode_strict_json,
     generate_agent_credential,
@@ -55,13 +58,37 @@ def login(args: Namespace) -> int:
     store = credential_store(allow_file_fallback=args.allow_file_credential_store)
 
     def display(authorization: dict[str, str]) -> None:
-        print(f"Code: {authorization['user_code']}")
-        print(f"Verify: {authorization['verification_url']}")
+        verification_url = authorization["verification_url"]
+        print("Finish signing in in your browser.", file=sys.stderr)
+        print(f"Open: {verification_url}", file=sys.stderr)
+        print(f"Confirm code: {authorization['user_code']}", file=sys.stderr)
+        print(
+            "Sign in as the intended workforce user and approve this device.",
+            file=sys.stderr,
+        )
+        print(
+            "Keep this command running; it will continue automatically.",
+            file=sys.stderr,
+        )
+        if not getattr(args, "no_browser", False):
+            try:
+                webbrowser.open(verification_url, new=2)
+            except (OSError, webbrowser.Error):
+                # The exact URL is already visible as the reliable fallback.
+                pass
 
     try:
         client.login(store, on_authorization=display)
     except (DeveloperClientError, CredentialStoreUnavailable) as error:
         raise CommandError(f"login failed: {error}") from error
+    if getattr(args, "register", False):
+        print(
+            "Signed in. Registering the agent in this directory.",
+            file=sys.stderr,
+        )
+        return agents_register(args)
+    print("Signed in.", file=sys.stderr)
+    print("Next: pnxs agents register", file=sys.stderr)
     return 0
 
 
@@ -96,6 +123,7 @@ def installed_sdk_version() -> str:
 
 
 _DESCRIPTOR_MAX_BYTES = 64 * 1024
+_REGISTRATION_PROFILE_MAX_BYTES = 16 * 1024
 _CEILING_BODY_FIELDS = {
     "schemaVersion",
     "agentGeneration",
@@ -105,21 +133,21 @@ _CEILING_BODY_FIELDS = {
 }
 
 
-def _reject_yaml_duplicates(node: Any) -> None:
+def _reject_yaml_duplicates(node: Any, label: str = "agent descriptor") -> None:
     if isinstance(node, yaml.MappingNode):
         keys: set[str] = set()
         for key_node, value_node in node.value:
             if not isinstance(key_node, yaml.ScalarNode) or not isinstance(
                 key_node.value, str
             ):
-                raise CommandError("agent descriptor is invalid")
+                raise CommandError(f"{label} is invalid")
             if key_node.value in keys:
-                raise CommandError("agent descriptor contains a duplicate field")
+                raise CommandError(f"{label} contains a duplicate field")
             keys.add(key_node.value)
-            _reject_yaml_duplicates(value_node)
+            _reject_yaml_duplicates(value_node, label)
     elif isinstance(node, yaml.SequenceNode):
         for item in node.value:
-            _reject_yaml_duplicates(item)
+            _reject_yaml_duplicates(item, label)
 
 
 def _strict_keys(value: object, expected: set[str]) -> dict[str, Any]:
@@ -217,6 +245,7 @@ def _project_descriptor(
         raise CommandError("agent output and action schemas must match")
     return {
         "name": name,
+        "version": version,
         "descriptor_digest": hashlib.sha256(raw).hexdigest(),
         "rules": [rule],
         "input_schema": input_schema,
@@ -228,6 +257,28 @@ def _project_descriptor(
         "resource": action["resource"],
         "constraints": action["constraints"],
     }
+
+
+def _project_registration_profile(
+    path: Path = Path("palonexus-registration.yaml"),
+) -> dict[str, Any]:
+    try:
+        raw = path.read_bytes()
+    except OSError as error:
+        raise CommandError("palonexus-registration.yaml is required") from error
+    if not raw or len(raw) > _REGISTRATION_PROFILE_MAX_BYTES:
+        raise CommandError("agent registration profile is empty or too large")
+    try:
+        text = raw.decode("utf-8")
+        node = yaml.compose(text, Loader=yaml.SafeLoader)
+        if node is None:
+            raise CommandError("agent registration profile is invalid")
+        _reject_yaml_duplicates(node, "agent registration profile")
+        profile = yaml.safe_load(text)
+        validated = _registration_authority_profile(profile)
+    except (UnicodeDecodeError, yaml.YAMLError, DeveloperClientError) as error:
+        raise CommandError("agent registration profile is invalid") from error
+    return {**profile, **validated}
 
 
 def _project_client(
@@ -268,6 +319,7 @@ def _print_json(value: dict[str, Any]) -> None:
 def agents_register(args: Namespace) -> int:
     client, store, session, agent, descriptor = _project_client(args)
     try:
+        descriptor["authority_profile"] = _project_registration_profile()
         result = client.register_agent(session, agent, descriptor)
         agent["agent_id"] = str(result["agent_id"])
         agent["agent_generation"] = str(result["generation"])
@@ -579,20 +631,26 @@ def logout(args: Namespace) -> int:
     store = credential_store(allow_file_fallback=args.allow_file_credential_store)
     try:
         credential = store.load("session")
-        if credential is not None:
-            stored_origin = _origin(credential.get("issuer_origin", ""))
-            configured_origin = args.auth_url or os.environ.get("PNXS_AUTH_URL")
-            if (
-                configured_origin is not None
-                and _origin(configured_origin) != stored_origin
-            ):
-                raise DeveloperClientError(
-                    "configured auth URL conflicts with the session issuer"
-                )
-            DeveloperClient(stored_origin).logout(credential)
-            store.delete("session")
+        if credential is None:
+            print("Already signed out.")
+            return 0
+        stored_origin = _origin(credential.get("issuer_origin", ""))
+        configured_origin = args.auth_url or os.environ.get("PNXS_AUTH_URL")
+        if (
+            configured_origin is not None
+            and _origin(configured_origin) != stored_origin
+        ):
+            raise DeveloperClientError(
+                "configured auth URL conflicts with the session issuer"
+            )
+        revoked = DeveloperClient(stored_origin).logout(credential)
+        store.delete("session")
     except (DeveloperClientError, CredentialStoreUnavailable) as error:
         raise CommandError(f"logout failed: {error}") from error
+    if revoked:
+        print("Signed out.")
+    else:
+        print("Already signed out. Local session cleared.")
     return 0
 
 

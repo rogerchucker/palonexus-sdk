@@ -269,7 +269,15 @@ func TestPeerUIDMismatchFailsClosedBeforeHandler(t *testing.T) {
 			return []byte(`{"schemaVersion":"1"}`), nil
 		}
 	})
-	response := exchange(t, path, validActionFrame(t))
+	conn, err := net.DialTimeout("unix", path, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer conn.Close()
+	response, err := bufio.NewReader(conn).ReadBytes('\n')
+	if err != nil {
+		t.Fatal(err)
+	}
 	failure, err := protocol.ParseProtocolError(response)
 	if err != nil {
 		t.Fatal(err)

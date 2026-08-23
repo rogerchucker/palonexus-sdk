@@ -86,6 +86,14 @@ class DeveloperClientError(RuntimeError):
     """A fail-closed developer protocol error."""
 
 
+class RequestRejected(DeveloperClientError):
+    """An authenticated developer request was rejected by the server."""
+
+    def __init__(self, status_code: int) -> None:
+        super().__init__(f"server rejected request ({status_code})")
+        self.status_code = status_code
+
+
 class ProtocolError(DeveloperClientError):
     """A peer response violated the strict developer protocol."""
 
@@ -203,6 +211,16 @@ def _require_timestamp(value: object, field: str) -> str:
     if parsed.tzinfo is None:
         raise ProtocolError(f"invalid {field}")
     return raw
+
+
+def _require_owner_subject(value: object, tenant_id: str) -> str:
+    subject = _require_string(value, "owner_subject")
+    pattern = (
+        r"[a-z][a-z0-9-]{0,31}:" + re.escape(tenant_id) + r":[A-Za-z0-9._~-]{1,220}"
+    )
+    if re.fullmatch(pattern, subject) is None:
+        raise ProtocolError("invalid owner_subject")
+    return subject
 
 
 def _require_poll_interval(value: object) -> int:
@@ -343,6 +361,12 @@ _REGISTRATION_RESPONSE_FIELDS = {
     "generation",
     "status",
     "capabilities",
+    "descriptor_version",
+    "runtime_profile",
+    "composition_digest",
+    "harness_adapter_contracts",
+    "not_before",
+    "expires_at",
 }
 _REVOCATION_RESPONSE_FIELDS = {
     "schema_version",
@@ -421,6 +445,24 @@ def _validate_registration_response(
     name: str,
     descriptor_digest: str,
     key_thumbprint: str,
+    authority_profile: dict[str, Any],
+) -> dict[str, Any]:
+    _validate_registered_agent_projection(response, session=session, name=name)
+    if response.get("descriptor_digest") != descriptor_digest:
+        raise ProtocolError("agent registration response is not bound to the request")
+    if response.get("key_thumbprint") != key_thumbprint:
+        raise ProtocolError("agent registration response is not bound to the request")
+    if any(
+        response.get(field) != expected for field, expected in authority_profile.items()
+    ):
+        raise ProtocolError(
+            "agent registration response has a different authority profile"
+        )
+    return response
+
+
+def _validate_registered_agent_projection(
+    response: dict[str, Any], *, session: dict[str, str], name: str
 ) -> dict[str, Any]:
     if set(response) != _REGISTRATION_RESPONSE_FIELDS:
         raise ProtocolError("invalid agent registration response shape")
@@ -434,8 +476,6 @@ def _validate_registration_response(
         "name": name,
         "tenant_id": _require_string(session.get("tenant_id"), "tenant_id"),
         "accountable_owner": _require_string(owner_subject, owner_field),
-        "descriptor_digest": descriptor_digest,
-        "key_thumbprint": key_thumbprint,
         "status": "registered",
     }
     if any(response.get(field) != value for field, value in expected_strings.items()):
@@ -443,9 +483,82 @@ def _validate_registration_response(
     if _require_string(response.get("agent_id"), "agent_id") != name:
         raise ProtocolError("agent registration response has an unexpected agent ID")
     _require_positive_int(response.get("generation"), "generation")
+    for field in ("descriptor_digest", "key_thumbprint"):
+        value = _require_string(response.get(field), field)
+        if re.fullmatch(r"[0-9a-f]{64}", value) is None:
+            raise ProtocolError("registered agent identity has an invalid digest")
     if response.get("capabilities") != []:
         raise ProtocolError("new agent registration unexpectedly contains authority")
+    _registration_authority_profile(
+        {
+            "schema_version": "palonexus.agent-registration-profile/v1",
+            **{
+                field: response.get(field)
+                for field in _REGISTRATION_PROFILE_FIELDS
+                if field != "schema_version"
+            },
+        }
+    )
     return response
+
+
+_REGISTRATION_PROFILE_FIELDS = {
+    "schema_version",
+    "descriptor_version",
+    "runtime_profile",
+    "composition_digest",
+    "harness_adapter_contracts",
+    "not_before",
+    "expires_at",
+}
+
+
+def _registration_authority_profile(value: object) -> dict[str, Any]:
+    if not isinstance(value, dict) or set(value) != _REGISTRATION_PROFILE_FIELDS:
+        raise ProtocolError("invalid agent registration profile")
+    if value.get("schema_version") != "palonexus.agent-registration-profile/v1":
+        raise ProtocolError("unsupported agent registration profile")
+    descriptor_version = _require_string(
+        value.get("descriptor_version"), "descriptor version"
+    )
+    if re.fullmatch(r"[a-z0-9][a-z0-9._:/-]{0,255}", descriptor_version) is None:
+        raise ProtocolError("invalid descriptor version")
+    runtime_profile = value.get("runtime_profile")
+    if not isinstance(runtime_profile, dict) or not runtime_profile:
+        raise ProtocolError("invalid runtime profile")
+    canonical_json(runtime_profile)
+    composition_digest = _require_string(
+        value.get("composition_digest"), "composition digest"
+    )
+    if re.fullmatch(r"[0-9a-f]{64}", composition_digest) is None:
+        raise ProtocolError("invalid composition digest")
+    contracts = value.get("harness_adapter_contracts")
+    if (
+        not isinstance(contracts, list)
+        or not 1 <= len(contracts) <= 64
+        or any(
+            not isinstance(contract, str)
+            or contract != contract.strip()
+            or re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._:/-]{0,255}", contract) is None
+            for contract in contracts
+        )
+        or len(set(contracts)) != len(contracts)
+    ):
+        raise ProtocolError("invalid harness adapter contracts")
+    not_before = _require_timestamp(value.get("not_before"), "not_before")
+    expires_at = _require_timestamp(value.get("expires_at"), "expires_at")
+    parsed_not_before = datetime.fromisoformat(not_before.replace("Z", "+00:00"))
+    parsed_expires_at = datetime.fromisoformat(expires_at.replace("Z", "+00:00"))
+    if parsed_expires_at <= parsed_not_before:
+        raise ProtocolError("agent registration profile has an invalid validity window")
+    return {
+        "descriptor_version": descriptor_version,
+        "runtime_profile": runtime_profile,
+        "composition_digest": composition_digest,
+        "harness_adapter_contracts": contracts,
+        "not_before": not_before,
+        "expires_at": expires_at,
+    }
 
 
 def _validate_revocation_response(
@@ -635,11 +748,13 @@ def _validate_device_session(
         expires_at.replace("Z", "+00:00")
     ) <= datetime.fromisoformat(created_at.replace("Z", "+00:00")):
         raise ProtocolError("invalid session time order")
+    tenant_id = _require_string(token.get("tenant_id"), "tenant_id")
     return {
         "session_token": session_token,
         "session_id": _require_string(token.get("session_id"), "session_id"),
-        "tenant_id": _require_string(token.get("tenant_id"), "tenant_id"),
+        "tenant_id": tenant_id,
         "membership_id": _require_string(token.get("membership_id"), "membership_id"),
+        "owner_subject": _require_owner_subject(token.get("owner_subject"), tenant_id),
         "role": role,
         "device_jkt": device_jkt,
         "created_at": created_at,
@@ -692,9 +807,7 @@ class DeveloperClient:
             ) as response:
                 expected_codes = {expected} if isinstance(expected, int) else expected
                 if response.status_code not in expected_codes:
-                    raise DeveloperClientError(
-                        f"server rejected request ({response.status_code})"
-                    )
+                    raise RequestRejected(response.status_code)
                 chunks: list[bytes] = []
                 received = 0
                 for chunk in response.iter_bytes(chunk_size=MAX_RESPONSE_BYTES + 1):
@@ -812,6 +925,7 @@ class DeveloperClient:
                 "tenant_id",
                 "account_id",
                 "membership_id",
+                "owner_subject",
                 "role",
                 "device_jkt",
                 "created_at",
@@ -841,7 +955,7 @@ class DeveloperClient:
         store.save("session", session)
         return authorization
 
-    def logout(self, credential: dict[str, str]) -> None:
+    def logout(self, credential: dict[str, str]) -> bool:
         token = _require_string(credential.get("session_token"), "session token")
         session_id = _require_string(credential.get("session_id"), "session ID")
         issuer_origin = _require_string(
@@ -849,16 +963,27 @@ class DeveloperClient:
         )
         if _origin(issuer_origin) != issuer_origin or issuer_origin != self.origin:
             raise ProtocolError("session issuer origin does not match")
-        response = self._request(
-            "DELETE",
-            "/v1/developer/sessions/" + quote(session_id, safe=""),
-            headers={"Authorization": "Bearer " + token},
-            allowed_fields={"status", "session_id"},
-        )
+        try:
+            response = self._request(
+                "DELETE",
+                "/v1/developer/sessions/" + quote(session_id, safe=""),
+                headers={"Authorization": "Bearer " + token},
+                allowed_fields={"status", "session_id"},
+            )
+        except RequestRejected as error:
+            # An expired or already-revoked developer session no longer
+            # authorizes this request, so Cloud Auth answers 401. That is the
+            # idempotent logout outcome: no remote authority remains and the
+            # caller may safely clear its local credential. Other status codes
+            # still fail closed because they do not prove inactivity.
+            if error.status_code == 401:
+                return False
+            raise
         if set(response) != {"status", "session_id"}:
             raise ProtocolError("invalid logout response shape")
         if response["status"] != "revoked" or response["session_id"] != session_id:
             raise ProtocolError("invalid logout confirmation")
+        return True
 
     def register_agent(
         self,
@@ -887,8 +1012,12 @@ class DeveloperClient:
         )
         if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
             raise ProtocolError("invalid descriptor digest")
+        authority_profile = _registration_authority_profile(
+            descriptor.get("authority_profile")
+        )
         message = canonical_json(
             {
+                "authority_profile": authority_profile,
                 "descriptor_digest": digest,
                 "key_thumbprint": thumbprint,
                 "name": name,
@@ -900,6 +1029,7 @@ class DeveloperClient:
             "name": name,
             "descriptor_digest": digest,
             "public_key_jwk": jwk,
+            **authority_profile,
             "proof": {
                 "alg": "EdDSA",
                 "key_thumbprint": thumbprint,
@@ -925,6 +1055,25 @@ class DeveloperClient:
             name=name,
             descriptor_digest=digest,
             key_thumbprint=thumbprint,
+            authority_profile=authority_profile,
+        )
+
+    def registered_agent(
+        self, session: dict[str, str], agent_name: str
+    ) -> dict[str, Any]:
+        """Resolve the immutable owner-bound registration projection."""
+        name = _require_string(agent_name, "agent name")
+        response = self._request(
+            "GET",
+            "/v1/developer/agents/" + quote(name, safe=""),
+            headers={
+                "Authorization": "Bearer "
+                + _require_string(session.get("session_token"), "session token")
+            },
+            allowed_fields=_REGISTRATION_RESPONSE_FIELDS,
+        )
+        return _validate_registered_agent_projection(
+            response, session=session, name=name
         )
 
     def revoke_agent(
