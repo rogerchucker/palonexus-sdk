@@ -1,0 +1,21 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palonexus.cloud/developer/cli-compatibility-v1.schema.json",
+  "title": "PaloNexus developer CLI compatibility v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "schema_version",
+    "cli_contract",
+    "minimum_cli_version",
+    "maximum_cli_version_exclusive",
+    "registration_contract"
+  ],
+  "properties": {
+    "schema_version": {"const": "palonexus.developer-cli-compatibility/v1"},
+    "cli_contract": {"const": "palonexus.pnxs/v1"},
+    "minimum_cli_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[a-zA-Z0-9.+-]*)?$"},
+    "maximum_cli_version_exclusive": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[a-zA-Z0-9.+-]*)?$"},
+    "registration_contract": {"const": "palonexus.developer-agent/v1"}
+  }
+}

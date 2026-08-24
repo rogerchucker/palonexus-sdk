@@ -8,6 +8,7 @@
   "x-palonexus-canonical-json-encoding": "UTF-8",
   "x-palonexus-duplicate-object-names": "reject",
   "oneOf": [
+    {"$ref": "#/$defs/DeveloperCLICompatibility"},
     {"$ref": "#/$defs/DeveloperAgentRegistration"},
     {"$ref": "#/$defs/CapabilityCeilingRequest"},
     {"$ref": "#/$defs/CreateActionRequest"},
@@ -15,6 +16,18 @@
     {"$ref": "#/$defs/ExactActionLeafAuthority"}
   ],
   "$defs": {
+    "DeveloperCLICompatibility": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "cli_contract", "minimum_cli_version", "maximum_cli_version_exclusive", "registration_contract"],
+      "properties": {
+        "schema_version": {"const": "palonexus.developer-cli-compatibility/v1"},
+        "cli_contract": {"const": "palonexus.pnxs/v1"},
+        "minimum_cli_version": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[a-zA-Z0-9.+-]*)?$"},
+        "maximum_cli_version_exclusive": {"type": "string", "pattern": "^[0-9]+\\.[0-9]+\\.[0-9]+(?:[a-zA-Z0-9.+-]*)?$"},
+        "registration_contract": {"const": "palonexus.developer-agent/v1"}
+      }
+    },
     "RegistrationProfile": {
       "$ref": "registration-profile-v1.schema.json",
       "$comment": "Adjacent project metadata validated before it is projected into DeveloperAgentRegistration; it is not itself an API request."

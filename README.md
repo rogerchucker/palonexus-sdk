@@ -4,10 +4,10 @@ PaloNexus SDK is the planned public integration boundary for the PaloNexus
 agent control plane. This repository will contain the Python SDK, local guard,
 shared protocol, and thin coding-agent plugins.
 
-Implementation is underway. The repository does not yet publish installable
-packages, binaries, or plugins. Until the first release, the committed design
-and implementation plans under `docs/superpowers/` describe the intended
-interfaces.
+Implementation is underway. The Python distribution includes the standalone
+`pnxs` command; public releases are installed as an isolated `uv` tool. See
+[Install the standalone `pnxs` CLI](docs/cli-installation.md). Plugins and other
+planned artifacts are not yet published.
 
 ## Development
 

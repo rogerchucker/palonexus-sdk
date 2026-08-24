@@ -388,9 +388,12 @@ def _register_with_recovery(
     session: dict[str, str],
     agent: dict[str, str],
     descriptor: dict[str, Any],
+    cli_version: str,
 ) -> tuple[dict[str, Any], bool]:
     try:
-        return client.register_agent(session, agent, descriptor), False
+        return client.register_agent(
+            session, agent, descriptor, cli_version=cli_version
+        ), False
     except DeveloperClientError as registration_error:
         try:
             recovered = client.reconcile_agent_registration(session, agent, descriptor)
@@ -525,6 +528,14 @@ def agents_add(args: Namespace) -> int:
         raise CommandError(
             "the developer session has no canonical owner identity; sign in again"
         )
+    try:
+        client = DeveloperClient(
+            os.environ.get("PNXS_API_URL", "https://api.palonexus.cloud")
+        )
+        cli_version = installed_sdk_version()
+        compatibility = client.require_cli_compatibility(session, cli_version)
+    except (DeveloperClientError, ScaffoldError) as error:
+        raise CommandError(f"agent registration failed: {error}") from error
 
     workspace = (
         Path(args.workspace).expanduser()
@@ -541,7 +552,13 @@ def agents_add(args: Namespace) -> int:
     print(f"Owner:  {owner_subject}", file=sys.stderr)
     print(f"Source: {source}", file=sys.stderr)
     print(f"Workspace: {workspace}", file=sys.stderr)
-    print(f"CLI:    {Path(sys.argv[0]).resolve(strict=False)}", file=sys.stderr)
+    print(
+        f"CLI:    {Path(sys.argv[0]).resolve(strict=False)} "
+        f"({cli_version}; compatible with "
+        f">={compatibility['minimum_cli_version']},"
+        f"<{compatibility['maximum_cli_version_exclusive']})",
+        file=sys.stderr,
+    )
     _confirm_registration(args)
 
     intent = {
@@ -561,10 +578,9 @@ def agents_add(args: Namespace) -> int:
         agent = store.load(credential_name)
         if agent is None:
             raise CredentialStoreUnavailable("agent credential was not persisted")
-        client = DeveloperClient(
-            os.environ.get("PNXS_API_URL", "https://api.palonexus.cloud")
+        result, recovered = _register_with_recovery(
+            client, session, agent, descriptor, cli_version
         )
-        result, recovered = _register_with_recovery(client, session, agent, descriptor)
         agent["agent_id"] = str(result["agent_id"])
         agent["agent_generation"] = str(result["generation"])
         agent["registered_descriptor_digest"] = str(result["descriptor_digest"])
@@ -590,12 +606,28 @@ def agents_register(args: Namespace) -> int:
     client, store, session, agent, descriptor, credential_name = _project_client(args)
     descriptor["authority_profile"] = _project_registration_profile()
     try:
-        result, recovered = _register_with_recovery(client, session, agent, descriptor)
+        cli_version = installed_sdk_version()
+        compatibility = client.require_cli_compatibility(session, cli_version)
+        print(
+            f"CLI: {Path(sys.argv[0]).resolve(strict=False)} "
+            f"({cli_version}; compatible with "
+            f">={compatibility['minimum_cli_version']},"
+            f"<{compatibility['maximum_cli_version_exclusive']})",
+            file=sys.stderr,
+        )
+        result, recovered = _register_with_recovery(
+            client, session, agent, descriptor, cli_version
+        )
         agent["agent_id"] = str(result["agent_id"])
         agent["agent_generation"] = str(result["generation"])
         agent["registered_descriptor_digest"] = str(result["descriptor_digest"])
         store.save(credential_name, agent)
-    except (DeveloperClientError, CredentialStoreUnavailable, KeyError) as error:
+    except (
+        DeveloperClientError,
+        CredentialStoreUnavailable,
+        KeyError,
+        ScaffoldError,
+    ) as error:
         raise CommandError(f"agent registration failed: {error}") from error
     if recovered:
         print(

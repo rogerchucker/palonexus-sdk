@@ -17,6 +17,10 @@ release.
 - Agent registration retries can reconcile an exact owner-, key-, descriptor-,
   and authority-profile-bound server commit when the original response could
   not be accepted locally.
+- Registration commands query the authenticated tenant's exact CLI
+  compatibility contract before creating local or server state and send the
+  accepted CLI contract and version with the registration request.
+- Added standalone `pnxs` installation and upgrade instructions for `uv tool`.
 
 ### Changed
 
