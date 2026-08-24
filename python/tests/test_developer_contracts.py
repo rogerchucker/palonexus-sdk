@@ -21,6 +21,10 @@ from palonexus.errors import ModelValidationError
 
 FIXTURE = Path(__file__).parent / "fixtures/developer-api-v1.json"
 SCHEMA = Path(__file__).parents[2] / "contracts/developer/v1.schema.json"
+CLI_COMPATIBILITY_SCHEMA = (
+    Path(__file__).parents[2]
+    / "contracts/developer/cli-compatibility-v1.schema.json"
+)
 
 
 def _fixture() -> dict[str, object]:
@@ -30,6 +34,25 @@ def _fixture() -> dict[str, object]:
 def _reject(model: type, value: object) -> None:
     with pytest.raises(ModelValidationError):
         model.model_validate(value)
+
+
+def test_cli_compatibility_schema_is_closed_and_in_the_v1_umbrella() -> None:
+    value = {
+        "schema_version": "palonexus.developer-cli-compatibility/v1",
+        "cli_contract": "palonexus.pnxs/v1",
+        "minimum_cli_version": "0.2.2",
+        "maximum_cli_version_exclusive": "0.3.0",
+        "registration_contract": "palonexus.developer-agent/v1",
+    }
+    standalone = Draft202012Validator(
+        json.loads(CLI_COMPATIBILITY_SCHEMA.read_text(encoding="utf-8"))
+    )
+    umbrella = Draft202012Validator(
+        json.loads(SCHEMA.read_text(encoding="utf-8"))
+    )
+    assert standalone.is_valid(value)
+    assert umbrella.is_valid(value)
+    assert not standalone.is_valid({**value, "unknown": True})
 
 
 def test_canonical_platform_vector_validates_without_platform_imports() -> None:

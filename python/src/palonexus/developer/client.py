@@ -16,11 +16,20 @@ import httpx
 import rfc8785
 from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+from packaging.version import InvalidVersion, Version
 
 from .contracts import RequestedCapabilityRule
 from .credentials import CredentialStore
 
 MAX_RESPONSE_BYTES = 64 * 1024
+CLI_CONTRACT = "palonexus.pnxs/v1"
+CLI_COMPATIBILITY_FIELDS = {
+    "schema_version",
+    "cli_contract",
+    "minimum_cli_version",
+    "maximum_cli_version_exclusive",
+    "registration_contract",
+}
 _RFC3339 = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
@@ -84,6 +93,10 @@ _DEVELOPER_DELIVERY_STATES = {
 
 class DeveloperClientError(RuntimeError):
     """A fail-closed developer protocol error."""
+
+
+class CLIIncompatible(DeveloperClientError):
+    """The installed standalone CLI cannot use this tenant contract."""
 
 
 class RequestRejected(DeveloperClientError):
@@ -1013,11 +1026,60 @@ class DeveloperClient:
             raise ProtocolError("invalid logout confirmation")
         return True
 
+    def require_cli_compatibility(
+        self, session: dict[str, str], cli_version: str
+    ) -> dict[str, str]:
+        response = self._request(
+            "GET",
+            "/v1/developer/compatibility",
+            headers={
+                "Authorization": "Bearer "
+                + _require_string(session.get("session_token"), "session token")
+            },
+            allowed_fields=CLI_COMPATIBILITY_FIELDS,
+        )
+        if set(response) != CLI_COMPATIBILITY_FIELDS:
+            raise ProtocolError("invalid CLI compatibility response shape")
+        expected = {
+            "schema_version": "palonexus.developer-cli-compatibility/v1",
+            "cli_contract": CLI_CONTRACT,
+            "registration_contract": "palonexus.developer-agent/v1",
+        }
+        if any(response.get(field) != value for field, value in expected.items()):
+            raise CLIIncompatible("tenant advertises an unsupported CLI contract")
+        minimum_raw = _require_string(
+            response.get("minimum_cli_version"), "minimum CLI version"
+        )
+        maximum_raw = _require_string(
+            response.get("maximum_cli_version_exclusive"),
+            "maximum CLI version",
+        )
+        installed_raw = _require_string(cli_version, "installed CLI version")
+        try:
+            minimum = Version(minimum_raw)
+            maximum = Version(maximum_raw)
+            installed = Version(installed_raw)
+        except InvalidVersion as error:
+            raise ProtocolError(
+                "CLI compatibility response has an invalid version"
+            ) from error
+        if minimum >= maximum:
+            raise ProtocolError("CLI compatibility response has an empty range")
+        if not minimum <= installed < maximum:
+            raise CLIIncompatible(
+                f"pnxs {installed_raw} is outside the tenant-supported range "
+                f">={minimum_raw},<{maximum_raw}. No changes were made. "
+                "Upgrade with `uv tool upgrade palonexus`."
+            )
+        return {field: str(response[field]) for field in CLI_COMPATIBILITY_FIELDS}
+
     def register_agent(
         self,
         session: dict[str, str],
         agent: dict[str, str],
         descriptor: dict[str, Any],
+        *,
+        cli_version: str | None = None,
     ) -> dict[str, Any]:
         private = _decode_private_key(agent.get("private_key"))
         jwk, thumbprint, name, digest, authority_profile = _registration_binding(
@@ -1045,15 +1107,25 @@ class DeveloperClient:
             },
         }
         body = canonical_json(request)
+        headers = {
+            "Authorization": "Bearer "
+            + _require_string(session.get("session_token"), "session token"),
+            "Idempotency-Key": hashlib.sha256(body).hexdigest(),
+        }
+        if cli_version is not None:
+            headers.update(
+                {
+                    "Palonexus-CLI-Contract": CLI_CONTRACT,
+                    "Palonexus-CLI-Version": _require_string(
+                        cli_version, "installed CLI version"
+                    ),
+                }
+            )
         response = self._request(
             "POST",
             "/v1/developer/agents",
             body=body,
-            headers={
-                "Authorization": "Bearer "
-                + _require_string(session.get("session_token"), "session token"),
-                "Idempotency-Key": hashlib.sha256(body).hexdigest(),
-            },
+            headers=headers,
             expected=201,
             allowed_fields=_REGISTRATION_RESPONSE_FIELDS,
         )

@@ -105,4 +105,4 @@ repository = "rogerchucker/palonexus-platform"
 # Task 1 adds canonical developer schemas to both repositories and lists their
 # repository-relative paths here. The release gate rejects missing, extra, or
 # byte-different files as soon as this list is populated.
-schema-paths = ["contracts/developer/exact-action-v3.schema.json", "contracts/developer/registration-profile-v1.schema.json", "contracts/developer/v1.schema.json"]
+schema-paths = ["contracts/developer/cli-compatibility-v1.schema.json", "contracts/developer/exact-action-v3.schema.json", "contracts/developer/registration-profile-v1.schema.json", "contracts/developer/v1.schema.json"]

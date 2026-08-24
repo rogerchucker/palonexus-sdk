@@ -28,6 +28,7 @@ from palonexus.cli.commands import CommandError
 from palonexus.cli.main import build_parser, main
 from palonexus.developer.client import (
     MAX_RESPONSE_BYTES,
+    CLIIncompatible,
     DeveloperClient,
     DeveloperClientError,
     ProtocolError,
@@ -1605,6 +1606,61 @@ def _registration_response(
     }
 
 
+def _compatibility_response() -> dict[str, str]:
+    return {
+        "schema_version": "palonexus.developer-cli-compatibility/v1",
+        "cli_contract": "palonexus.pnxs/v1",
+        "minimum_cli_version": "0.2.2",
+        "maximum_cli_version_exclusive": "0.3.0",
+        "registration_contract": "palonexus.developer-agent/v1",
+    }
+
+
+def test_developer_cli_compatibility_is_exact_and_enforced_before_mutation() -> None:
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        return httpx.Response(200, json=_compatibility_response())
+
+    client = DeveloperClient(
+        "https://api.palonexus.cloud", transport=httpx.MockTransport(handler)
+    )
+    session = {"session_token": "pnx_dev_session"}
+    assert client.require_cli_compatibility(session, "0.2.2") == (
+        _compatibility_response()
+    )
+    assert seen[0].url == (
+        "https://api.palonexus.cloud/v1/developer/compatibility"
+    )
+    assert seen[0].headers["authorization"] == "Bearer pnx_dev_session"
+
+    with pytest.raises(CLIIncompatible, match="uv tool upgrade palonexus"):
+        client.require_cli_compatibility(session, "0.2.1")
+
+
+@pytest.mark.parametrize(
+    "field,value",
+    [
+        ("schema_version", "palonexus.developer-cli-compatibility/v2"),
+        ("cli_contract", "palonexus.pnxs/v2"),
+        ("registration_contract", "palonexus.developer-agent/v2"),
+    ],
+)
+def test_developer_cli_compatibility_rejects_unknown_contracts(
+    field: str, value: str
+) -> None:
+    response = {**_compatibility_response(), field: value}
+    client = DeveloperClient(
+        "https://api.palonexus.cloud",
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=response)),
+    )
+    with pytest.raises(CLIIncompatible):
+        client.require_cli_compatibility(
+            {"session_token": "pnx_dev_session"}, "0.2.2"
+        )
+
+
 def _registration_profile() -> dict[str, object]:
     return {
         "schema_version": "palonexus.agent-registration-profile/v1",
@@ -1978,12 +2034,15 @@ def test_agent_registration_uses_exact_pop_contract_and_zero_authority() -> None
             "descriptor_digest": descriptor_digest,
             "authority_profile": _registration_profile(),
         },
+        cli_version="0.2.2",
     )
 
     assert result["capabilities"] == []
     assert len(seen) == 1
     assert seen[0].url == "https://api.palonexus.cloud/v1/developer/agents"
     assert seen[0].headers["authorization"] == "Bearer pnx_dev_session"
+    assert seen[0].headers["palonexus-cli-contract"] == "palonexus.pnxs/v1"
+    assert seen[0].headers["palonexus-cli-version"] == "0.2.2"
     assert (
         seen[0].headers["idempotency-key"]
         == hashlib.sha256(seen[0].content).hexdigest()
@@ -2053,7 +2112,12 @@ def test_agents_register_recovers_an_exact_server_commit_and_saves_local_state(
             saved[name] = dict(value)
 
     class Client:
-        def register_agent(self, *args: object) -> dict[str, object]:
+        def require_cli_compatibility(self, *args: object) -> dict[str, str]:
+            return _compatibility_response()
+
+        def register_agent(
+            self, *args: object, **kwargs: object
+        ) -> dict[str, object]:
             raise ProtocolError("response contains an unknown field")
 
         def reconcile_agent_registration(
@@ -2082,6 +2146,7 @@ def test_agents_register_recovers_an_exact_server_commit_and_saves_local_state(
         "palonexus.cli.commands._project_registration_profile",
         _registration_profile,
     )
+    monkeypatch.setattr("palonexus.cli.commands.installed_sdk_version", lambda: "0.2.2")
 
     assert main(["agents", "register"]) == 0
     assert saved["agent:release-risk-reviewer"]["agent_id"] == ("release-risk-reviewer")
@@ -2111,7 +2176,12 @@ def test_agents_register_preserves_the_original_error_when_reconciliation_fails(
             raise AssertionError((name, value))
 
     class Client:
-        def register_agent(self, *args: object) -> dict[str, object]:
+        def require_cli_compatibility(self, *args: object) -> dict[str, str]:
+            return _compatibility_response()
+
+        def register_agent(
+            self, *args: object, **kwargs: object
+        ) -> dict[str, object]:
             raise ProtocolError("registration response is malformed")
 
         def reconcile_agent_registration(self, *args: object) -> dict[str, object]:
@@ -2132,11 +2202,13 @@ def test_agents_register_preserves_the_original_error_when_reconciliation_fails(
         "palonexus.cli.commands._project_registration_profile",
         _registration_profile,
     )
+    monkeypatch.setattr("palonexus.cli.commands.installed_sdk_version", lambda: "0.2.2")
 
     assert main(["agents", "register"]) == 1
     captured = capsys.readouterr()
     assert captured.out == ""
-    assert captured.err == (
+    assert "CLI:" in captured.err
+    assert captured.err.endswith(
         "agent registration failed: registration response is malformed\n"
     )
 
@@ -2204,11 +2276,15 @@ expires_at: '2027-08-21T00:00:00Z'
         def __init__(self, origin: str) -> None:
             assert origin == "https://api.palonexus.cloud"
 
+        def require_cli_compatibility(self, *args: object) -> dict[str, str]:
+            return _compatibility_response()
+
         def register_agent(
             self,
             session: dict[str, str],
             agent: dict[str, str],
             descriptor: dict[str, object],
+            **kwargs: object,
         ) -> dict[str, object]:
             assert session == values["session"]
             assert descriptor["name"] == "second-agent"
@@ -2231,6 +2307,7 @@ expires_at: '2027-08-21T00:00:00Z'
     monkeypatch.setattr(
         "palonexus.cli.commands._require_standalone_registration_cli", lambda: None
     )
+    monkeypatch.setattr("palonexus.cli.commands.installed_sdk_version", lambda: "0.2.2")
 
     argv = [
         "agents",
@@ -2278,6 +2355,67 @@ expires_at: '2027-08-21T00:00:00Z'
     assert "Tenant: tenant-a" in captured.err
     assert "Workspace:" in captured.err
     assert values[credential_name]["private_key"] not in captured.out + captured.err
+
+
+def test_agents_add_incompatible_cli_makes_no_local_changes(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    workspace = tmp_path / "registration"
+
+    class Store:
+        state_dir = tmp_path / "state"
+
+        def load(self, name: str) -> dict[str, str] | None:
+            assert name == "session"
+            return {
+                "session_token": "pnx_dev_session-secret",
+                "tenant_id": "tenant-a",
+                "owner_subject": "okta:tenant-a:robin-singh",
+            }
+
+        def create_if_absent(self, *args: object) -> bool:
+            raise AssertionError("incompatible CLI created a credential")
+
+    class Client:
+        def __init__(self, _origin: str) -> None:
+            pass
+
+        def require_cli_compatibility(self, *args: object) -> dict[str, str]:
+            raise CLIIncompatible(
+                "No changes were made. Upgrade with `uv tool upgrade palonexus`."
+            )
+
+    monkeypatch.setattr("palonexus.cli.commands.credential_store", lambda **_: Store())
+    monkeypatch.setattr("palonexus.cli.commands.DeveloperClient", Client)
+    monkeypatch.setattr(
+        "palonexus.cli.commands._require_standalone_registration_cli", lambda: None
+    )
+    monkeypatch.setattr(
+        "palonexus.cli.commands._derived_registration_material",
+        lambda *_: (b"descriptor", b"profile"),
+    )
+    monkeypatch.setattr("palonexus.cli.commands.installed_sdk_version", lambda: "0.2.1")
+    args = build_parser().parse_args(
+        [
+            "agents",
+            "add",
+            "--from",
+            str(tmp_path / "source"),
+            "--name",
+            "second-agent",
+            "--tenant",
+            "tenant-a",
+            "--workspace",
+            str(workspace),
+            "--yes",
+        ]
+    )
+
+    with pytest.raises(CommandError, match="uv tool upgrade palonexus"):
+        from palonexus.cli.commands import agents_add
+
+        agents_add(args)
+    assert not workspace.exists()
 
 
 def test_registration_rejects_a_project_virtualenv_cli_before_mutation(
