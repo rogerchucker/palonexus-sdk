@@ -1630,9 +1630,7 @@ def test_developer_cli_compatibility_is_exact_and_enforced_before_mutation() -> 
     assert client.require_cli_compatibility(session, "0.2.2") == (
         _compatibility_response()
     )
-    assert seen[0].url == (
-        "https://api.palonexus.cloud/v1/developer/compatibility"
-    )
+    assert seen[0].url == ("https://api.palonexus.cloud/v1/developer/compatibility")
     assert seen[0].headers["authorization"] == "Bearer pnx_dev_session"
 
     with pytest.raises(CLIIncompatible, match="uv tool upgrade palonexus"):
@@ -1656,9 +1654,7 @@ def test_developer_cli_compatibility_rejects_unknown_contracts(
         transport=httpx.MockTransport(lambda _: httpx.Response(200, json=response)),
     )
     with pytest.raises(CLIIncompatible):
-        client.require_cli_compatibility(
-            {"session_token": "pnx_dev_session"}, "0.2.2"
-        )
+        client.require_cli_compatibility({"session_token": "pnx_dev_session"}, "0.2.2")
 
 
 def _registration_profile() -> dict[str, object]:
@@ -2115,9 +2111,7 @@ def test_agents_register_recovers_an_exact_server_commit_and_saves_local_state(
         def require_cli_compatibility(self, *args: object) -> dict[str, str]:
             return _compatibility_response()
 
-        def register_agent(
-            self, *args: object, **kwargs: object
-        ) -> dict[str, object]:
+        def register_agent(self, *args: object, **kwargs: object) -> dict[str, object]:
             raise ProtocolError("response contains an unknown field")
 
         def reconcile_agent_registration(
@@ -2179,9 +2173,7 @@ def test_agents_register_preserves_the_original_error_when_reconciliation_fails(
         def require_cli_compatibility(self, *args: object) -> dict[str, str]:
             return _compatibility_response()
 
-        def register_agent(
-            self, *args: object, **kwargs: object
-        ) -> dict[str, object]:
+        def register_agent(self, *args: object, **kwargs: object) -> dict[str, object]:
             raise ProtocolError("registration response is malformed")
 
         def reconcile_agent_registration(self, *args: object) -> dict[str, object]:

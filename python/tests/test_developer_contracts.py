@@ -22,8 +22,7 @@ from palonexus.errors import ModelValidationError
 FIXTURE = Path(__file__).parent / "fixtures/developer-api-v1.json"
 SCHEMA = Path(__file__).parents[2] / "contracts/developer/v1.schema.json"
 CLI_COMPATIBILITY_SCHEMA = (
-    Path(__file__).parents[2]
-    / "contracts/developer/cli-compatibility-v1.schema.json"
+    Path(__file__).parents[2] / "contracts/developer/cli-compatibility-v1.schema.json"
 )
 
 
@@ -47,9 +46,7 @@ def test_cli_compatibility_schema_is_closed_and_in_the_v1_umbrella() -> None:
     standalone = Draft202012Validator(
         json.loads(CLI_COMPATIBILITY_SCHEMA.read_text(encoding="utf-8"))
     )
-    umbrella = Draft202012Validator(
-        json.loads(SCHEMA.read_text(encoding="utf-8"))
-    )
+    umbrella = Draft202012Validator(json.loads(SCHEMA.read_text(encoding="utf-8")))
     assert standalone.is_valid(value)
     assert umbrella.is_valid(value)
     assert not standalone.is_valid({**value, "unknown": True})
