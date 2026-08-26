@@ -49,6 +49,20 @@ def build_parser() -> argparse.ArgumentParser:
         command.add_argument("--allow-file-credential-store", action="store_true")
         command.set_defaults(handler=handler)
 
+    agent = subcommands.add_parser("agent", allow_abbrev=False)
+    singular_agent_commands = agent.add_subparsers(
+        dest="singular_agent_command", required=True
+    )
+    attach = singular_agent_commands.add_parser("attach", allow_abbrev=False)
+    attach.add_argument("name")
+    attach.add_argument("--allow-file-credential-store", action="store_true")
+    attach.set_defaults(handler=commands.agent_attach)
+
+    register = subcommands.add_parser("register", allow_abbrev=False)
+    register.add_argument("name")
+    register.add_argument("--allow-file-credential-store", action="store_true")
+    register.set_defaults(handler=commands.register_agent)
+
     run = subcommands.add_parser("run", allow_abbrev=False)
     run.add_argument("agent_file")
     run.add_argument("--input", required=True)

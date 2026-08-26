@@ -381,6 +381,31 @@ _REGISTRATION_RESPONSE_FIELDS = {
     "not_before",
     "expires_at",
 }
+_CLAIM_CHALLENGE_FIELDS = {
+    "schema_version",
+    "challenge_id",
+    "agent_id",
+    "tenant_id",
+    "accountable_owner",
+    "generation",
+    "descriptor_digest",
+    "key_thumbprint",
+    "nonce",
+    "expires_at",
+    "status",
+}
+_CLAIM_RECEIPT_FIELDS = {
+    "schema_version",
+    "claim_id",
+    "agent_id",
+    "tenant_id",
+    "accountable_owner",
+    "descriptor_digest",
+    "key_thumbprint",
+    "generation",
+    "status",
+    "claimed_at",
+}
 _REVOCATION_RESPONSE_FIELDS = {
     "schema_version",
     "event_id",
@@ -600,6 +625,95 @@ def _registration_binding(
         descriptor.get("authority_profile")
     )
     return jwk, thumbprint, name, digest, authority_profile
+
+
+def _claim_binding(
+    agent: dict[str, str], descriptor: dict[str, Any]
+) -> tuple[dict[str, str], str, str, str]:
+    try:
+        jwk = json.loads(
+            _require_string(agent.get("public_key_jwk"), "agent public key")
+        )
+    except json.JSONDecodeError as error:
+        raise ProtocolError("invalid agent public key") from error
+    if (
+        not isinstance(jwk, dict)
+        or set(jwk) != {"kty", "crv", "x"}
+        or jwk.get("kty") != "OKP"
+        or jwk.get("crv") != "Ed25519"
+        or not all(isinstance(value, str) for value in jwk.values())
+    ):
+        raise ProtocolError("invalid agent public key")
+    thumbprint = hashlib.sha256(canonical_json(jwk)).hexdigest()
+    name = _require_string(descriptor.get("name"), "agent name")
+    digest = _require_string(descriptor.get("descriptor_digest"), "descriptor digest")
+    if re.fullmatch(r"[0-9a-f]{64}", digest) is None:
+        raise ProtocolError("invalid descriptor digest")
+    return jwk, thumbprint, name, digest
+
+
+def _validate_claim_challenge(
+    response: dict[str, Any],
+    *,
+    session: dict[str, str],
+    name: str,
+    descriptor_digest: str,
+    key_thumbprint: str,
+) -> dict[str, Any]:
+    if set(response) != _CLAIM_CHALLENGE_FIELDS:
+        raise ProtocolError("invalid agent claim challenge shape")
+    expected = {
+        "schema_version": "palonexus.developer-agent-claim-challenge/v1",
+        "agent_id": name,
+        "tenant_id": _require_string(session.get("tenant_id"), "tenant_id"),
+        "accountable_owner": _require_string(
+            session.get("owner_subject"), "owner_subject"
+        ),
+        "descriptor_digest": descriptor_digest,
+        "key_thumbprint": key_thumbprint,
+        "status": "pending",
+    }
+    if any(response.get(field) != value for field, value in expected.items()):
+        raise ProtocolError("agent claim challenge is not bound to the request")
+    challenge_id = _require_string(response.get("challenge_id"), "challenge ID")
+    if re.fullmatch(r"claim-[0-9a-f]{32}", challenge_id) is None:
+        raise ProtocolError("invalid agent claim challenge ID")
+    nonce = _require_string(response.get("nonce"), "claim nonce")
+    if re.fullmatch(r"[A-Za-z0-9_-]{43}", nonce) is None:
+        raise ProtocolError("invalid agent claim nonce")
+    _require_positive_int(response.get("generation"), "generation")
+    _require_timestamp(response.get("expires_at"), "claim expiry")
+    return response
+
+
+def _validate_claim_receipt(
+    response: dict[str, Any],
+    *,
+    session: dict[str, str],
+    name: str,
+    descriptor_digest: str,
+    key_thumbprint: str,
+    challenge_id: str,
+) -> dict[str, Any]:
+    if set(response) != _CLAIM_RECEIPT_FIELDS:
+        raise ProtocolError("invalid agent claim receipt shape")
+    expected = {
+        "schema_version": "palonexus.developer-agent-claim/v1",
+        "claim_id": challenge_id,
+        "agent_id": name,
+        "tenant_id": _require_string(session.get("tenant_id"), "tenant_id"),
+        "accountable_owner": _require_string(
+            session.get("owner_subject"), "owner_subject"
+        ),
+        "descriptor_digest": descriptor_digest,
+        "key_thumbprint": key_thumbprint,
+        "status": "attached",
+    }
+    if any(response.get(field) != value for field, value in expected.items()):
+        raise ProtocolError("agent claim receipt is not bound to the request")
+    _require_positive_int(response.get("generation"), "generation")
+    _require_timestamp(response.get("claimed_at"), "claimed_at")
+    return response
 
 
 def _validate_revocation_response(
@@ -1136,6 +1250,165 @@ class DeveloperClient:
             descriptor_digest=digest,
             key_thumbprint=thumbprint,
             authority_profile=authority_profile,
+        )
+
+    def attach_agent(
+        self,
+        session: dict[str, str],
+        agent: dict[str, str],
+        descriptor: dict[str, Any],
+        *,
+        cli_version: str | None = None,
+    ) -> dict[str, Any]:
+        """Bind a locally generated proof key to an owner-matched web registration."""
+        private = _decode_private_key(agent.get("private_key"))
+        jwk, thumbprint, name, digest = _claim_binding(agent, descriptor)
+        token = _require_string(session.get("session_token"), "session token")
+        metadata = (
+            {
+                "Palonexus-CLI-Contract": CLI_CONTRACT,
+                "Palonexus-CLI-Version": _require_string(
+                    cli_version, "installed CLI version"
+                ),
+            }
+            if cli_version is not None
+            else {}
+        )
+        request_value = {
+            "schema_version": "palonexus.developer-agent-claim-request/v1",
+            "descriptor_digest": digest,
+            "public_key_jwk": jwk,
+        }
+        request_body = canonical_json(request_value)
+        request_idempotency = hashlib.sha256(request_body).hexdigest()
+        request_digest = hashlib.sha256(
+            canonical_json(
+                {
+                    "body": request_value,
+                    "idempotency_key": request_idempotency,
+                }
+            )
+        ).hexdigest()
+        expected_challenge_id = (
+            "claim-"
+            + hashlib.sha256(
+                canonical_json(
+                    {
+                        "tenant_id": _require_string(
+                            session.get("tenant_id"), "tenant_id"
+                        ),
+                        "agent_id": name,
+                        "accountable_owner": _require_string(
+                            session.get("owner_subject"), "owner_subject"
+                        ),
+                        "request_digest": request_digest,
+                    }
+                )
+            ).hexdigest()[:32]
+        )
+        base_path = "/v1/developer/agents/" + quote(name, safe="") + "/claim-challenges"
+        status_path = base_path + "/" + quote(expected_challenge_id, safe="")
+        try:
+            challenge_response = self._request(
+                "POST",
+                base_path,
+                body=request_body,
+                headers={
+                    "Authorization": "Bearer " + token,
+                    "Idempotency-Key": request_idempotency,
+                    **metadata,
+                },
+                expected=201,
+                allowed_fields=_CLAIM_CHALLENGE_FIELDS,
+            )
+        except DeveloperClientError as original:
+            try:
+                recovered = self._request(
+                    "GET",
+                    status_path,
+                    headers={"Authorization": "Bearer " + token, **metadata},
+                    allowed_fields=_CLAIM_CHALLENGE_FIELDS | _CLAIM_RECEIPT_FIELDS,
+                )
+            except DeveloperClientError:
+                raise original from None
+            if set(recovered) == _CLAIM_RECEIPT_FIELDS:
+                return _validate_claim_receipt(
+                    recovered,
+                    session=session,
+                    name=name,
+                    descriptor_digest=digest,
+                    key_thumbprint=thumbprint,
+                    challenge_id=expected_challenge_id,
+                )
+            challenge_response = recovered
+        challenge = _validate_claim_challenge(
+            challenge_response,
+            session=session,
+            name=name,
+            descriptor_digest=digest,
+            key_thumbprint=thumbprint,
+        )
+        challenge_id = str(challenge["challenge_id"])
+        if challenge_id != expected_challenge_id:
+            raise ProtocolError("agent claim challenge has an unexpected ID")
+        message = canonical_json(
+            {
+                "accountable_owner": challenge["accountable_owner"],
+                "agent_id": challenge["agent_id"],
+                "challenge_id": challenge_id,
+                "descriptor_digest": challenge["descriptor_digest"],
+                "expires_at": challenge["expires_at"],
+                "generation": challenge["generation"],
+                "key_thumbprint": challenge["key_thumbprint"],
+                "nonce": challenge["nonce"],
+                "purpose": "palonexus.developer-agent-claim.v1",
+                "tenant_id": challenge["tenant_id"],
+            }
+        )
+        completion_body = canonical_json(
+            {
+                "schema_version": "palonexus.developer-agent-claim-completion/v1",
+                "challenge_id": challenge_id,
+                "nonce": challenge["nonce"],
+                "proof": {
+                    "alg": "EdDSA",
+                    "key_thumbprint": thumbprint,
+                    "signature": _b64url(private.sign(message)),
+                },
+            }
+        )
+        completion_path = base_path + "/" + quote(challenge_id, safe="") + "/complete"
+        try:
+            response = self._request(
+                "POST",
+                completion_path,
+                body=completion_body,
+                headers={
+                    "Authorization": "Bearer " + token,
+                    "Idempotency-Key": hashlib.sha256(completion_body).hexdigest(),
+                    **metadata,
+                },
+                allowed_fields=_CLAIM_RECEIPT_FIELDS,
+            )
+        except DeveloperClientError as original:
+            try:
+                response = self._request(
+                    "GET",
+                    status_path,
+                    headers={"Authorization": "Bearer " + token, **metadata},
+                    allowed_fields=_CLAIM_CHALLENGE_FIELDS | _CLAIM_RECEIPT_FIELDS,
+                )
+                if set(response) != _CLAIM_RECEIPT_FIELDS:
+                    raise original
+            except DeveloperClientError:
+                raise original from None
+        return _validate_claim_receipt(
+            response,
+            session=session,
+            name=name,
+            descriptor_digest=digest,
+            key_thumbprint=thumbprint,
+            challenge_id=challenge_id,
         )
 
     def reconcile_agent_registration(

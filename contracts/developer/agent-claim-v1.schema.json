@@ -1,0 +1,96 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palonexus.cloud/developer/agent-claim-v1.schema.json",
+  "title": "PaloNexus owner-bound agent claim contracts v1",
+  "$comment": "The private Ed25519 key is generated and retained locally. Only the public JWK and a detached proof over the server challenge cross this boundary. Runtime validation also enforces RFC 8785 canonical JSON, exact owner/tenant/agent binding, expiry, and one-time consumption.",
+  "oneOf": [
+    {"$ref": "#/$defs/ClaimRequest"},
+    {"$ref": "#/$defs/ClaimChallenge"},
+    {"$ref": "#/$defs/ClaimCompletion"},
+    {"$ref": "#/$defs/ClaimReceipt"}
+  ],
+  "$defs": {
+    "Digest": {"type": "string", "pattern": "^[0-9a-f]{64}$"},
+    "Timestamp": {"type": "string", "format": "date-time", "pattern": "^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}(?:\\.[0-9]+)?Z$"},
+    "ClaimId": {"type": "string", "pattern": "^claim-[0-9a-f]{32}$", "$comment": "The suffix is the first 32 lowercase hex characters of SHA-256 over RFC 8785 canonical JSON containing tenant_id, agent_id, accountable_owner, and request_digest. request_digest is SHA-256 over canonical JSON containing the exact claim request body and Idempotency-Key."},
+    "PublicJwk": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["kty", "crv", "x"],
+      "properties": {
+        "kty": {"const": "OKP"},
+        "crv": {"const": "Ed25519"},
+        "x": {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"},
+        "kid": {"type": "string", "minLength": 1, "maxLength": 128},
+        "use": {"const": "sig"},
+        "alg": {"const": "EdDSA"}
+      }
+    },
+    "Proof": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["alg", "key_thumbprint", "signature"],
+      "properties": {
+        "alg": {"const": "EdDSA"},
+        "key_thumbprint": {"$ref": "#/$defs/Digest"},
+        "signature": {"type": "string", "pattern": "^[A-Za-z0-9_-]{86}$"}
+      }
+    },
+    "ClaimRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "descriptor_digest", "public_key_jwk"],
+      "properties": {
+        "schema_version": {"const": "palonexus.developer-agent-claim-request/v1"},
+        "descriptor_digest": {"$ref": "#/$defs/Digest"},
+        "public_key_jwk": {"$ref": "#/$defs/PublicJwk"}
+      }
+    },
+    "ClaimChallenge": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "challenge_id", "agent_id", "tenant_id", "accountable_owner", "generation", "descriptor_digest", "key_thumbprint", "nonce", "expires_at", "status"],
+      "properties": {
+        "schema_version": {"const": "palonexus.developer-agent-claim-challenge/v1"},
+        "challenge_id": {"$ref": "#/$defs/ClaimId"},
+        "agent_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "tenant_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "accountable_owner": {"type": "string", "minLength": 1, "maxLength": 512},
+        "generation": {"type": "integer", "minimum": 1},
+        "descriptor_digest": {"$ref": "#/$defs/Digest"},
+        "key_thumbprint": {"$ref": "#/$defs/Digest"},
+        "nonce": {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"},
+        "expires_at": {"$ref": "#/$defs/Timestamp"},
+        "status": {"const": "pending"}
+      }
+    },
+    "ClaimCompletion": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "challenge_id", "nonce", "proof"],
+      "properties": {
+        "schema_version": {"const": "palonexus.developer-agent-claim-completion/v1"},
+        "challenge_id": {"$ref": "#/$defs/ClaimId"},
+        "nonce": {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"},
+        "proof": {"$ref": "#/$defs/Proof"}
+      }
+    },
+    "ClaimReceipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schema_version", "claim_id", "agent_id", "tenant_id", "accountable_owner", "descriptor_digest", "key_thumbprint", "generation", "status", "claimed_at"],
+      "properties": {
+        "schema_version": {"const": "palonexus.developer-agent-claim/v1"},
+        "claim_id": {"$ref": "#/$defs/ClaimId"},
+        "agent_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "tenant_id": {"type": "string", "minLength": 1, "maxLength": 256},
+        "accountable_owner": {"type": "string", "minLength": 1, "maxLength": 512},
+        "descriptor_digest": {"$ref": "#/$defs/Digest"},
+        "key_thumbprint": {"$ref": "#/$defs/Digest"},
+        "generation": {"type": "integer", "minimum": 1},
+        "status": {"const": "attached"},
+        "claimed_at": {"$ref": "#/$defs/Timestamp"}
+      }
+    }
+  }
+}
