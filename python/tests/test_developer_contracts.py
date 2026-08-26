@@ -24,6 +24,9 @@ SCHEMA = Path(__file__).parents[2] / "contracts/developer/v1.schema.json"
 CLI_COMPATIBILITY_SCHEMA = (
     Path(__file__).parents[2] / "contracts/developer/cli-compatibility-v1.schema.json"
 )
+CLAIM_SCHEMA = (
+    Path(__file__).parents[2] / "contracts/developer/agent-claim-v1.schema.json"
+)
 
 
 def _fixture() -> dict[str, object]:
@@ -50,6 +53,17 @@ def test_cli_compatibility_schema_is_closed_and_in_the_v1_umbrella() -> None:
     assert standalone.is_valid(value)
     assert umbrella.is_valid(value)
     assert not standalone.is_valid({**value, "unknown": True})
+
+
+def test_agent_claim_contract_is_closed_and_contains_no_private_key() -> None:
+    schema = Draft202012Validator(json.loads(CLAIM_SCHEMA.read_text(encoding="utf-8")))
+    request = {
+        "schema_version": "palonexus.developer-agent-claim-request/v1",
+        "descriptor_digest": "a" * 64,
+        "public_key_jwk": {"kty": "OKP", "crv": "Ed25519", "x": "x" * 43},
+    }
+    assert schema.is_valid(request)
+    assert not schema.is_valid({**request, "private_key": "secret"})
 
 
 def test_canonical_platform_vector_validates_without_platform_imports() -> None:

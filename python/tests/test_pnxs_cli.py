@@ -32,6 +32,7 @@ from palonexus.developer.client import (
     DeveloperClient,
     DeveloperClientError,
     ProtocolError,
+    RequestRejected,
     _validate_device_session,
     build_device_proof,
     canonical_json,
@@ -77,6 +78,36 @@ def _fallback_mutation_worker(state_dir: str, operation: str, name: str) -> None
         store.delete(name)
 
 
+def _claim_id(public_jwk: dict[str, str]) -> str:
+    request_value = {
+        "schema_version": "palonexus.developer-agent-claim-request/v1",
+        "descriptor_digest": "a" * 64,
+        "public_key_jwk": public_jwk,
+    }
+    request_body = canonical_json(request_value)
+    request_digest = hashlib.sha256(
+        canonical_json(
+            {
+                "body": request_value,
+                "idempotency_key": hashlib.sha256(request_body).hexdigest(),
+            }
+        )
+    ).hexdigest()
+    return (
+        "claim-"
+        + hashlib.sha256(
+            canonical_json(
+                {
+                    "tenant_id": "tenant-a",
+                    "agent_id": "r3-reviewer",
+                    "accountable_owner": "okta:tenant-a:robin-singh",
+                    "request_digest": request_digest,
+                }
+            )
+        ).hexdigest()[:32]
+    )
+
+
 def test_pnxs_is_the_only_console_script_and_parser_surface_is_exact() -> None:
     pyproject = Path(__file__).parents[1] / "pyproject.toml"
     text = pyproject.read_text(encoding="utf-8")
@@ -94,6 +125,8 @@ def test_pnxs_is_the_only_console_script_and_parser_surface_is_exact() -> None:
             "example",
         ],
         ["agents", "register"],
+        ["agent", "attach", "example"],
+        ["register", "example"],
         [
             "agents",
             "add",
@@ -115,7 +148,6 @@ def test_pnxs_is_the_only_console_script_and_parser_surface_is_exact() -> None:
     )
     for argv in accepted:
         assert parser.parse_args(argv).handler is not None
-
     for argv in (["pnx"], ["agents", "delete"], ["publish"], ["version"]):
         with pytest.raises(SystemExit):
             parser.parse_args(argv)
@@ -131,6 +163,230 @@ def test_pnxs_is_the_only_console_script_and_parser_surface_is_exact() -> None:
                 "palonexus.whl",
             ]
         )
+
+
+def test_agent_attach_uses_owner_bound_challenge_and_never_sends_private_key() -> None:
+    credential = generate_agent_credential()
+    public_jwk = json.loads(credential["public_key_jwk"])
+    thumbprint = hashlib.sha256(canonical_json(public_jwk)).hexdigest()
+    challenge = {
+        "schema_version": "palonexus.developer-agent-claim-challenge/v1",
+        "challenge_id": _claim_id(public_jwk),
+        "agent_id": "r3-reviewer",
+        "tenant_id": "tenant-a",
+        "accountable_owner": "okta:tenant-a:robin-singh",
+        "generation": 1,
+        "descriptor_digest": "a" * 64,
+        "key_thumbprint": thumbprint,
+        "nonce": "n" * 43,
+        "expires_at": "2026-08-25T12:05:00Z",
+        "status": "pending",
+    }
+    receipt = {
+        "schema_version": "palonexus.developer-agent-claim/v1",
+        "claim_id": challenge["challenge_id"],
+        "agent_id": "r3-reviewer",
+        "tenant_id": "tenant-a",
+        "accountable_owner": "okta:tenant-a:robin-singh",
+        "descriptor_digest": "a" * 64,
+        "key_thumbprint": thumbprint,
+        "generation": 1,
+        "status": "attached",
+        "claimed_at": "2026-08-25T12:00:02Z",
+    }
+    seen: list[httpx.Request] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request)
+        if request.url.path.endswith("/claim-challenges"):
+            body = json.loads(request.content)
+            assert body == {
+                "schema_version": "palonexus.developer-agent-claim-request/v1",
+                "descriptor_digest": "a" * 64,
+                "public_key_jwk": public_jwk,
+            }
+            return httpx.Response(201, json=challenge)
+        body = json.loads(request.content)
+        assert body["challenge_id"] == challenge["challenge_id"]
+        assert body["nonce"] == challenge["nonce"]
+        message = canonical_json(
+            {
+                "accountable_owner": challenge["accountable_owner"],
+                "agent_id": challenge["agent_id"],
+                "challenge_id": challenge["challenge_id"],
+                "descriptor_digest": challenge["descriptor_digest"],
+                "expires_at": challenge["expires_at"],
+                "generation": challenge["generation"],
+                "key_thumbprint": challenge["key_thumbprint"],
+                "nonce": challenge["nonce"],
+                "purpose": "palonexus.developer-agent-claim.v1",
+                "tenant_id": challenge["tenant_id"],
+            }
+        )
+        signature = base64.urlsafe_b64decode(
+            body["proof"]["signature"] + "=" * (-len(body["proof"]["signature"]) % 4)
+        )
+        Ed25519PrivateKey.from_private_bytes(
+            base64.urlsafe_b64decode(
+                credential["private_key"] + "=" * (-len(credential["private_key"]) % 4)
+            )
+        ).public_key().verify(signature, message)
+        return httpx.Response(200, json=receipt)
+
+    client = DeveloperClient(
+        "https://api.palonexus.cloud", transport=httpx.MockTransport(handler)
+    )
+    result = client.attach_agent(
+        {
+            "session_token": "pnx_dev_session",
+            "tenant_id": "tenant-a",
+            "membership_id": "member-robin",
+            "owner_subject": "okta:tenant-a:robin-singh",
+        },
+        credential,
+        {"name": "r3-reviewer", "descriptor_digest": "a" * 64},
+        cli_version="0.2.3",
+    )
+
+    assert result == receipt
+    assert len(seen) == 2
+    assert all("private" not in request.content.decode().lower() for request in seen)
+    assert all(
+        request.headers["palonexus-cli-contract"] == "palonexus.pnxs/v1"
+        for request in seen
+    )
+
+
+def test_agent_attach_recovers_commit_after_process_lost_local_save() -> None:
+    credential = generate_agent_credential()
+    public_jwk = json.loads(credential["public_key_jwk"])
+    thumbprint = hashlib.sha256(canonical_json(public_jwk)).hexdigest()
+    challenge_id = _claim_id(public_jwk)
+    receipt = {
+        "schema_version": "palonexus.developer-agent-claim/v1",
+        "claim_id": challenge_id,
+        "agent_id": "r3-reviewer",
+        "tenant_id": "tenant-a",
+        "accountable_owner": "okta:tenant-a:robin-singh",
+        "descriptor_digest": "a" * 64,
+        "key_thumbprint": thumbprint,
+        "generation": 1,
+        "status": "attached",
+        "claimed_at": "2026-08-25T12:00:02Z",
+    }
+    seen: list[str] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.method + " " + request.url.path)
+        if request.method == "POST":
+            return httpx.Response(
+                409,
+                json={
+                    "error": {
+                        "code": "developer_agent_claim_conflict",
+                        "message": "already attached",
+                    }
+                },
+            )
+        assert request.url.path.endswith("/" + challenge_id)
+        return httpx.Response(200, json=receipt)
+
+    client = DeveloperClient(
+        "https://api.palonexus.cloud", transport=httpx.MockTransport(handler)
+    )
+    result = client.attach_agent(
+        {
+            "session_token": "pnx_dev_session",
+            "tenant_id": "tenant-a",
+            "membership_id": "member-robin",
+            "owner_subject": "okta:tenant-a:robin-singh",
+        },
+        credential,
+        {"name": "r3-reviewer", "descriptor_digest": "a" * 64},
+        cli_version="0.2.3",
+    )
+
+    assert result == receipt
+    assert [item.split()[0] for item in seen] == ["POST", "GET"]
+
+
+def test_agent_attach_command_persists_only_the_returned_binding(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    credential = generate_agent_credential()
+    saved: dict[str, dict[str, str]] = {}
+    receipt = {
+        "schema_version": "palonexus.developer-agent-claim/v1",
+        "claim_id": "claim-" + "1" * 32,
+        "agent_id": "r3-reviewer",
+        "tenant_id": "tenant-a",
+        "accountable_owner": "okta:tenant-a:robin-singh",
+        "descriptor_digest": "a" * 64,
+        "key_thumbprint": "b" * 64,
+        "generation": 1,
+        "status": "attached",
+        "claimed_at": "2026-08-25T12:00:02Z",
+    }
+
+    class Store:
+        def create_if_absent(self, name: str, value: dict[str, str]) -> bool:
+            assert name == "agent:tenant-a:r3-reviewer"
+            assert "private_key" in value
+            return True
+
+        def load(self, name: str) -> dict[str, str] | None:
+            assert name == "agent:tenant-a:r3-reviewer"
+            return dict(credential)
+
+        def save(self, name: str, value: dict[str, str]) -> None:
+            saved[name] = dict(value)
+
+    class Client:
+        def require_cli_compatibility(self, *args: object) -> dict[str, str]:
+            return _compatibility_response()
+
+        def attach_agent(self, session, agent, descriptor, *, cli_version):
+            assert session["owner_subject"] == receipt["accountable_owner"]
+            assert descriptor["name"] == "r3-reviewer"
+            assert agent == credential
+            assert cli_version == "0.2.3"
+            return receipt
+
+    monkeypatch.setattr(
+        "palonexus.cli.commands._claim_project_client",
+        lambda _: (
+            Client(),
+            Store(),
+            {
+                "tenant_id": "tenant-a",
+                "owner_subject": "okta:tenant-a:robin-singh",
+            },
+            {"name": "r3-reviewer", "descriptor_digest": "a" * 64},
+        ),
+    )
+    monkeypatch.setattr("palonexus.cli.commands.installed_sdk_version", lambda: "0.2.3")
+    monkeypatch.setattr(
+        "palonexus.cli.commands._require_standalone_registration_cli", lambda: None
+    )
+
+    assert main(["agent", "attach", "r3-reviewer"]) == 0
+    stored = saved["agent:tenant-a:r3-reviewer"]
+    assert stored["agent_id"] == "r3-reviewer"
+    assert stored["agent_generation"] == "1"
+    assert stored["registered_descriptor_digest"] == "a" * 64
+    assert stored["claim_id"] == receipt["claim_id"]
+    assert credential["private_key"] not in capsys.readouterr().out
+
+
+def test_top_level_register_requires_exact_local_agent_name(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    monkeypatch.setattr(
+        "palonexus.cli.commands._project_descriptor",
+        lambda: {"name": "r3-reviewer", "descriptor_digest": "a" * 64},
+    )
+    assert main(["register", "another-agent"]) == 1
+    assert "does not match" in capsys.readouterr().err
 
 
 def test_cli_subprocess_detach_then_restart_wait_uses_exact_grammar(
@@ -2203,6 +2459,49 @@ def test_agents_register_preserves_the_original_error_when_reconciliation_fails(
     assert captured.err.endswith(
         "agent registration failed: registration response is malformed\n"
     )
+
+
+def test_register_conflict_directs_web_registration_to_explicit_attach(
+    monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    session = {"tenant_id": "tenant-a"}
+    descriptor: dict[str, object] = {
+        "name": "r3-reviewer",
+        "descriptor_digest": "a" * 64,
+    }
+
+    class Client:
+        def require_cli_compatibility(self, *args: object) -> dict[str, str]:
+            return _compatibility_response()
+
+        def register_agent(self, *args: object, **kwargs: object) -> dict[str, object]:
+            raise RequestRejected(409)
+
+        def reconcile_agent_registration(self, *args: object) -> dict[str, object]:
+            raise RequestRejected(404)
+
+    monkeypatch.setattr(
+        "palonexus.cli.commands._project_client",
+        lambda _: (
+            Client(),
+            object(),
+            session,
+            {},
+            descriptor,
+            "agent:tenant-a:r3-reviewer",
+        ),
+    )
+    monkeypatch.setattr(
+        "palonexus.cli.commands._project_registration_profile",
+        _registration_profile,
+    )
+    monkeypatch.setattr(
+        "palonexus.cli.commands._project_descriptor", lambda: descriptor
+    )
+    monkeypatch.setattr("palonexus.cli.commands.installed_sdk_version", lambda: "0.2.3")
+
+    assert main(["register", "r3-reviewer"]) == 1
+    assert "pnxs agent attach r3-reviewer" in capsys.readouterr().err
 
 
 def test_agents_add_registers_a_second_identity_without_copying_source_repo(

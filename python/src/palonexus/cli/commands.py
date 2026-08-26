@@ -22,6 +22,7 @@ from packaging.version import InvalidVersion, Version
 from palonexus.developer.client import (
     DeveloperClient,
     DeveloperClientError,
+    RequestRejected,
     _origin,
     _registration_authority_profile,
     canonical_json,
@@ -379,6 +380,36 @@ def _project_client(
     return client, store, session, agent, descriptor, credential_name
 
 
+def _claim_project_client(
+    args: Namespace,
+) -> tuple[DeveloperClient, CredentialStore, dict[str, str], dict[str, Any]]:
+    try:
+        store = credential_store(
+            allow_file_fallback=getattr(args, "allow_file_credential_store", False)
+        )
+        session = store.load("session")
+        descriptor = _project_descriptor()
+        if session is None:
+            raise CommandError("pnxs login is required")
+        tenant_id = session.get("tenant_id")
+        owner = session.get("owner_subject")
+        if (
+            not isinstance(tenant_id, str)
+            or not tenant_id
+            or not isinstance(owner, str)
+            or not owner
+        ):
+            raise CommandError("stored developer session is invalid")
+        client = DeveloperClient(
+            os.environ.get("PNXS_API_URL", "https://api.palonexus.cloud")
+        )
+    except CredentialStoreUnavailable as error:
+        raise CommandError(f"credential access failed: {error}") from error
+    except DeveloperClientError as error:
+        raise CommandError(f"tenant API configuration failed: {error}") from error
+    return client, store, session, descriptor
+
+
 def _print_json(value: dict[str, Any]) -> None:
     print(json.dumps(value, sort_keys=True, separators=(",", ":")))
 
@@ -622,6 +653,14 @@ def agents_register(args: Namespace) -> int:
         agent["agent_generation"] = str(result["generation"])
         agent["registered_descriptor_digest"] = str(result["descriptor_digest"])
         store.save(credential_name, agent)
+    except RequestRejected as error:
+        if error.status_code == 409:
+            raise CommandError(
+                "agent registration failed: the agent already exists or conflicts. "
+                "For a web-created agent, use "
+                f"`pnxs agent attach {descriptor['name']}`."
+            ) from error
+        raise CommandError(f"agent registration failed: {error}") from error
     except (
         DeveloperClientError,
         CredentialStoreUnavailable,
@@ -636,6 +675,52 @@ def agents_register(args: Namespace) -> int:
         )
     _print_json(result)
     return 0
+
+
+def agent_attach(args: Namespace) -> int:
+    _require_standalone_registration_cli()
+    client, store, session, descriptor = _claim_project_client(args)
+    if args.name != descriptor["name"]:
+        raise CommandError(
+            f"agent name {args.name!r} does not match the local descriptor name "
+            f"{descriptor['name']!r}"
+        )
+    tenant_id = str(session["tenant_id"])
+    credential_name = f"agent:{tenant_id}:{args.name}"
+    try:
+        cli_version = installed_sdk_version()
+        client.require_cli_compatibility(session, cli_version)
+        store.create_if_absent(credential_name, generate_agent_credential())
+        agent = store.load(credential_name)
+        if agent is None:
+            raise CredentialStoreUnavailable("agent credential was not persisted")
+        result = client.attach_agent(
+            session, agent, descriptor, cli_version=cli_version
+        )
+        agent["agent_id"] = str(result["agent_id"])
+        agent["agent_generation"] = str(result["generation"])
+        agent["registered_descriptor_digest"] = str(result["descriptor_digest"])
+        agent["claim_id"] = str(result["claim_id"])
+        store.save(credential_name, agent)
+    except (
+        DeveloperClientError,
+        CredentialStoreUnavailable,
+        KeyError,
+        ScaffoldError,
+    ) as error:
+        raise CommandError(f"agent attach failed: {error}") from error
+    _print_json(result)
+    return 0
+
+
+def register_agent(args: Namespace) -> int:
+    descriptor = _project_descriptor()
+    if args.name != descriptor["name"]:
+        raise CommandError(
+            f"agent name {args.name!r} does not match the local descriptor name "
+            f"{descriptor['name']!r}"
+        )
+    return agents_register(args)
 
 
 def _new_ceiling_request(
