@@ -21,6 +21,13 @@ release.
   compatibility contract before creating local or server state and send the
   accepted CLI contract and version with the registration request.
 - Added standalone `pnxs` installation and upgrade instructions for `uv tool`.
+- Governed MCP actions can now pause for human approval, detach, resume the
+  same authority request, and return a verified target receipt.
+- Agents can request a descriptor-bound subagent identity before spawn, resume
+  the same request after a decision, and fail closed without creating a child
+  identity when the request is denied.
+- Added a runnable R3 agent walkthrough for the approved MCP, capability-denied,
+  and denied-subagent scenarios, including Deep Agents adapter wiring.
 
 ### Changed
 

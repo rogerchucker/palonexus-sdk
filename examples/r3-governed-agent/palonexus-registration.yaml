@@ -1,0 +1,11 @@
+schema_version: palonexus.agent-registration-profile/v1
+descriptor_version: palonexus.agent-descriptor/v1
+runtime_profile:
+  id: release-reviewer-runtime
+  version: 1
+  digest: e7020e9520cf37266c946d4834f639773a762dc7d907f27a86b4533b41e96de9
+composition_digest: 9f776f6b040de2129050b84a7757a0ce4d5c6e5009e5dbbaeb604488df273a62
+harness_adapter_contracts:
+  - palonexus.harness-adapter/v1
+not_before: "2026-08-01T00:00:00Z"
+expires_at: "2027-08-01T00:00:00Z"

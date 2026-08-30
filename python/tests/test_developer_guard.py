@@ -1,11 +1,17 @@
 from __future__ import annotations
 
+import errno
 import json
 import socket
 import threading
 
 import pytest
-from palonexus.developer.context import ActionDenied, ActionExpired, AgentContext
+from palonexus.developer.context import (
+    ActionDenied,
+    ActionExpired,
+    AgentContext,
+    CapabilityDenied,
+)
 from palonexus.developer.guard import MAX_ENVELOPE_BYTES, GuardProtocol
 
 
@@ -68,6 +74,57 @@ def test_context_maps_terminal_outcomes(status, error) -> None:
     thread.join(timeout=2)
 
 
+def test_context_distinguishes_terminal_capability_denial() -> None:
+    parent, child = socket.socketpair()
+    guard = GuardProtocol(
+        run_id="run",
+        descriptor_digest="a" * 64,
+        input_digest="b" * 64,
+        runtime_lease_id="lease",
+        invoke=lambda _: {
+            "status": "capability_denied",
+            "reason": "outside run grant",
+        },
+    )
+    thread = threading.Thread(target=guard.serve_once, args=(parent,))
+    thread.start()
+    with pytest.raises(CapabilityDenied, match="outside run grant"):
+        AgentContext.from_fd(child.detach()).actions.invoke("a", "r", {})
+    thread.join(timeout=2)
+
+
+def test_context_mcp_facade_normalizes_one_registered_tool_call() -> None:
+    parent, child = socket.socketpair()
+    seen: list[dict] = []
+    guard = GuardProtocol(
+        run_id="run",
+        descriptor_digest="a" * 64,
+        input_digest="b" * 64,
+        runtime_lease_id="lease",
+        invoke=lambda envelope: (
+            seen.append(envelope)
+            or {
+                "status": "approved",
+                "receipt": {"receipt_id": "receipt-mcp"},
+                "result": {"content": [{"type": "text", "text": "safe"}]},
+            }
+        ),
+    )
+    thread = threading.Thread(target=guard.serve_once, args=(parent,))
+    thread.start()
+    outcome = AgentContext.from_fd(child.detach()).mcp.call(
+        server="change-control-mcp",
+        tool="assess_release",
+        schema_digest="a" * 64,
+        resource="release/demo",
+        arguments={"release_id": "2026.08.30"},
+    )
+    thread.join(timeout=2)
+    assert outcome.receipt == {"receipt_id": "receipt-mcp"}
+    assert seen[0]["action"] == ("mcp:change-control-mcp/assess_release/" + "a" * 64)
+    assert seen[0]["payload"] == {"release_id": "2026.08.30"}
+
+
 def test_guard_rejects_bad_envelopes_without_cloud_call() -> None:
     calls = []
     guard = GuardProtocol(
@@ -82,7 +139,10 @@ def test_guard_rejects_bad_envelopes_without_cloud_call() -> None:
         thread = threading.Thread(target=guard.serve_once, args=(parent,))
         thread.start()
         child.sendall(raw)
-        child.shutdown(socket.SHUT_WR)
+        try:
+            child.shutdown(socket.SHUT_WR)
+        except OSError as error:
+            assert error.errno in {errno.ENOTCONN, errno.EPIPE}
         response = child.recv(4096)
         thread.join(timeout=2)
         assert json.loads(response)["status"] == "contract_error"

@@ -1,0 +1,76 @@
+schemaVersion: palonexus.agent/v1
+name: release-risk-reviewer-r3
+version: 0.2.0
+entrypoint:
+  module: agent
+  symbol: assess_release
+inputSchema:
+  type: object
+  additionalProperties: false
+  required: [scenario, release]
+  properties:
+    scenario:
+      enum: [mcp_approval, capability_denied, subagent_denied]
+    release:
+      type: string
+outputSchema: &result
+  type: object
+actions:
+  - action: mcp:change-control-mcp/assess_release/93c5c52c6762a21b1b35dea92835f8385a29c7c9da3ecb4f1b4c0faa3937132b
+    resource: release:2026.08.30
+    target: change-control-mcp
+    approval: exact-action
+    constraints: {}
+    argumentSchema:
+      type: object
+      additionalProperties: false
+      required: [release]
+      properties:
+        release:
+          type: string
+  - action: release.assessment.publish
+    resource: release:2026.08.30
+    target: release-assessments
+    approval: exact-action
+    requestAuthority: false
+    constraints: {}
+    argumentSchema: *result
+  - action: subagent:spawn
+    resource: subagent-template:evidence-checker/1
+    target: palonexus-control-plane
+    approval: exact-action
+    requestAuthority: false
+    constraints: {}
+    argumentSchema:
+      type: object
+      additionalProperties: false
+      required: [description, subagent_type, parent_action_id]
+      properties:
+        description: {type: string}
+        subagent_type: {const: evidence-checker}
+        parent_action_id: {type: string}
+subagents:
+  - name: evidence-checker
+    version: "1"
+    digest: a8c921382a7456782eabbba736c5973be5b7385c717992cd5acfd3ea7abb6964
+    runtimeProfile: python-sandbox
+    sandboxProfile: network-restricted
+    attestationRequirementDigest: ee8f1bbab0243c9aacf3549a5b4c8787c0f65a0f55e5a4b6baa6a88a84c928da
+    requestedTtlSeconds: 300
+    requestedAuthority:
+      capability_ids: [controlled_publisher]
+      action_classes: [controlled_publish]
+      action_ids: [mcp:change-control-mcp/assess_release/93c5c52c6762a21b1b35dea92835f8385a29c7c9da3ecb4f1b4c0faa3937132b]
+      effects: [external_record.create]
+      resources: [release:2026.08.30]
+      target_registration_ids: [change-control-mcp]
+      constraints_digest: 44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a
+      maximum_token_ttl_seconds: 120
+      requires_human_approval: false
+    budgetReservation:
+      cost_microunits: 0
+      model_tokens: 0
+      steps: 1
+      tool_calls: 1
+      external_effects: 1
+      jobs: 0

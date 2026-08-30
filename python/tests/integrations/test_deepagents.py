@@ -138,6 +138,102 @@ def _request(
     )
 
 
+@tool("task")
+def task_tool(description: str, subagent_type: str) -> str:
+    """Delegate a task to a configured subagent."""
+
+    return f"{subagent_type}:{description}"
+
+
+def _task_request() -> ToolCallRequest:
+    runtime = ToolRuntime(
+        state={},
+        context=_context(),
+        config=RunnableConfig(metadata={"lc_agent_name": "coordinator"}),
+        stream_writer=lambda _: None,
+        tool_call_id="call-task",
+        store=None,
+        tools=[task_tool],
+    )
+    return ToolCallRequest(
+        tool_call={
+            "name": "task",
+            "args": {
+                "description": "retry the denied operation",
+                "subagent_type": "inventory-worker",
+            },
+            "id": "call-task",
+            "type": "tool_call",
+        },
+        tool=task_tool,
+        state={},
+        runtime=runtime,
+    )
+
+
+def test_governed_spawn_denial_never_calls_deep_agents_task_handler() -> None:
+    class DeniedSpawn:
+        def request(self, **_: str) -> dict[str, object]:
+            return {
+                "status": "spawn_denied",
+                "spawn_request_id": "spawn-a",
+                "reason_codes": ["HUMAN_APPROVAL_DENIED"],
+            }
+
+    middleware, engine = _authorization()
+    governed = PaloNexusDeepAgentsMiddleware(
+        authorization=middleware._authorization,
+        accountable_actors=middleware.accountable_actors,
+        spawn_runtime=DeniedSpawn(),
+    )._for_factory(frozenset({"inventory-worker"}), "coordinator")
+    called = False
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal called
+        called = True
+        return ToolMessage(content="must-not-run", tool_call_id=request.tool_call["id"])
+
+    result = governed.wrap_tool_call(_task_request(), handler)
+
+    assert called is False
+    assert isinstance(result, ToolMessage)
+    assert "spawn_denied" in str(result.content)
+    assert not engine.recorded_calls
+
+
+def test_governed_active_spawn_runs_task_only_with_bound_child_identity() -> None:
+    class ActiveSpawn:
+        def request(self, **_: str) -> dict[str, object]:
+            return {
+                "status": "active",
+                "spawn_request_id": "spawn-a",
+                "reason_codes": [],
+                "child_agent_id": "child-a",
+                "child_agent_generation": 1,
+                "child_run_id": "run-child-a",
+                "identity_lease_id": "lease-child-a",
+            }
+
+    middleware, _engine = _authorization()
+    governed = PaloNexusDeepAgentsMiddleware(
+        authorization=middleware._authorization,
+        accountable_actors=middleware.accountable_actors,
+        spawn_runtime=ActiveSpawn(),
+    )._for_factory(frozenset({"inventory-worker"}), "coordinator")
+    called = False
+
+    def handler(request: ToolCallRequest) -> ToolMessage:
+        nonlocal called
+        called = True
+        return ToolMessage(content="child-ran", tool_call_id=request.tool_call["id"])
+
+    result = governed.wrap_tool_call(_task_request(), handler)
+
+    assert called is True
+    assert isinstance(result, ToolMessage)
+    assert result.content == "child-ran"
+
+
 def test_parent_child_share_task_and_correlation_with_causation() -> None:
     middleware, engine = _authorization(
         ScriptedEngine.allow(),

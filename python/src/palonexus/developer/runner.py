@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .context import CapabilityDenied
 from .guard import GuardProtocol
 
 
@@ -21,6 +22,7 @@ class RunnerResult:
     runtime_guarded: str
     runtime_isolated: str
     pending_action_id: str | None = None
+    pending_spawn_request_id: str | None = None
 
 
 class Runner:
@@ -81,6 +83,8 @@ class Runner:
                 "import importlib,json,os,sys",
                 "from palonexus.developer.context import AgentContext",
                 "from palonexus.developer.context import ActionPending",
+                "from palonexus.developer.context import CapabilityDenied",
+                "from palonexus.developer.context import SubagentSpawnPending",
                 "sys.path.insert(0,os.getcwd())",
                 "module=importlib.import_module(sys.argv[1])",
                 "fn=getattr(module,sys.argv[2])",
@@ -91,6 +95,13 @@ class Runner:
                 " print(json.dumps(outcome,sort_keys=True,separators=(',',':')))",
                 "except ActionPending as pending:",
                 " print(json.dumps({'__pnxs_pending_action_id__':pending.action_id},",
+                "  sort_keys=True,separators=(',',':')))",
+                "except CapabilityDenied as denied:",
+                " print(json.dumps({'__pnxs_capability_denied__':str(denied)},",
+                "  sort_keys=True,separators=(',',':')))",
+                "except SubagentSpawnPending as pending:",
+                " print(json.dumps({",
+                "  '__pnxs_pending_spawn_request_id__':pending.spawn_request_id},",
                 "  sort_keys=True,separators=(',',':')))",
             )
         )
@@ -110,6 +121,12 @@ class Runner:
             raise RuntimeError("guarded agent process failed")
         output = json.loads(process.stdout)
         if (
+            isinstance(output, dict)
+            and set(output) == {"__pnxs_capability_denied__"}
+            and isinstance(output["__pnxs_capability_denied__"], str)
+        ):
+            raise CapabilityDenied(output["__pnxs_capability_denied__"])
+        if (
             detach
             and isinstance(output, dict)
             and set(output) == {"__pnxs_pending_action_id__"}
@@ -121,15 +138,29 @@ class Runner:
                 runtime_isolated="not_configured",
                 pending_action_id=output["__pnxs_pending_action_id__"],
             )
+        if (
+            detach
+            and isinstance(output, dict)
+            and set(output) == {"__pnxs_pending_spawn_request_id__"}
+        ):
+            return RunnerResult(
+                output=None,
+                receipt=None,
+                runtime_guarded="observed",
+                runtime_isolated="not_configured",
+                pending_spawn_request_id=output["__pnxs_pending_spawn_request_id__"],
+            )
         # The approved outcome is the only response the sample callable returns;
         # retain its receipt from the guard result without exposing credentials.
-        receipt = {"receipt_id": "unknown"}
+        receipt: dict[str, Any] | None = {"receipt_id": "unknown"}
         if (
             isinstance(output, dict)
             and output.get("receipt")
             and isinstance(output["receipt"], dict)
         ):
             receipt = output.pop("receipt")
+        elif (guard.last_response or {}).get("status") == "spawn_result":
+            receipt = None
         else:
             response = guard.last_response or {}
             if response.get("status") != "approved" or not isinstance(

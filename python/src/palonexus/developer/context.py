@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 from dataclasses import dataclass
 from typing import Any
@@ -13,6 +14,14 @@ class ActionError(RuntimeError):
 
 class ActionDenied(ActionError):
     pass
+
+
+class CapabilityDenied(ActionDenied):
+    """The command is outside effective authority and cannot be human-approved."""
+
+    def __init__(self, reason_code: str, message: str | None = None):
+        self.reason_code = reason_code
+        super().__init__(message or reason_code)
 
 
 class ActionExpired(ActionError):
@@ -27,6 +36,12 @@ class ActionPending(ActionError):
     def __init__(self, action_id: str):
         self.action_id = action_id
         super().__init__("action pending")
+
+
+class SubagentSpawnPending(ActionError):
+    def __init__(self, spawn_request_id: str):
+        self.spawn_request_id = spawn_request_id
+        super().__init__("subagent spawn pending")
 
 
 class ActionContractError(ActionError):
@@ -88,6 +103,7 @@ class Actions:
         )
         errors = {
             "denied": ActionDenied,
+            "capability_denied": CapabilityDenied,
             "expired": ActionExpired,
             "unavailable": ActionUnavailable,
             "contract_error": ActionContractError,
@@ -100,9 +116,99 @@ class Actions:
         raise error_type(str(reason))
 
 
+_MCP_NAME = re.compile(r"[a-z0-9](?:[a-z0-9._-]{0,127})?")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+class MCP:
+    """Thin MCP normalization facade over the governed local action guard."""
+
+    def __init__(self, actions: Actions):
+        self._actions = actions
+
+    def call(
+        self,
+        *,
+        server: str,
+        tool: str,
+        schema_digest: str,
+        resource: str,
+        arguments: dict[str, Any],
+    ) -> ActionOutcome:
+        if (
+            not isinstance(server, str)
+            or _MCP_NAME.fullmatch(server) is None
+            or not isinstance(tool, str)
+            or _MCP_NAME.fullmatch(tool) is None
+            or not isinstance(schema_digest, str)
+            or _SHA256.fullmatch(schema_digest) is None
+        ):
+            raise ActionContractError("invalid MCP tool identity")
+        return self._actions.invoke(
+            f"mcp:{server}/{tool}/{schema_digest}", resource, arguments
+        )
+
+
+class Subagents:
+    """Request one declared subagent through the parent runtime guard."""
+
+    def __init__(self, transport: socket.socket):
+        self._transport = transport
+
+    def request(
+        self, *, description: str, subagent_type: str, parent_action_id: str
+    ) -> dict[str, Any]:
+        if not all(
+            isinstance(value, str) and value and value == value.strip()
+            for value in (description, subagent_type, parent_action_id)
+        ):
+            raise ActionContractError("invalid subagent spawn intent")
+        raw = (
+            json.dumps(
+                {
+                    "action": "subagent:spawn",
+                    "resource": f"subagent-template:{subagent_type}",
+                    "payload": {
+                        "description": description,
+                        "subagent_type": subagent_type,
+                        "parent_action_id": parent_action_id,
+                    },
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                ensure_ascii=False,
+                allow_nan=False,
+            ).encode()
+            + b"\n"
+        )
+        self._transport.sendall(raw)
+        response = _read_line(self._transport, 1 << 20)
+        try:
+            value = json.loads(response, object_pairs_hook=_pairs)
+        except (json.JSONDecodeError, UnicodeDecodeError, ValueError) as error:
+            raise ActionContractError("guard response is invalid") from error
+        if not isinstance(value, dict):
+            raise ActionContractError("guard response is invalid")
+        status = value.get("status")
+        if status == "spawn_pending" and set(value) == {
+            "status",
+            "spawn_request_id",
+        }:
+            raise SubagentSpawnPending(str(value["spawn_request_id"]))
+        if (
+            status == "spawn_result"
+            and set(value) == {"status", "result"}
+            and isinstance(value["result"], dict)
+        ):
+            return value["result"]
+        raise ActionContractError("guard response is invalid")
+
+
 class AgentContext:
     def __init__(self, transport: socket.socket):
         self.actions = Actions(transport)
+        self.mcp = MCP(self.actions)
+        self.subagents = Subagents(transport)
 
     @classmethod
     def from_fd(cls, fd: int) -> AgentContext:

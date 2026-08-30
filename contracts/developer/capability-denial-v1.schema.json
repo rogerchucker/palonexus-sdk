@@ -1,0 +1,32 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palonexus.cloud/developer/capability-denial-v1.schema.json",
+  "title": "PaloNexus capability denial audit projection v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "attemptId", "tenantId", "runId", "agentName", "agentGeneration", "runtimeLeaseId", "canonicalAction", "resource", "constraintsDigest", "payloadDigest", "idempotencyKey", "requestHash", "ceilingRequestId", "ceilingVersion", "effectiveGrantRef", "reasonCode", "createdAt"],
+  "properties": {
+    "schemaVersion": {"const": "palonexus.developer-capability-denial/v1"},
+    "attemptId": {"$ref": "#/$defs/nonEmpty"},
+    "tenantId": {"$ref": "#/$defs/nonEmpty"},
+    "runId": {"$ref": "#/$defs/nonEmpty"},
+    "agentName": {"$ref": "#/$defs/nonEmpty"},
+    "agentGeneration": {"type": "integer", "minimum": 1},
+    "runtimeLeaseId": {"$ref": "#/$defs/nonEmpty"},
+    "canonicalAction": {"$ref": "#/$defs/nonEmpty"},
+    "resource": {"$ref": "#/$defs/nonEmpty"},
+    "constraintsDigest": {"$ref": "#/$defs/sha256"},
+    "payloadDigest": {"$ref": "#/$defs/sha256"},
+    "idempotencyKey": {"$ref": "#/$defs/nonEmpty"},
+    "requestHash": {"$ref": "#/$defs/sha256"},
+    "ceilingRequestId": {"$ref": "#/$defs/nonEmpty"},
+    "ceilingVersion": {"type": "integer", "minimum": 1},
+    "effectiveGrantRef": {"$ref": "#/$defs/nonEmpty"},
+    "reasonCode": {"enum": ["OUTSIDE_CONFIGURED_CEILING", "OUTSIDE_RUN_GRANT"]},
+    "createdAt": {"type": "string", "format": "date-time"}
+  },
+  "$defs": {
+    "nonEmpty": {"type": "string", "minLength": 1, "maxLength": 1024},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

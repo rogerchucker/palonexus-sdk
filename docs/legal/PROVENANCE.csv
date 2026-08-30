@@ -1,4 +1,14 @@
 destination,source_repository,source_commit,source_path,owner,contributors_reviewed,migration_method,result_license,reviewer
+examples/r3-governed-agent/README.md,rogerchucker/palonexus-sdk,WORKTREE,examples/r3-governed-agent/README.md,PaloNexus,yes,new,MIT,rogerchucker
+examples/r3-governed-agent/agent.py,rogerchucker/palonexus-sdk,WORKTREE,examples/r3-governed-agent/agent.py,PaloNexus,yes,new,MIT,rogerchucker
+examples/r3-governed-agent/deep_agent.py,rogerchucker/palonexus-sdk,WORKTREE,examples/r3-governed-agent/deep_agent.py,PaloNexus,yes,new,MIT,rogerchucker
+examples/r3-governed-agent/input-capability-denied.json,rogerchucker/palonexus-sdk,WORKTREE,examples/r3-governed-agent/input-capability-denied.json,PaloNexus,yes,new,MIT,rogerchucker
+examples/r3-governed-agent/input-mcp-approval.json,rogerchucker/palonexus-sdk,WORKTREE,examples/r3-governed-agent/input-mcp-approval.json,PaloNexus,yes,new,MIT,rogerchucker
+examples/r3-governed-agent/input-subagent-denied.json,rogerchucker/palonexus-sdk,WORKTREE,examples/r3-governed-agent/input-subagent-denied.json,PaloNexus,yes,new,MIT,rogerchucker
+examples/r3-governed-agent/palonexus-agent.yaml,rogerchucker/palonexus-sdk,WORKTREE,examples/r3-governed-agent/palonexus-agent.yaml,PaloNexus,yes,new,MIT,rogerchucker
+examples/r3-governed-agent/palonexus-registration.yaml,rogerchucker/palonexus-sdk,WORKTREE,examples/r3-governed-agent/palonexus-registration.yaml,PaloNexus,yes,new,MIT,rogerchucker
+python/src/palonexus/developer/subagents.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/developer/subagents.py,PaloNexus,yes,new,MIT,rogerchucker
+python/tests/test_developer_subagents.py,rogerchucker/palonexus-sdk,WORKTREE,python/tests/test_developer_subagents.py,PaloNexus,yes,new,MIT,rogerchucker
 python/src/palonexus/cli/__init__.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/cli/__init__.py,PaloNexus,yes,new,MIT,rogerchucker
 python/src/palonexus/cli/commands.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/cli/commands.py,PaloNexus,yes,new,MIT,rogerchucker
 python/src/palonexus/cli/main.py,rogerchucker/palonexus-sdk,WORKTREE,python/src/palonexus/cli/main.py,PaloNexus,yes,new,MIT,rogerchucker

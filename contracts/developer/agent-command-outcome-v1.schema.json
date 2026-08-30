@@ -1,0 +1,31 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palonexus.cloud/developer/agent-command-outcome-v1.schema.json",
+  "title": "PaloNexus agent command outcome v1",
+  "oneOf": [
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "disposition", "code", "reasonCode"],
+      "properties": {
+        "schemaVersion": {"const": "palonexus.agent-command-outcome/v1"},
+        "disposition": {"const": "terminal"},
+        "code": {"const": "capability_denied"},
+        "reasonCode": {
+          "enum": ["OUTSIDE_CONFIGURED_CEILING", "OUTSIDE_RUN_GRANT"]
+        }
+      }
+    },
+    {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["schemaVersion", "disposition", "code", "requestId"],
+      "properties": {
+        "schemaVersion": {"const": "palonexus.agent-command-outcome/v1"},
+        "disposition": {"const": "resumable"},
+        "code": {"enum": ["approval_required", "spawn_approval_required"]},
+        "requestId": {"type": "string", "minLength": 1, "maxLength": 256}
+      }
+    }
+  ]
+}

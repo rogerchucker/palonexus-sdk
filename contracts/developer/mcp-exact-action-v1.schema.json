@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://schemas.palonexus.cloud/developer/mcp-exact-action-v1.schema.json",
+  "title": "PaloNexus exact MCP action v1",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schemaVersion", "serverId", "toolName", "toolSchemaDigest", "canonicalAction", "resource", "arguments", "argumentsDigest", "effectIdempotencyKey"],
+  "properties": {
+    "schemaVersion": {"const": "palonexus.mcp-exact-action/v1"},
+    "serverId": {"$ref": "#/$defs/mcpName"},
+    "toolName": {"$ref": "#/$defs/mcpName"},
+    "toolSchemaDigest": {"$ref": "#/$defs/sha256"},
+    "canonicalAction": {"type": "string", "pattern": "^mcp:[a-z0-9][a-z0-9._-]{0,127}/[a-z0-9][a-z0-9._-]{0,127}/[0-9a-f]{64}$"},
+    "resource": {"type": "string", "minLength": 1, "maxLength": 512},
+    "arguments": {"type": "object"},
+    "argumentsDigest": {"$ref": "#/$defs/sha256"},
+    "effectIdempotencyKey": {"type": "string", "minLength": 1, "maxLength": 256}
+  },
+  "$defs": {
+    "mcpName": {"type": "string", "pattern": "^[a-z0-9][a-z0-9._-]{0,127}$"},
+    "sha256": {"type": "string", "pattern": "^[0-9a-f]{64}$"}
+  }
+}

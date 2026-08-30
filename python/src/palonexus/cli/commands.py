@@ -29,6 +29,7 @@ from palonexus.developer.client import (
     decode_strict_json,
     generate_agent_credential,
 )
+from palonexus.developer.context import CapabilityDenied
 from palonexus.developer.contracts import RequestedCapabilityRule
 from palonexus.developer.credentials import (
     CredentialStore,
@@ -40,6 +41,7 @@ from palonexus.developer.scaffold import (
     initialize_plain_python,
     preflight_plain_python,
 )
+from palonexus.developer.subagents import GovernedSubagentRuntime, SubagentTemplate
 from palonexus.developer.version import version_metadata
 
 
@@ -181,6 +183,7 @@ def installed_sdk_version() -> str:
 
 
 _DESCRIPTOR_MAX_BYTES = 64 * 1024
+_DESCRIPTOR_MAX_ACTIONS = 64
 _REGISTRATION_PROFILE_MAX_BYTES = 16 * 1024
 _AGENT_NAME = re.compile(r"[a-z](?:[a-z0-9-]{0,61}[a-z0-9])?")
 _CEILING_BODY_FIELDS = {
@@ -237,18 +240,21 @@ def _project_descriptor(
         value = yaml.safe_load(text)
     except (UnicodeDecodeError, yaml.YAMLError) as error:
         raise CommandError("agent descriptor is invalid") from error
-    root = _strict_keys(
-        value,
-        {
-            "schemaVersion",
-            "name",
-            "version",
-            "entrypoint",
-            "inputSchema",
-            "outputSchema",
-            "actions",
-        },
-    )
+    root_keys = {
+        "schemaVersion",
+        "name",
+        "version",
+        "entrypoint",
+        "inputSchema",
+        "outputSchema",
+        "actions",
+    }
+    if not isinstance(value, dict) or set(value) not in (
+        root_keys,
+        root_keys | {"subagents"},
+    ):
+        raise CommandError("agent descriptor is invalid")
+    root = value
     if root["schemaVersion"] != "palonexus.agent/v1":
         raise CommandError("agent descriptor schema is unsupported")
     name = root["name"]
@@ -261,13 +267,14 @@ def _project_descriptor(
         for field in ("module", "symbol")
     ):
         raise CommandError("agent descriptor entrypoint is invalid")
-    actions = root["actions"]
-    if not isinstance(actions, list) or len(actions) != 1:
-        raise CommandError("the MVP descriptor requires exactly one action")
-    action_value = actions[0]
-    if not isinstance(action_value, dict):
-        raise CommandError("agent descriptor action is invalid")
-    expected_action = {
+    action_values = root["actions"]
+    if (
+        not isinstance(action_values, list)
+        or not action_values
+        or len(action_values) > _DESCRIPTOR_MAX_ACTIONS
+    ):
+        raise CommandError("agent descriptor action count is invalid")
+    required_action = {
         "action",
         "resource",
         "target",
@@ -275,47 +282,200 @@ def _project_descriptor(
         "constraints",
         "argumentSchema",
     }
-    action = _strict_keys(action_value, expected_action)
-    if action["approval"] != "exact-action":
-        raise CommandError("the MVP action requires exact-action approval")
-    try:
-        rule = RequestedCapabilityRule.model_validate(
-            {
-                "schema_version": "palonexus.requested-capability/v1",
-                "canonical_action": action["action"],
-                "resource": action["resource"],
-                "constraints": action.get("constraints", {}),
-                "logical_target_id": action["target"],
-            }
-        ).model_dump(mode="json")
-    except ValueError as error:
-        raise CommandError("agent descriptor action is invalid") from error
     input_schema = root["inputSchema"]
     output_schema = root["outputSchema"]
-    action_schema = action["argumentSchema"]
-    for schema in (input_schema, output_schema, action_schema):
+    for schema in (input_schema, output_schema):
         if not isinstance(schema, dict):
             raise CommandError("agent descriptor schema is invalid")
         try:
             canonical_json(schema)
         except DeveloperClientError as error:
             raise CommandError("agent descriptor schema is invalid") from error
-    if canonical_json(output_schema) != canonical_json(action_schema):
+    actions: list[dict[str, Any]] = []
+    rules: list[dict[str, Any]] = []
+    identities: set[tuple[str, str]] = set()
+    for action_value in action_values:
+        if (
+            not isinstance(action_value, dict)
+            or not required_action <= set(action_value)
+            or set(action_value) - (required_action | {"requestAuthority"})
+        ):
+            raise CommandError("agent descriptor action is invalid")
+        action = action_value
+        if action["approval"] != "exact-action" or not isinstance(
+            action.get("requestAuthority", True), bool
+        ):
+            raise CommandError("the MVP action requires exact-action approval")
+        try:
+            rule = RequestedCapabilityRule.model_validate(
+                {
+                    "schema_version": "palonexus.requested-capability/v1",
+                    "canonical_action": action["action"],
+                    "resource": action["resource"],
+                    "constraints": action.get("constraints", {}),
+                    "logical_target_id": action["target"],
+                }
+            ).model_dump(mode="json")
+        except ValueError as error:
+            raise CommandError("agent descriptor action is invalid") from error
+        identity = (rule["canonical_action"], rule["resource"])
+        if identity in identities:
+            raise CommandError("agent descriptor actions must be unique")
+        identities.add(identity)
+        action_schema = action["argumentSchema"]
+        if not isinstance(action_schema, dict):
+            raise CommandError("agent descriptor schema is invalid")
+        try:
+            canonical_json(action_schema)
+        except DeveloperClientError as error:
+            raise CommandError("agent descriptor schema is invalid") from error
+        actions.append(
+            {
+                "action": rule["canonical_action"],
+                "resource": rule["resource"],
+                "target": rule["logical_target_id"],
+                "constraints": rule["constraints"],
+                "argument_schema": action_schema,
+                "request_authority": action.get("requestAuthority", True),
+            }
+        )
+        if action.get("requestAuthority", True):
+            rules.append(rule)
+    if not rules:
+        raise CommandError("agent descriptor requests no authority")
+    if len(actions) == 1 and canonical_json(output_schema) != canonical_json(
+        actions[0]["argument_schema"]
+    ):
         raise CommandError("agent output and action schemas must match")
+    primary = actions[0]
+    subagents = _descriptor_subagents(root.get("subagents", []))
     return {
         "name": name,
         "version": version,
         "descriptor_digest": hashlib.sha256(raw).hexdigest(),
-        "rules": [rule],
+        "rules": rules,
+        "actions": actions,
         "input_schema": input_schema,
         "output_schema": output_schema,
-        "action_schema": action_schema,
+        "action_schema": primary["argument_schema"],
         "module": entrypoint["module"],
         "symbol": entrypoint["symbol"],
-        "action": action["action"],
-        "resource": action["resource"],
-        "constraints": action["constraints"],
+        "action": primary["action"],
+        "resource": primary["resource"],
+        "constraints": primary["constraints"],
+        "subagents": subagents,
     }
+
+
+def _descriptor_subagents(value: object) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or len(value) > 16:
+        raise CommandError("agent descriptor subagents are invalid")
+    normalized: list[dict[str, Any]] = []
+    names: set[str] = set()
+    expected = {
+        "name",
+        "version",
+        "digest",
+        "runtimeProfile",
+        "sandboxProfile",
+        "attestationRequirementDigest",
+        "requestedTtlSeconds",
+        "requestedAuthority",
+        "budgetReservation",
+    }
+    for item in value:
+        if not isinstance(item, dict) or set(item) != expected:
+            raise CommandError("agent descriptor subagents are invalid")
+        try:
+            template = SubagentTemplate(
+                name=item["name"],
+                version=item["version"],
+                digest=item["digest"],
+                runtime_profile=item["runtimeProfile"],
+                sandbox_profile=item["sandboxProfile"],
+                attestation_requirement_digest=item["attestationRequirementDigest"],
+                requested_ttl_seconds=item["requestedTtlSeconds"],
+                requested_authority=item["requestedAuthority"],
+                budget_reservation=item["budgetReservation"],
+            )
+            canonical_json(item["requestedAuthority"])
+            canonical_json(item["budgetReservation"])
+        except (TypeError, ValueError, DeveloperClientError) as error:
+            raise CommandError("agent descriptor subagents are invalid") from error
+        reference = f"{template.name}@{template.version}"
+        if reference in names:
+            raise CommandError("agent descriptor subagents are invalid")
+        names.add(reference)
+        normalized.append(
+            {
+                "name": template.name,
+                "version": template.version,
+                "digest": template.digest,
+                "runtime_profile": template.runtime_profile,
+                "sandbox_profile": template.sandbox_profile,
+                "attestation_requirement_digest": (
+                    template.attestation_requirement_digest
+                ),
+                "requested_ttl_seconds": template.requested_ttl_seconds,
+                "requested_authority": dict(template.requested_authority),
+                "budget_reservation": dict(template.budget_reservation),
+            }
+        )
+    return normalized
+
+
+def _descriptor_action(
+    descriptor: dict[str, Any], action: str, resource: str
+) -> dict[str, Any]:
+    candidates = descriptor.get("actions")
+    if not isinstance(candidates, list):
+        raise CommandError("registered descriptor actions are invalid")
+    matches: list[dict[str, Any]] = []
+    for candidate in candidates:
+        if not isinstance(candidate, dict):
+            raise CommandError("registered descriptor actions are invalid")
+        if candidate.get("action") == action and candidate.get("resource") == resource:
+            matches.append(candidate)
+    if len(matches) != 1:
+        raise CommandError("action is not declared by the registered descriptor")
+    return matches[0]
+
+
+def _subagent_runtime(
+    *,
+    client: DeveloperClient,
+    store: CredentialStore,
+    session: dict[str, Any],
+    agent: dict[str, Any],
+    guard: dict[str, Any],
+    runtime: dict[str, Any],
+    run: dict[str, Any],
+    descriptor: dict[str, Any],
+) -> GovernedSubagentRuntime:
+    templates = {
+        item["name"]: SubagentTemplate(
+            name=item["name"],
+            version=item["version"],
+            digest=item["digest"],
+            runtime_profile=item["runtime_profile"],
+            sandbox_profile=item["sandbox_profile"],
+            attestation_requirement_digest=item["attestation_requirement_digest"],
+            requested_ttl_seconds=item["requested_ttl_seconds"],
+            requested_authority=item["requested_authority"],
+            budget_reservation=item["budget_reservation"],
+        )
+        for item in descriptor.get("subagents", [])
+    }
+    return GovernedSubagentRuntime(
+        client=client,
+        store=store,
+        session=session,
+        agent=agent,
+        guard=guard,
+        runtime=runtime,
+        run=run,
+        templates=templates,
+    )
 
 
 def _project_registration_profile(
@@ -923,26 +1083,123 @@ def run_agent(args: Namespace) -> int:
             idempotency_key=run_key,
         )
         persisted: dict[str, Any] = {}
+        persisted_spawn: dict[str, Any] = {}
+        spawn_runtime = (
+            _subagent_runtime(
+                client=client,
+                store=store,
+                session=session,
+                agent=agent,
+                guard=guard,
+                runtime=runtime,
+                run=run,
+                descriptor=descriptor,
+            )
+            if descriptor.get("subagents")
+            else None
+        )
 
         def invoke(envelope: dict[str, Any]) -> dict[str, Any]:
-            if not persisted:
-                action = client.create_developer_action(
-                    session,
-                    agent,
-                    guard,
-                    runtime,
-                    run,
-                    action=envelope["action"],
-                    resource=envelope["resource"],
-                    constraints=descriptor["constraints"],
-                    payload=envelope["payload"],
-                    idempotency_key=str(uuid.uuid4()),
-                    effect_idempotency_key=str(uuid.uuid4()),
+            if envelope["action"] == "subagent:spawn":
+                payload = envelope.get("payload")
+                if not isinstance(payload, dict) or set(payload) != {
+                    "description",
+                    "subagent_type",
+                    "parent_action_id",
+                }:
+                    return {
+                        "status": "contract_error",
+                        "reason": "invalid spawn intent",
+                    }
+                subagent_type = payload["subagent_type"]
+                template = next(
+                    (
+                        item
+                        for item in descriptor.get("subagents", [])
+                        if item.get("name") == subagent_type
+                    ),
+                    None,
                 )
+                if template is None or spawn_runtime is None:
+                    return {"status": "contract_error", "reason": "undeclared subagent"}
+                expected_resource = f"subagent-template:{subagent_type}"
+                declared_resource = (
+                    f"subagent-template:{subagent_type}/{template['version']}"
+                )
+                if envelope["resource"] != expected_resource:
+                    return {"status": "contract_error", "reason": "changed subagent"}
+                _descriptor_action(descriptor, "subagent:spawn", declared_resource)
+                outcome = spawn_runtime.request(
+                    description=payload["description"],
+                    subagent_type=subagent_type,
+                    parent_action_id=payload["parent_action_id"],
+                )
+                if outcome["status"] == "spawn_approval_required":
+                    request_id = outcome["spawn_request_id"]
+                    persisted_spawn.update(outcome)
+                    store.save(
+                        "subagent:" + request_id,
+                        {
+                            "schemaVersion": "palonexus.local-subagent-continuation/v1",
+                            "run_json": json.dumps(
+                                run, sort_keys=True, separators=(",", ":")
+                            ),
+                            "runtime_json": json.dumps(
+                                runtime, sort_keys=True, separators=(",", ":")
+                            ),
+                            "agent": descriptor["name"],
+                            "descriptor_digest": descriptor["descriptor_digest"],
+                            "project": str(Path.cwd().resolve()),
+                            "spawn_request_id": request_id,
+                            "description": payload["description"],
+                            "subagent_type": subagent_type,
+                            "parent_action_id": payload["parent_action_id"],
+                        },
+                    )
+                    return {"status": "spawn_pending", "spawn_request_id": request_id}
+                return {"status": "spawn_result", "result": outcome}
+            if not persisted:
+                declared_action = _descriptor_action(
+                    descriptor, envelope["action"], envelope["resource"]
+                )
+                try:
+                    action = client.create_developer_action(
+                        session,
+                        agent,
+                        guard,
+                        runtime,
+                        run,
+                        action=envelope["action"],
+                        resource=envelope["resource"],
+                        constraints=declared_action["constraints"],
+                        payload=envelope["payload"],
+                        idempotency_key=str(uuid.uuid4()),
+                        effect_idempotency_key=str(uuid.uuid4()),
+                    )
+                except CapabilityDenied as error:
+                    return {
+                        "status": "capability_denied",
+                        "reason": error.reason_code,
+                    }
                 persisted.update(action)
                 store.save(
                     "action:" + persisted["actionId"],
-                    {"run_id": run["runId"], "agent": descriptor["name"]},
+                    {
+                        "schemaVersion": "palonexus.local-action-continuation/v1",
+                        "run_id": run["runId"],
+                        "agent": descriptor["name"],
+                        "descriptor_digest": descriptor["descriptor_digest"],
+                        "project": str(Path.cwd().resolve()),
+                        "agent_file": str(Path(args.agent_file).resolve()),
+                        "input_json": json.dumps(
+                            input_value, sort_keys=True, separators=(",", ":")
+                        ),
+                        "input_digest": input_digest,
+                        "runtime_lease_id": runtime["runtime_id"],
+                        "envelope_json": json.dumps(
+                            envelope, sort_keys=True, separators=(",", ":")
+                        ),
+                    },
                 )
             if args.detach:
                 return {"status": "pending", "action_id": persisted["actionId"]}
@@ -978,6 +1235,21 @@ def run_agent(args: Namespace) -> int:
             detach=args.detach,
         )
         if args.detach:
+            if result.pending_spawn_request_id is not None:
+                if (
+                    not persisted_spawn
+                    or result.pending_spawn_request_id
+                    != persisted_spawn["spawn_request_id"]
+                ):
+                    raise RuntimeError("detached spawn was not durably persisted")
+                _print_json(
+                    {
+                        "run_id": run["runId"],
+                        "spawn_request_id": result.pending_spawn_request_id,
+                        "status": "pending",
+                    }
+                )
+                return 0
             if not persisted or result.pending_action_id != persisted["actionId"]:
                 raise RuntimeError("detached action was not durably persisted")
             _print_json(
@@ -988,6 +1260,16 @@ def run_agent(args: Namespace) -> int:
                 }
             )
             return 0
+    except CapabilityDenied as error:
+        _print_json(
+            {
+                "schemaVersion": "palonexus.agent-command-outcome/v1",
+                "disposition": "terminal",
+                "code": "capability_denied",
+                "reasonCode": error.reason_code,
+            }
+        )
+        return 4
     except (
         DeveloperClientError,
         CredentialStoreUnavailable,
@@ -1024,6 +1306,168 @@ def actions_wait(args: Namespace) -> int:
             _print_json(current)
             return 0 if state == "delivered" else 4
         time.sleep(2)
+
+
+def actions_resume(args: Namespace) -> int:
+    client, store, session, _agent, descriptor, _credential_name = _project_client(args)
+    reference = store.load("action:" + args.action_id)
+    required = {
+        "schemaVersion",
+        "run_id",
+        "agent",
+        "descriptor_digest",
+        "project",
+        "agent_file",
+        "input_json",
+        "input_digest",
+        "runtime_lease_id",
+        "envelope_json",
+    }
+    if not isinstance(reference, dict) or set(reference) != required:
+        raise CommandError("no resumable local continuation exists for this action")
+    if reference["schemaVersion"] != "palonexus.local-action-continuation/v1":
+        raise CommandError("local action continuation version is unsupported")
+    if (
+        reference["agent"] != descriptor["name"]
+        or reference["descriptor_digest"] != descriptor["descriptor_digest"]
+        or reference["project"] != str(Path.cwd().resolve())
+    ):
+        raise CommandError("local action continuation does not match this project")
+    try:
+        input_value = json.loads(reference["input_json"])
+        expected_envelope = json.loads(reference["envelope_json"])
+    except (TypeError, json.JSONDecodeError):
+        raise CommandError("local action continuation is invalid") from None
+    if not isinstance(input_value, dict) or not isinstance(expected_envelope, dict):
+        raise CommandError("local action continuation is invalid")
+    run_id = reference["run_id"]
+    try:
+        current = client.get_developer_action(session, run_id, args.action_id)
+        state = current.get("delivery", {}).get("state")
+        if state != "delivered":
+            if state in {"denied", "expired", "canceled", "failed_safe"}:
+                _print_json(
+                    {
+                        "run_id": run_id,
+                        "action_id": args.action_id,
+                        "status": state,
+                    }
+                )
+                return 4
+            _print_json(
+                {
+                    "run_id": run_id,
+                    "action_id": args.action_id,
+                    "status": "pending",
+                }
+            )
+            return 3
+
+        def invoke(envelope: dict[str, Any]) -> dict[str, Any]:
+            if canonical_json(envelope) != canonical_json(expected_envelope):
+                return {
+                    "status": "contract_error",
+                    "reason": "action changed on resume",
+                }
+            return {
+                "status": "approved",
+                "receipt": current["receipt"],
+                "result": current.get("result", {}),
+            }
+
+        runner = Runner(
+            guard_invoke=invoke,
+            child_environment={"PATH": os.environ.get("PATH", "")},
+        )
+        result = runner.run(
+            project=Path(reference["project"]),
+            agent_file=Path(reference["agent_file"]),
+            descriptor=descriptor,
+            input_value=input_value,
+            run_id=run_id,
+            descriptor_digest=reference["descriptor_digest"],
+            input_digest=reference["input_digest"],
+            runtime_lease_id=reference["runtime_lease_id"],
+        )
+    except (DeveloperClientError, KeyError, ValueError, RuntimeError) as error:
+        raise CommandError(f"action resume failed: {error}") from error
+    _print_json(
+        {
+            "run_id": run_id,
+            "action_id": args.action_id,
+            "status": "completed",
+            "output": result.output,
+            "receipt": result.receipt,
+        }
+    )
+    return 0
+
+
+def subagents_resume(args: Namespace) -> int:
+    client, store, session, agent, descriptor, _credential_name = _project_client(args)
+    reference = store.load("subagent:" + args.spawn_request_id)
+    required = {
+        "schemaVersion",
+        "run_json",
+        "runtime_json",
+        "agent",
+        "descriptor_digest",
+        "project",
+        "spawn_request_id",
+        "description",
+        "subagent_type",
+        "parent_action_id",
+    }
+    if not isinstance(reference, dict) or set(reference) != required:
+        raise CommandError("no resumable local continuation exists for this subagent")
+    if reference["schemaVersion"] != "palonexus.local-subagent-continuation/v1":
+        raise CommandError("local subagent continuation version is unsupported")
+    if (
+        reference["agent"] != descriptor["name"]
+        or reference["descriptor_digest"] != descriptor["descriptor_digest"]
+        or reference["project"] != str(Path.cwd().resolve())
+        or reference["spawn_request_id"] != args.spawn_request_id
+    ):
+        raise CommandError("local subagent continuation does not match this project")
+    try:
+        run = json.loads(reference["run_json"])
+        runtime = json.loads(reference["runtime_json"])
+        if not isinstance(run, dict) or not isinstance(runtime, dict):
+            raise ValueError("invalid continuation")
+        guard = store.load("guard:" + str(descriptor["name"]))
+        if guard is None:
+            raise ValueError("missing runtime guard")
+        governed = _subagent_runtime(
+            client=client,
+            store=store,
+            session=session,
+            agent=agent,
+            guard=guard,
+            runtime=runtime,
+            run=run,
+            descriptor=descriptor,
+        )
+        outcome = governed.request(
+            description=reference["description"],
+            subagent_type=reference["subagent_type"],
+            parent_action_id=reference["parent_action_id"],
+        )
+    except (
+        DeveloperClientError,
+        CredentialStoreUnavailable,
+        KeyError,
+        TypeError,
+        ValueError,
+    ) as error:
+        raise CommandError(f"subagent resume failed: {error}") from error
+    if outcome.get("spawn_request_id") != args.spawn_request_id:
+        raise CommandError("subagent resume returned a different request")
+    _print_json({"run_id": run["runId"], **outcome})
+    if outcome.get("status") == "spawn_approval_required":
+        return 3
+    if outcome.get("status") == "spawn_denied":
+        return 4
+    return 0
 
 
 def logout(args: Namespace) -> int:
