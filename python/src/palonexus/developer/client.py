@@ -260,16 +260,14 @@ def _validate_subagent_provision_result(
         or authorization.get("tenant_id") != session.get("tenant_id")
         or authorization.get("parent_agent_id") != agent.get("agent_id")
         or authorization.get("parent_runtime_lease_id") != runtime.get("runtime_id")
-        or authorization.get("prospective_key_thumbprint")
-        != prospective_key_thumbprint
+        or authorization.get("prospective_key_thumbprint") != prospective_key_thumbprint
     ):
         raise ProtocolError("subagent provisioning is not bound to the request")
     lease = value.get("identityLease")
     if lease is not None:
         if (
             not isinstance(lease, dict)
-            or lease.get("schema_version")
-            != "palonexus.subagent-identity-lease/v1"
+            or lease.get("schema_version") != "palonexus.subagent-identity-lease/v1"
             or lease.get("tenant_id") != session.get("tenant_id")
             or lease.get("spawn_request_id") != request_id
             or lease.get("parent_agent_id") != agent.get("agent_id")
@@ -2053,9 +2051,7 @@ class DeveloperClient:
         command: dict[str, Any],
         idempotency_key: str,
     ) -> dict[str, Any]:
-        path = (
-            f"/v1/developer/runs/{quote(run['runId'], safe='')}/subagent-spawns"
-        )
+        path = f"/v1/developer/runs/{quote(run['runId'], safe='')}/subagent-spawns"
         body = canonical_json(
             {
                 "schemaVersion": "palonexus.subagent-spawn-command/v1",
@@ -2134,9 +2130,7 @@ class DeveloperClient:
         command: dict[str, Any],
         prospective_key_thumbprint: str,
     ) -> dict[str, Any]:
-        path = (
-            f"/v1/developer/subagent-spawns/{quote(request_id, safe='')}/provision"
-        )
+        path = f"/v1/developer/subagent-spawns/{quote(request_id, safe='')}/provision"
         body = canonical_json(
             {"schemaVersion": "palonexus.subagent-provision/v1", **command}
         )

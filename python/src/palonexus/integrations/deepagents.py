@@ -313,9 +313,7 @@ class PaloNexusDeepAgentsMiddleware(AgentMiddleware[Any, Any]):
             or type(value.get("spawn_request_id")) is not str
             or not value["spawn_request_id"]
             or not isinstance(value.get("reason_codes"), list)
-            or not all(
-                type(item) is str and item for item in value["reason_codes"]
-            )
+            or not all(type(item) is str and item for item in value["reason_codes"])
             or (
                 value.get("status") == "active"
                 and (

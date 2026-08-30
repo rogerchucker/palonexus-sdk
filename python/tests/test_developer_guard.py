@@ -121,9 +121,7 @@ def test_context_mcp_facade_normalizes_one_registered_tool_call() -> None:
     )
     thread.join(timeout=2)
     assert outcome.receipt == {"receipt_id": "receipt-mcp"}
-    assert seen[0]["action"] == (
-        "mcp:change-control-mcp/assess_release/" + "a" * 64
-    )
+    assert seen[0]["action"] == ("mcp:change-control-mcp/assess_release/" + "a" * 64)
     assert seen[0]["payload"] == {"release_id": "2026.08.30"}
 
 

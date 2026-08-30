@@ -226,9 +226,7 @@ class GovernedSubagentRuntime:
         activation_message = provisioned.get("activationProofMessage")
         if not isinstance(lease, dict) or not isinstance(activation_message, str):
             raise ProtocolError("subagent provisioning omitted activation authority")
-        activation_proof = _sign_proof(
-            str(state["private_key"]), activation_message
-        )
+        activation_proof = _sign_proof(str(state["private_key"]), activation_message)
         activated = self._client.provision_developer_subagent(
             self._session,
             self._agent,

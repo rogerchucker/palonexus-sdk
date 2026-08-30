@@ -46,13 +46,17 @@ def _status(state: str) -> dict[str, object]:
         "approvalStatus": (
             "pending"
             if state == "pending_approval"
-            else "approved" if terminal_allowed else "denied"
+            else "approved"
+            if terminal_allowed
+            else "denied"
         ),
         "decisionId": "decision-a",
         "decisionOutcome": (
             "pending"
             if state == "pending_approval"
-            else "allow" if terminal_allowed else "deny"
+            else "allow"
+            if terminal_allowed
+            else "deny"
         ),
         "reasonCodes": [
             "HUMAN_APPROVAL_REQUIRED"
@@ -124,9 +128,7 @@ def test_pending_spawn_is_restart_safe_and_denial_never_reposts(tmp_path: Path) 
             return httpx.Response(201, json=_status("pending_approval"))
         return httpx.Response(200, json=_status("denied"))
 
-    store = CredentialStore(
-        keyring_backend=MemoryKeyring(), state_dir=tmp_path
-    )
+    store = CredentialStore(keyring_backend=MemoryKeyring(), state_dir=tmp_path)
     client = DeveloperClient(
         "https://api.palonexus.cloud", transport=httpx.MockTransport(handler)
     )
@@ -205,7 +207,7 @@ def test_allowed_spawn_provisions_and_activates_with_prospective_key(
                         "spawn_request_id": "spawn-a",
                         "parent_agent_id": "agent-a",
                         "parent_identity_lease_id": "runtime-a",
-                            "key_thumbprint": prospective_thumbprint,
+                        "key_thumbprint": prospective_thumbprint,
                         "status": "provisioned",
                     },
                 ),
