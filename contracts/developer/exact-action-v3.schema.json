@@ -59,6 +59,7 @@
     "tenant_id": {"$ref": "#/$defs/nonEmpty"},
     "agent_id": {"$ref": "#/$defs/nonEmpty"},
     "agent_generation": {"type": "integer", "minimum": 1},
+    "subagent": {"$ref": "#/$defs/subagent"},
     "proxy_id": {"$ref": "#/$defs/nonEmpty"},
     "proxy_generation": {"type": "integer", "minimum": 1},
     "proxy_proof_key_thumbprint": {
@@ -114,6 +115,40 @@
     "expires_at": {"$ref": "#/$defs/canonicalTimestamp"}
   },
   "$defs": {
+    "subagent": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "identity_lease_id",
+        "actor_proof_key_thumbprint",
+        "child_grant_id",
+        "child_grant_hash",
+        "parent_agent_id",
+        "parent_agent_generation",
+        "spawn_request_id",
+        "spawn_decision_id",
+        "root_agent_id",
+        "root_agent_generation",
+        "root_run_id",
+        "delegation_depth",
+        "ancestry_digest"
+      ],
+      "properties": {
+        "identity_lease_id": {"$ref": "#/$defs/nonEmpty"},
+        "actor_proof_key_thumbprint": {"type": "string", "pattern": "^[A-Za-z0-9_-]{43}$"},
+        "child_grant_id": {"$ref": "#/$defs/nonEmpty"},
+        "child_grant_hash": {"$ref": "#/$defs/sha256"},
+        "parent_agent_id": {"$ref": "#/$defs/nonEmpty"},
+        "parent_agent_generation": {"type": "integer", "minimum": 1},
+        "spawn_request_id": {"$ref": "#/$defs/nonEmpty"},
+        "spawn_decision_id": {"$ref": "#/$defs/nonEmpty"},
+        "root_agent_id": {"$ref": "#/$defs/nonEmpty"},
+        "root_agent_generation": {"type": "integer", "minimum": 1},
+        "root_run_id": {"$ref": "#/$defs/nonEmpty"},
+        "delegation_depth": {"type": "integer", "minimum": 1, "maximum": 32},
+        "ancestry_digest": {"$ref": "#/$defs/sha256"}
+      }
+    },
     "nonEmpty": {
       "type": "string",
       "minLength": 1,

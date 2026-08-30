@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import errno
 import json
 import socket
 import threading
@@ -140,7 +141,10 @@ def test_guard_rejects_bad_envelopes_without_cloud_call() -> None:
         thread = threading.Thread(target=guard.serve_once, args=(parent,))
         thread.start()
         child.sendall(raw)
-        child.shutdown(socket.SHUT_WR)
+        try:
+            child.shutdown(socket.SHUT_WR)
+        except OSError as error:
+            assert error.errno in {errno.ENOTCONN, errno.EPIPE}
         response = child.recv(4096)
         thread.join(timeout=2)
         assert json.loads(response)["status"] == "contract_error"

@@ -4,9 +4,7 @@ from __future__ import annotations
 
 from typing import Any
 
-MCP_SCHEMA_DIGEST = (
-    "93c5c52c6762a21b1b35dea92835f8385a29c7c9da3ecb4f1b4c0faa3937132b"
-)
+MCP_SCHEMA_DIGEST = "93c5c52c6762a21b1b35dea92835f8385a29c7c9da3ecb4f1b4c0faa3937132b"
 RESOURCE = "release:2026.08.30"
 
 
@@ -20,8 +18,14 @@ def assess_release(command: dict[str, Any], context: Any) -> dict[str, Any]:
             resource=RESOURCE,
             arguments={"release": release},
         ).result
-    return context.actions.invoke(
-        "release.assessment.publish",
-        RESOURCE,
-        {"release": release},
-    ).result
+    if command["scenario"] == "capability_denied":
+        return context.actions.invoke(
+            "release.assessment.publish",
+            RESOURCE,
+            {"release": release},
+        ).result
+    return context.subagents.request(
+        description=f"Re-check the denied release evidence for {release}",
+        subagent_type="evidence-checker",
+        parent_action_id="parent-action-denied-release",
+    )

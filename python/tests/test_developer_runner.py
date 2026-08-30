@@ -122,6 +122,79 @@ def test_detached_child_pending_is_a_normal_persisted_result(tmp_path: Path) -> 
     assert result.pending_action_id == "action-1" and result.output is None
 
 
+def test_detached_subagent_spawn_is_restart_safe_before_child_execution(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "agent.py").write_text(
+        "def review_release(change, context):\n"
+        "    return context.subagents.request(\n"
+        "        description='check evidence', subagent_type='evidence-checker@1',\n"
+        "        parent_action_id='parent-action-1')\n"
+    )
+    runner = Runner(
+        guard_invoke=lambda _envelope: {
+            "status": "spawn_pending",
+            "spawn_request_id": "spawn-1",
+        }
+    )
+    result = runner.run(
+        project=tmp_path,
+        agent_file=tmp_path / "agent.py",
+        descriptor={
+            "module": "agent",
+            "symbol": "review_release",
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+        },
+        input_value={},
+        run_id="run-1",
+        descriptor_digest="a" * 64,
+        input_digest="b" * 64,
+        runtime_lease_id="lease-1",
+        detach=True,
+    )
+    assert result.pending_spawn_request_id == "spawn-1"
+    assert result.pending_action_id is None and result.output is None
+
+
+def test_denied_subagent_spawn_returns_to_parent_without_receipt(
+    tmp_path: Path,
+) -> None:
+    (tmp_path / "agent.py").write_text(
+        "def review_release(change, context):\n"
+        "    return context.subagents.request(\n"
+        "        description='check evidence', subagent_type='evidence-checker@1',\n"
+        "        parent_action_id='parent-action-1')\n"
+    )
+    runner = Runner(
+        guard_invoke=lambda _envelope: {
+            "status": "spawn_result",
+            "result": {
+                "status": "spawn_denied",
+                "spawn_request_id": "spawn-1",
+                "reason_codes": ["HUMAN_APPROVAL_DENIED"],
+            },
+        }
+    )
+    result = runner.run(
+        project=tmp_path,
+        agent_file=tmp_path / "agent.py",
+        descriptor={
+            "module": "agent",
+            "symbol": "review_release",
+            "input_schema": {"type": "object"},
+            "output_schema": {"type": "object"},
+        },
+        input_value={},
+        run_id="run-1",
+        descriptor_digest="a" * 64,
+        input_digest="b" * 64,
+        runtime_lease_id="lease-1",
+    )
+    assert result.output["status"] == "spawn_denied"
+    assert result.receipt is None
+
+
 def test_runner_preserves_terminal_capability_denial_from_child(tmp_path: Path) -> None:
     (tmp_path / "agent.py").write_text(
         "def review_release(change, context):\n"

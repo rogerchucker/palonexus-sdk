@@ -84,6 +84,14 @@ def build_parser() -> argparse.ArgumentParser:
     resume.add_argument("--allow-file-credential-store", action="store_true")
     resume.set_defaults(handler=commands.actions_resume)
 
+    subagents = subcommands.add_parser("subagents", allow_abbrev=False)
+    subagent_commands = subagents.add_subparsers(dest="subagent_command", required=True)
+    subagent_resume = subagent_commands.add_parser("resume", allow_abbrev=False)
+    subagent_resume.add_argument("spawn_request_id")
+    subagent_resume.add_argument("--json", action="store_true")
+    subagent_resume.add_argument("--allow-file-credential-store", action="store_true")
+    subagent_resume.set_defaults(handler=commands.subagents_resume)
+
     logout = subcommands.add_parser("logout", allow_abbrev=False)
     logout.add_argument("--auth-url")
     logout.add_argument("--allow-file-credential-store", action="store_true")

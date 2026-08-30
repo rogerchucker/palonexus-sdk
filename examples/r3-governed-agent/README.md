@@ -30,7 +30,19 @@ pnxs run agent.py --input input-capability-denied.json --json
 That command exits with terminal `capability_denied`; no approval request, credential,
 target call, effect, or receipt is created.
 
-`deep_agent.py` shows the third scenario's host wiring. Pass a
+The third scenario is directly runnable and restart-safe:
+
+```bash
+pnxs run agent.py --input input-subagent-denied.json --detach --json
+# Deny the pending spawn in Operations Center.
+pnxs subagents resume SPAWN_REQUEST_ID --json
+```
+
+The descriptor's reviewed subagent template is part of the registered artifact. The CLI
+retains the prospective key only in local encrypted custody and resumes the same server
+request; it never creates a replacement request after restart.
+
+`deep_agent.py` also shows the framework host wiring. Pass a
 `GovernedSubagentRuntime` as `spawn_runtime`. The middleware intercepts Deep Agents'
 public `task` tool before its handler. A pending spawn interrupts the durable graph; a
 human denial resumes it as `spawn_denied` without calling the child handler. An allowed

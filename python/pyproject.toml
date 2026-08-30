@@ -29,7 +29,7 @@ license-files = ["LICENSE"]
 authors = [
   { name = "PaloNexus maintainers" },
 ]
-keywords = ["platform-contract-sha:febc6fd899e7007e46373ac3d7efac4c556552d3"]
+keywords = ["platform-contract-sha:63a554d2d6b064defab92250e591c8baaabfd6c8"]
 classifiers = [
   "Development Status :: 2 - Pre-Alpha",
   "License :: OSI Approved :: MIT License",
@@ -105,4 +105,4 @@ repository = "rogerchucker/palonexus-platform"
 # Task 1 adds canonical developer schemas to both repositories and lists their
 # repository-relative paths here. The release gate rejects missing, extra, or
 # byte-different files as soon as this list is populated.
-schema-paths = ["contracts/developer/agent-command-outcome-v1.schema.json", "contracts/developer/capability-denial-v1.schema.json", "contracts/developer/cli-compatibility-v1.schema.json", "contracts/developer/exact-action-v3.schema.json", "contracts/developer/mcp-exact-action-v1.schema.json", "contracts/developer/registration-profile-v1.schema.json", "contracts/developer/v1.schema.json"]
+schema-paths = ["contracts/developer/agent-claim-v1.schema.json", "contracts/developer/agent-command-outcome-v1.schema.json", "contracts/developer/capability-denial-v1.schema.json", "contracts/developer/cli-compatibility-v1.schema.json", "contracts/developer/exact-action-v3.schema.json", "contracts/developer/mcp-exact-action-v1.schema.json", "contracts/developer/registration-profile-v1.schema.json", "contracts/developer/v1.schema.json"]
