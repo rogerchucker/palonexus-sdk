@@ -18,6 +18,7 @@ from cryptography.hazmat.primitives import serialization
 from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
 from packaging.version import InvalidVersion, Version
 
+from .context import CapabilityDenied
 from .contracts import RequestedCapabilityRule
 from .credentials import CredentialStore
 
@@ -89,6 +90,59 @@ _DEVELOPER_DELIVERY_STATES = {
     "canceled",
     "failed_safe",
 }
+_COMMAND_OUTCOME_FIELDS = {
+    "schemaVersion",
+    "disposition",
+    "code",
+    "reasonCode",
+}
+_CAPABILITY_DENIAL_REASONS = {
+    "OUTSIDE_CONFIGURED_CEILING": "outside configured capability ceiling",
+    "OUTSIDE_RUN_GRANT": "outside effective run grant",
+}
+_SUBAGENT_STATUS_FIELDS = {
+    "schemaVersion",
+    "version",
+    "spawnRequestId",
+    "tenantId",
+    "rootRunId",
+    "parentAgentId",
+    "parentAgentGeneration",
+    "parentRuntimeLeaseId",
+    "parentGrantId",
+    "childTaskId",
+    "templateId",
+    "templateVersion",
+    "delegationDepth",
+    "remainingDelegationDepth",
+    "status",
+    "approvalMode",
+    "approvalStatus",
+    "decisionId",
+    "decisionOutcome",
+    "reasonCodes",
+    "requestDigest",
+    "expiresAt",
+    "childGrantId",
+    "childGrantHash",
+    "provisioningAuthorizationId",
+    "reservationId",
+    "childAgentId",
+    "childAgentGeneration",
+    "childRunId",
+    "identityLeaseId",
+    "activatedAt",
+}
+_SUBAGENT_PROVISION_FIELDS = {
+    "schemaVersion",
+    "spawnRequestId",
+    "status",
+    "authorization",
+    "keyProofMessage",
+    "activationProofMessage",
+    "identityLease",
+    "runId",
+}
 
 
 class DeveloperClientError(RuntimeError):
@@ -129,6 +183,108 @@ def decode_strict_json(raw: bytes, allowed_fields: set[str]) -> dict[str, Any]:
         raise ProtocolError("response is not strict JSON") from error
     if not isinstance(value, dict) or set(value) - allowed_fields:
         raise ProtocolError("response contains an unknown field")
+    return value
+
+
+def _raise_closed_command_outcome(response: httpx.Response, raw: bytes) -> None:
+    content_type = response.headers.get("Content-Type", "").split(";", 1)[0].strip()
+    if response.status_code != 403 or content_type != "application/json":
+        raise RequestRejected(response.status_code)
+    try:
+        value = decode_strict_json(raw, _COMMAND_OUTCOME_FIELDS)
+    except ProtocolError:
+        raise DeveloperClientError(
+            "developer authorization service returned an invalid denial"
+        ) from None
+    reason_code = value.get("reasonCode")
+    if (
+        value.get("schemaVersion") != "palonexus.agent-command-outcome/v1"
+        or value.get("disposition") != "terminal"
+        or value.get("code") != "capability_denied"
+        or not isinstance(reason_code, str)
+        or reason_code not in _CAPABILITY_DENIAL_REASONS
+    ):
+        raise DeveloperClientError(
+            "developer authorization service returned an invalid denial"
+        )
+    raise CapabilityDenied(reason_code, _CAPABILITY_DENIAL_REASONS[reason_code])
+
+
+def _validate_subagent_status(
+    value: dict[str, Any],
+    *,
+    session: dict[str, Any],
+    agent: dict[str, Any],
+    runtime: dict[str, Any],
+    request_id: str | None = None,
+) -> dict[str, Any]:
+    if (
+        value.get("schemaVersion") != "palonexus.authority-subagent-spawn/v1"
+        or value.get("tenantId") != session.get("tenant_id")
+        or value.get("parentAgentId") != agent.get("agent_id")
+        or value.get("parentRuntimeLeaseId") != runtime.get("runtime_id")
+        or not isinstance(value.get("spawnRequestId"), str)
+        or not value["spawnRequestId"]
+        or (request_id is not None and value["spawnRequestId"] != request_id)
+        or value.get("status")
+        not in {"pending_approval", "allowed", "denied", "provisioned", "active"}
+        or value.get("approvalStatus")
+        not in {"pending", "approved", "denied", "not_required"}
+        or not isinstance(value.get("reasonCodes"), list)
+        or not all(isinstance(item, str) and item for item in value["reasonCodes"])
+    ):
+        raise ProtocolError("subagent status is not bound to the parent runtime")
+    return value
+
+
+def _validate_subagent_provision_result(
+    value: dict[str, Any],
+    *,
+    session: dict[str, Any],
+    agent: dict[str, Any],
+    runtime: dict[str, Any],
+    request_id: str,
+    prospective_key_thumbprint: str,
+) -> dict[str, Any]:
+    authorization = value.get("authorization")
+    if (
+        value.get("schemaVersion") != "palonexus.subagent-provision-result/v1"
+        or value.get("spawnRequestId") != request_id
+        or value.get("status") not in {"proof_required", "provisioned", "active"}
+        or not isinstance(value.get("keyProofMessage"), str)
+        or not value["keyProofMessage"]
+        or not isinstance(authorization, dict)
+        or authorization.get("schema_version")
+        != "palonexus.subagent-provisioning-authorization/v1"
+        or authorization.get("spawn_request_id") != request_id
+        or authorization.get("tenant_id") != session.get("tenant_id")
+        or authorization.get("parent_agent_id") != agent.get("agent_id")
+        or authorization.get("parent_runtime_lease_id") != runtime.get("runtime_id")
+        or authorization.get("prospective_key_thumbprint")
+        != prospective_key_thumbprint
+    ):
+        raise ProtocolError("subagent provisioning is not bound to the request")
+    lease = value.get("identityLease")
+    if lease is not None:
+        if (
+            not isinstance(lease, dict)
+            or lease.get("schema_version")
+            != "palonexus.subagent-identity-lease/v1"
+            or lease.get("tenant_id") != session.get("tenant_id")
+            or lease.get("spawn_request_id") != request_id
+            or lease.get("parent_agent_id") != agent.get("agent_id")
+            or lease.get("parent_identity_lease_id") != runtime.get("runtime_id")
+            or lease.get("key_thumbprint") != prospective_key_thumbprint
+            or lease.get("status") not in {"provisioned", "active"}
+            or not isinstance(lease.get("identity_lease_id"), str)
+            or not lease["identity_lease_id"]
+            or not isinstance(lease.get("subagent_id"), str)
+            or not lease["subagent_id"]
+            or not isinstance(lease.get("agent_generation"), int)
+            or isinstance(lease.get("agent_generation"), bool)
+            or lease["agent_generation"] < 1
+        ):
+            raise ProtocolError("subagent identity lease is not bound to the request")
     return value
 
 
@@ -961,8 +1117,6 @@ class DeveloperClient:
                 method, path, content=body, headers=request_headers
             ) as response:
                 expected_codes = {expected} if isinstance(expected, int) else expected
-                if response.status_code not in expected_codes:
-                    raise RequestRejected(response.status_code)
                 chunks: list[bytes] = []
                 received = 0
                 for chunk in response.iter_bytes(chunk_size=MAX_RESPONSE_BYTES + 1):
@@ -972,6 +1126,8 @@ class DeveloperClient:
                     if received > MAX_RESPONSE_BYTES:
                         raise ProtocolError("response is too large")
                 raw = b"".join(chunks)
+                if response.status_code not in expected_codes:
+                    _raise_closed_command_outcome(response, raw)
         except (DeveloperClientError, ProtocolError):
             raise
         except httpx.HTTPError:
@@ -1885,3 +2041,133 @@ class DeveloperClient:
         )
         _validate_developer_action_response(response)
         return response
+
+    def create_developer_subagent_spawn(
+        self,
+        session: dict[str, Any],
+        agent: dict[str, Any],
+        guard: dict[str, Any],
+        runtime: dict[str, Any],
+        run: dict[str, Any],
+        *,
+        command: dict[str, Any],
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        path = (
+            f"/v1/developer/runs/{quote(run['runId'], safe='')}/subagent-spawns"
+        )
+        body = canonical_json(
+            {
+                "schemaVersion": "palonexus.subagent-spawn-command/v1",
+                **command,
+                "idempotencyKey": idempotency_key,
+            }
+        )
+        proof = self.mounted_proof(
+            _decode_private_key(guard.get("private_key")),
+            mode="runtime_proof",
+            tenant_id=session["tenant_id"],
+            agent_id=agent["agent_id"],
+            agent_generation=int(agent["agent_generation"]),
+            method="POST",
+            path=path,
+            body=body,
+            runtime_id=runtime["runtime_id"],
+        )
+        response = self._request(
+            "POST",
+            path,
+            body=body,
+            headers={
+                "X-Palonexus-Developer-Proof": proof,
+                "Idempotency-Key": idempotency_key,
+            },
+            expected={200, 201, 202},
+            allowed_fields=_SUBAGENT_STATUS_FIELDS,
+        )
+        return _validate_subagent_status(
+            response, session=session, agent=agent, runtime=runtime
+        )
+
+    def get_developer_subagent_spawn(
+        self,
+        session: dict[str, Any],
+        agent: dict[str, Any],
+        guard: dict[str, Any],
+        runtime: dict[str, Any],
+        request_id: str,
+    ) -> dict[str, Any]:
+        path = f"/v1/developer/subagent-spawns/{quote(request_id, safe='')}"
+        proof = self.mounted_proof(
+            _decode_private_key(guard.get("private_key")),
+            mode="runtime_proof",
+            tenant_id=session["tenant_id"],
+            agent_id=agent["agent_id"],
+            agent_generation=int(agent["agent_generation"]),
+            method="GET",
+            path=path,
+            body=b"",
+            runtime_id=runtime["runtime_id"],
+        )
+        response = self._request(
+            "GET",
+            path,
+            headers={"X-Palonexus-Developer-Proof": proof},
+            allowed_fields=_SUBAGENT_STATUS_FIELDS,
+        )
+        return _validate_subagent_status(
+            response,
+            session=session,
+            agent=agent,
+            runtime=runtime,
+            request_id=request_id,
+        )
+
+    def provision_developer_subagent(
+        self,
+        session: dict[str, Any],
+        agent: dict[str, Any],
+        guard: dict[str, Any],
+        runtime: dict[str, Any],
+        request_id: str,
+        *,
+        command: dict[str, Any],
+        prospective_key_thumbprint: str,
+    ) -> dict[str, Any]:
+        path = (
+            f"/v1/developer/subagent-spawns/{quote(request_id, safe='')}/provision"
+        )
+        body = canonical_json(
+            {"schemaVersion": "palonexus.subagent-provision/v1", **command}
+        )
+        proof = self.mounted_proof(
+            _decode_private_key(guard.get("private_key")),
+            mode="runtime_proof",
+            tenant_id=session["tenant_id"],
+            agent_id=agent["agent_id"],
+            agent_generation=int(agent["agent_generation"]),
+            method="POST",
+            path=path,
+            body=body,
+            runtime_id=runtime["runtime_id"],
+        )
+        operation = _require_string(command.get("operation"), "operation")
+        response = self._request(
+            "POST",
+            path,
+            body=body,
+            headers={
+                "X-Palonexus-Developer-Proof": proof,
+                "Idempotency-Key": f"provision-{request_id}-{operation}",
+            },
+            expected={200, 201},
+            allowed_fields=_SUBAGENT_PROVISION_FIELDS,
+        )
+        return _validate_subagent_provision_result(
+            response,
+            session=session,
+            agent=agent,
+            runtime=runtime,
+            request_id=request_id,
+            prospective_key_thumbprint=prospective_key_thumbprint,
+        )

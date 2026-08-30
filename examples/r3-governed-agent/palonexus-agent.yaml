@@ -1,0 +1,37 @@
+schemaVersion: palonexus.agent/v1
+name: release-risk-reviewer-r3
+version: 0.1.0
+entrypoint:
+  module: agent
+  symbol: assess_release
+inputSchema:
+  type: object
+  additionalProperties: false
+  required: [scenario, release]
+  properties:
+    scenario:
+      enum: [mcp_approval, capability_denied]
+    release:
+      type: string
+outputSchema: &result
+  type: object
+actions:
+  - action: mcp:change-control-mcp/assess_release/93c5c52c6762a21b1b35dea92835f8385a29c7c9da3ecb4f1b4c0faa3937132b
+    resource: release:2026.08.30
+    target: change-control-mcp
+    approval: exact-action
+    constraints: {}
+    argumentSchema:
+      type: object
+      additionalProperties: false
+      required: [release]
+      properties:
+        release:
+          type: string
+  - action: release.assessment.publish
+    resource: release:2026.08.30
+    target: release-assessments
+    approval: exact-action
+    requestAuthority: false
+    constraints: {}
+    argumentSchema: *result

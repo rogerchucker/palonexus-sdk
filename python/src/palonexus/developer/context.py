@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import json
+import re
 import socket
 from dataclasses import dataclass
 from typing import Any
@@ -13,6 +14,14 @@ class ActionError(RuntimeError):
 
 class ActionDenied(ActionError):
     pass
+
+
+class CapabilityDenied(ActionDenied):
+    """The command is outside effective authority and cannot be human-approved."""
+
+    def __init__(self, reason_code: str, message: str | None = None):
+        self.reason_code = reason_code
+        super().__init__(message or reason_code)
 
 
 class ActionExpired(ActionError):
@@ -88,6 +97,7 @@ class Actions:
         )
         errors = {
             "denied": ActionDenied,
+            "capability_denied": CapabilityDenied,
             "expired": ActionExpired,
             "unavailable": ActionUnavailable,
             "contract_error": ActionContractError,
@@ -100,9 +110,43 @@ class Actions:
         raise error_type(str(reason))
 
 
+_MCP_NAME = re.compile(r"[a-z0-9](?:[a-z0-9._-]{0,127})?")
+_SHA256 = re.compile(r"[0-9a-f]{64}")
+
+
+class MCP:
+    """Thin MCP normalization facade over the governed local action guard."""
+
+    def __init__(self, actions: Actions):
+        self._actions = actions
+
+    def call(
+        self,
+        *,
+        server: str,
+        tool: str,
+        schema_digest: str,
+        resource: str,
+        arguments: dict[str, Any],
+    ) -> ActionOutcome:
+        if (
+            not isinstance(server, str)
+            or _MCP_NAME.fullmatch(server) is None
+            or not isinstance(tool, str)
+            or _MCP_NAME.fullmatch(tool) is None
+            or not isinstance(schema_digest, str)
+            or _SHA256.fullmatch(schema_digest) is None
+        ):
+            raise ActionContractError("invalid MCP tool identity")
+        return self._actions.invoke(
+            f"mcp:{server}/{tool}/{schema_digest}", resource, arguments
+        )
+
+
 class AgentContext:
     def __init__(self, transport: socket.socket):
         self.actions = Actions(transport)
+        self.mcp = MCP(self.actions)
 
     @classmethod
     def from_fd(cls, fd: int) -> AgentContext:

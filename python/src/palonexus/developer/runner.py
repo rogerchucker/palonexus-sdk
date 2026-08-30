@@ -11,6 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from .context import CapabilityDenied
 from .guard import GuardProtocol
 
 
@@ -81,6 +82,7 @@ class Runner:
                 "import importlib,json,os,sys",
                 "from palonexus.developer.context import AgentContext",
                 "from palonexus.developer.context import ActionPending",
+                "from palonexus.developer.context import CapabilityDenied",
                 "sys.path.insert(0,os.getcwd())",
                 "module=importlib.import_module(sys.argv[1])",
                 "fn=getattr(module,sys.argv[2])",
@@ -91,6 +93,9 @@ class Runner:
                 " print(json.dumps(outcome,sort_keys=True,separators=(',',':')))",
                 "except ActionPending as pending:",
                 " print(json.dumps({'__pnxs_pending_action_id__':pending.action_id},",
+                "  sort_keys=True,separators=(',',':')))",
+                "except CapabilityDenied as denied:",
+                " print(json.dumps({'__pnxs_capability_denied__':str(denied)},",
                 "  sort_keys=True,separators=(',',':')))",
             )
         )
@@ -109,6 +114,12 @@ class Runner:
         if process.returncode != 0:
             raise RuntimeError("guarded agent process failed")
         output = json.loads(process.stdout)
+        if (
+            isinstance(output, dict)
+            and set(output) == {"__pnxs_capability_denied__"}
+            and isinstance(output["__pnxs_capability_denied__"], str)
+        ):
+            raise CapabilityDenied(output["__pnxs_capability_denied__"])
         if (
             detach
             and isinstance(output, dict)

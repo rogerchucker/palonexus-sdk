@@ -78,6 +78,11 @@ def build_parser() -> argparse.ArgumentParser:
     wait.add_argument("--json", action="store_true")
     wait.add_argument("--allow-file-credential-store", action="store_true")
     wait.set_defaults(handler=commands.actions_wait)
+    resume = action_commands.add_parser("resume", allow_abbrev=False)
+    resume.add_argument("action_id")
+    resume.add_argument("--json", action="store_true")
+    resume.add_argument("--allow-file-credential-store", action="store_true")
+    resume.set_defaults(handler=commands.actions_resume)
 
     logout = subcommands.add_parser("logout", allow_abbrev=False)
     logout.add_argument("--auth-url")

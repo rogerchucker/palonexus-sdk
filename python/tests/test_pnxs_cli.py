@@ -17,6 +17,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
 import httpx
+import palonexus.cli.commands as cli_commands
 import pytest
 import yaml
 from cryptography import x509
@@ -39,8 +40,25 @@ from palonexus.developer.client import (
     decode_strict_json,
     generate_agent_credential,
 )
+from palonexus.developer.context import CapabilityDenied
 from palonexus.developer.credentials import CredentialStore, CredentialStoreUnavailable
 from palonexus.developer.scaffold import ScaffoldError
+
+
+def test_r3_example_declares_denied_attempt_without_requesting_its_authority(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = Path(__file__).parents[2] / "examples" / "r3-governed-agent"
+    monkeypatch.chdir(project)
+
+    descriptor = cli_commands._project_descriptor()
+
+    assert len(descriptor["actions"]) == 2
+    assert len(descriptor["rules"]) == 1
+    assert descriptor["rules"][0]["canonical_action"].startswith(
+        "mcp:change-control-mcp/assess_release/"
+    )
+    assert descriptor["actions"][1]["request_authority"] is False
 
 
 class _UnavailableProcessKeyring:
@@ -614,12 +632,54 @@ actions:
         capture_output=True,
         timeout=20,
     )
-    server.shutdown()
-    thread.join(timeout=2)
     assert (
         wait.returncode == 0
         and json.loads(wait.stdout)["delivery"]["state"] == "delivered"
     )
+    resume = subprocess.run(
+        [
+            executable,
+            "actions",
+            "resume",
+            "action-1",
+            "--json",
+            "--allow-file-credential-store",
+        ],
+        cwd=tmp_path,
+        env=env,
+        text=True,
+        capture_output=True,
+        timeout=20,
+    )
+    server.shutdown()
+    thread.join(timeout=2)
+    assert resume.returncode == 0, resume.stderr
+    assert json.loads(resume.stdout) == {
+        "action_id": "action-1",
+        "output": {},
+        "receipt": {
+            "capabilityId": "capability-1",
+            "effectCreatedAt": "2026-08-12T12:01:59Z",
+            "effectId": "effect-1",
+            "effectIdempotencyKey": "effect-1",
+            "opaqueDigest": "a" * 64,
+            "payloadDigest": hashlib.sha256(
+                canonical_json({"risk": "low"})
+            ).hexdigest(),
+            "receiptId": "receipt-1",
+            "recordedAt": "2026-08-12T12:02:00Z",
+            "rootId": "root-1",
+            "runId": "run-1",
+            "schemaVersion": "palonexus.developer-receipt-reference/v1",
+            "targetRegistrationId": "release-assessments",
+            "targetRegistrationVersion": 2,
+            "tenantId": "tenant-a",
+            "verified": True,
+            "actionId": "action-1",
+        },
+        "run_id": "run-1",
+        "status": "completed",
+    }
 
 
 def test_strict_json_rejects_duplicate_unknown_and_oversized_documents() -> None:
@@ -3134,6 +3194,38 @@ def test_developer_action_payload_and_strict_lifecycle_records() -> None:
     assert terminal["receipt"]["capabilityId"] == "capability-a"
 
 
+def test_developer_action_preserves_exact_terminal_capability_denial() -> None:
+    client = DeveloperClient(
+        "https://api.palonexus.cloud",
+        transport=httpx.MockTransport(
+            lambda _: httpx.Response(
+                403,
+                headers={"Content-Type": "application/json"},
+                json={
+                    "schemaVersion": "palonexus.agent-command-outcome/v1",
+                    "disposition": "terminal",
+                    "code": "capability_denied",
+                    "reasonCode": "OUTSIDE_RUN_GRANT",
+                },
+            )
+        ),
+    )
+    with pytest.raises(CapabilityDenied, match="outside effective run grant"):
+        client.create_developer_action(
+            {"tenant_id": "tenant-a"},
+            {"agent_id": "release-agent", "agent_generation": "1"},
+            generate_agent_credential(),
+            {"runtime_id": "runtime-a"},
+            {"runId": "run-a"},
+            action="release.delete",
+            resource="release/demo",
+            constraints={},
+            payload={},
+            idempotency_key="action-key",
+            effect_idempotency_key="effect-key",
+        )
+
+
 def test_developer_run_accepts_server_cancellation_timestamp_field() -> None:
     response = {
         "schemaVersion": "palonexus.developer-run/v1",
@@ -3460,6 +3552,66 @@ actions:
         encoding="utf-8",
     )
     with pytest.raises(CommandError, match="descriptor"):
+        _project_descriptor(descriptor_path)
+
+
+def test_descriptor_supports_multiple_unique_exact_actions(tmp_path: Path) -> None:
+    from palonexus.cli.commands import _descriptor_action, _project_descriptor
+
+    descriptor_path = tmp_path / "palonexus-agent.yaml"
+    descriptor_path.write_text(
+        """schemaVersion: palonexus.agent/v1
+name: release-risk-reviewer
+version: 0.2.0
+entrypoint: {module: agent, symbol: review_release}
+inputSchema: {type: object}
+outputSchema: {type: object}
+actions:
+  - action: mcp:change-control-mcp/assess-release/schema-a
+    resource: release/demo
+    target: change-control-mcp-assess
+    approval: exact-action
+    constraints: {max_risk_score: 1}
+    argumentSchema: {type: object, required: [release_id]}
+  - action: mcp:change-control-mcp/delete-release/schema-b
+    resource: release/demo
+    target: change-control-mcp-delete
+    approval: exact-action
+    requestAuthority: false
+    constraints: {}
+    argumentSchema: {type: object, required: [release_id]}
+""",
+        encoding="utf-8",
+    )
+
+    descriptor = _project_descriptor(descriptor_path)
+
+    assert [rule["canonical_action"] for rule in descriptor["rules"]] == [
+        "mcp:change-control-mcp/assess-release/schema-a"
+    ]
+    assert [action["target"] for action in descriptor["actions"]] == [
+        "change-control-mcp-assess",
+        "change-control-mcp-delete",
+    ]
+    assert descriptor["actions"][0]["argument_schema"]["required"] == [
+        "release_id"
+    ]
+    assert _descriptor_action(
+        descriptor,
+        "mcp:change-control-mcp/delete-release/schema-b",
+        "release/demo",
+    )["constraints"] == {}
+    with pytest.raises(CommandError, match="not declared"):
+        _descriptor_action(descriptor, "mcp:change-control-mcp/unknown/schema-c", "r")
+
+    descriptor_path.write_text(
+        descriptor_path.read_text(encoding="utf-8").replace(
+            "mcp:change-control-mcp/delete-release/schema-b",
+            "mcp:change-control-mcp/assess-release/schema-a",
+        ),
+        encoding="utf-8",
+    )
+    with pytest.raises(CommandError, match="unique"):
         _project_descriptor(descriptor_path)
 
 

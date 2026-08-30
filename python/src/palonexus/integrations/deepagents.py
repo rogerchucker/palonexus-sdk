@@ -13,9 +13,10 @@ from __future__ import annotations
 import asyncio
 import concurrent.futures
 import inspect
+import json
 from collections.abc import Awaitable, Callable, Iterator, Mapping, Sequence
 from types import MappingProxyType
-from typing import Any, Never, cast
+from typing import Any, Never, Protocol, cast
 
 from ..errors import AuthorizationUnavailable, PaloNexusError
 from . import MissingIntegrationDependency
@@ -51,6 +52,12 @@ class MissingDeepAgentsDependency(MissingIntegrationDependency):
     )
 
 
+class GovernedSpawnRuntime(Protocol):
+    def request(
+        self, *, description: str, subagent_type: str, parent_action_id: str
+    ) -> Mapping[str, object]: ...
+
+
 try:
     from langchain.agents.middleware import (
         AgentMiddleware,
@@ -60,7 +67,7 @@ try:
     from langchain.tools.tool_node import ToolCallRequest
     from langchain_core.messages import AIMessage, ToolMessage
     from langchain_core.tools import BaseTool
-    from langgraph.types import Command
+    from langgraph.types import Command, interrupt
 
     from .langchain import (
         LangChainActionPolicy,
@@ -240,6 +247,7 @@ class PaloNexusDeepAgentsMiddleware(AgentMiddleware[Any, Any]):
         "_bound_agent_name",
         "_governed_subagents",
         "_orchestration_builtins",
+        "_spawn_runtime",
     )
 
     def __init__(
@@ -250,6 +258,7 @@ class PaloNexusDeepAgentsMiddleware(AgentMiddleware[Any, Any]):
         _bound_agent_name: str | None = None,
         _governed_subagents: frozenset[str] = frozenset(),
         _orchestration_builtins: bool = False,
+        spawn_runtime: GovernedSpawnRuntime | None = None,
     ) -> None:
         if type(authorization) is not PaloNexusLangChainMiddleware:
             _invalid()
@@ -258,6 +267,11 @@ class PaloNexusDeepAgentsMiddleware(AgentMiddleware[Any, Any]):
         self._bound_agent_name = _bound_agent_name
         self._governed_subagents = _governed_subagents
         self._orchestration_builtins = _orchestration_builtins
+        if spawn_runtime is not None and not callable(
+            getattr(spawn_runtime, "request", None)
+        ):
+            _invalid()
+        self._spawn_runtime = spawn_runtime
 
     @property
     def accountable_actors(self) -> Mapping[str, str]:
@@ -278,6 +292,88 @@ class PaloNexusDeepAgentsMiddleware(AgentMiddleware[Any, Any]):
             _bound_agent_name=bound_agent_name,
             _governed_subagents=governed_subagents,
             _orchestration_builtins=True,
+            spawn_runtime=self._spawn_runtime,
+        )
+
+    @staticmethod
+    def _checked_spawn_outcome(value: object) -> Mapping[str, object]:
+        base = {"status", "spawn_request_id", "reason_codes"}
+        active = {
+            "child_agent_id",
+            "child_agent_generation",
+            "child_run_id",
+            "identity_lease_id",
+        }
+        if (
+            not isinstance(value, Mapping)
+            or frozenset(value)
+            != (base | active if value.get("status") == "active" else base)
+            or value.get("status")
+            not in {"spawn_approval_required", "spawn_denied", "active"}
+            or type(value.get("spawn_request_id")) is not str
+            or not value["spawn_request_id"]
+            or not isinstance(value.get("reason_codes"), list)
+            or not all(
+                type(item) is str and item for item in value["reason_codes"]
+            )
+            or (
+                value.get("status") == "active"
+                and (
+                    type(value.get("child_agent_id")) is not str
+                    or not value["child_agent_id"]
+                    or type(value.get("child_agent_generation")) is not int
+                    or value["child_agent_generation"] < 1
+                    or type(value.get("child_run_id")) is not str
+                    or not value["child_run_id"]
+                    or type(value.get("identity_lease_id")) is not str
+                    or not value["identity_lease_id"]
+                )
+            )
+        ):
+            _invalid()
+        return value
+
+    def _request_spawn(
+        self, request: ToolCallRequest, subagent_type: str
+    ) -> Mapping[str, object]:
+        if self._spawn_runtime is None:
+            _invalid()
+        arguments = request.tool_call["args"]
+        if not isinstance(arguments, Mapping):
+            _invalid()
+        outcome = self._checked_spawn_outcome(
+            self._spawn_runtime.request(
+                description=str(arguments["description"]),
+                subagent_type=subagent_type,
+                parent_action_id=str(request.tool_call["id"]),
+            )
+        )
+        if outcome["status"] == "spawn_approval_required":
+            interrupt(
+                {
+                    "schemaVersion": "palonexus.subagent-interrupt/v1",
+                    "status": "spawn_approval_required",
+                    "spawnRequestId": outcome["spawn_request_id"],
+                }
+            )
+            return self._request_spawn(request, subagent_type)
+        return outcome
+
+    @staticmethod
+    def _spawn_tool_message(
+        request: ToolCallRequest, outcome: Mapping[str, object]
+    ) -> ToolMessage:
+        return ToolMessage(
+            content=json.dumps(
+                {
+                    "status": outcome["status"],
+                    "spawn_request_id": outcome["spawn_request_id"],
+                    "reason_codes": outcome["reason_codes"],
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+            ),
+            tool_call_id=str(request.tool_call["id"]),
         )
 
     def _validate(self, request: object) -> None:
@@ -343,6 +439,11 @@ class PaloNexusDeepAgentsMiddleware(AgentMiddleware[Any, Any]):
         if orchestration == "write_todos":
             return handler(request)
         if orchestration is not None:
+            if self._spawn_runtime is not None:
+                outcome = self._request_spawn(request, orchestration)
+                if outcome["status"] != "active":
+                    return self._spawn_tool_message(request, outcome)
+                return handler(request)
             if request.tool is None:
                 _invalid()
             bound = self._authorization.with_tool_binding(
@@ -368,6 +469,13 @@ class PaloNexusDeepAgentsMiddleware(AgentMiddleware[Any, Any]):
         if orchestration == "write_todos":
             return await handler(request)
         if orchestration is not None:
+            if self._spawn_runtime is not None:
+                outcome = await asyncio.to_thread(
+                    self._request_spawn, request, orchestration
+                )
+                if outcome["status"] != "active":
+                    return self._spawn_tool_message(request, outcome)
+                return await handler(request)
             if request.tool is None:
                 _invalid()
             bound = self._authorization.with_tool_binding(
@@ -556,6 +664,7 @@ def create_authorized_deep_agent(
 
 __all__ = [
     "DeepAgentsAuthorizationContext",
+    "GovernedSpawnRuntime",
     "MissingDeepAgentsDependency",
     "PaloNexusDeepAgentsMiddleware",
     "create_authorized_deep_agent",

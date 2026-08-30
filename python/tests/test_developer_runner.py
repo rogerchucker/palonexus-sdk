@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from pathlib import Path
 
+import pytest
+from palonexus.developer.context import CapabilityDenied
 from palonexus.developer.runner import Runner, RunnerResult
 
 
@@ -118,3 +120,36 @@ def test_detached_child_pending_is_a_normal_persisted_result(tmp_path: Path) -> 
         detach=True,
     )
     assert result.pending_action_id == "action-1" and result.output is None
+
+
+def test_runner_preserves_terminal_capability_denial_from_child(tmp_path: Path) -> None:
+    (tmp_path / "agent.py").write_text(
+        "def review_release(change, context):\n"
+        "    context.actions.invoke(\n"
+        "        'release.assessment.publish', 'release/demo', change\n"
+        "    )\n"
+        "    return {'unreachable': True}\n"
+    )
+    runner = Runner(
+        guard_invoke=lambda _envelope: {
+            "status": "capability_denied",
+            "reason": "OUTSIDE_RUN_GRANT",
+        }
+    )
+    with pytest.raises(CapabilityDenied, match="OUTSIDE_RUN_GRANT") as denied:
+        runner.run(
+            project=tmp_path,
+            agent_file=tmp_path / "agent.py",
+            descriptor={
+                "module": "agent",
+                "symbol": "review_release",
+                "input_schema": {"type": "object"},
+                "output_schema": {"type": "object"},
+            },
+            input_value={"risk": "low"},
+            run_id="run-1",
+            descriptor_digest="a" * 64,
+            input_digest="b" * 64,
+            runtime_lease_id="lease-1",
+        )
+    assert denied.value.reason_code == "OUTSIDE_RUN_GRANT"
