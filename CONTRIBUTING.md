@@ -15,6 +15,16 @@ git commit --signoff
 The sign-off confirms that you have the right to submit the contribution under
 this repository's license. It is not a cryptographic signature.
 
+Before the first push, verify the complete pull-request range rather than only
+the tip commit:
+
+```console
+scripts/verify --dco-range "$(git merge-base origin/main HEAD)" "$(git rev-parse HEAD)"
+```
+
+Release work must treat this range check as a pre-push gate. A signed tip does
+not repair an earlier unsigned commit in the same pull request.
+
 ## Development
 
 Use `uv` for all Python environment, dependency, test, build, and publishing
