@@ -137,6 +137,7 @@ def test_pnxs_is_the_only_console_script_and_parser_surface_is_exact() -> None:
 
     parser = build_parser()
     accepted = (
+        ["--version"],
         ["login"],
         [
             "agents",
@@ -165,11 +166,12 @@ def test_pnxs_is_the_only_console_script_and_parser_surface_is_exact() -> None:
         ["run", "agent.py", "--input", "fixture.json"],
         ["actions", "wait", "action-1"],
         ["logout"],
+        ["version"],
         ["version", "--json"],
     )
     for argv in accepted:
         assert parser.parse_args(argv).handler is not None
-    for argv in (["pnx"], ["agents", "delete"], ["publish"], ["version"]):
+    for argv in (["pnx"], ["agents", "delete"], ["publish"]):
         with pytest.raises(SystemExit):
             parser.parse_args(argv)
     with pytest.raises(SystemExit):
@@ -1899,6 +1901,41 @@ def test_version_json_is_strict_and_contains_release_identity(
         "version": "1.2.3",
         "source_revision": "a" * 40,
     }
+
+
+@pytest.mark.parametrize("argv", (["--version"], ["version"]))
+def test_version_has_a_standard_human_readable_surface(
+    argv: list[str],
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        "palonexus.cli.commands.version_metadata",
+        lambda: {"version": "1.2.3", "source_revision": "a" * 40},
+    )
+
+    assert main(argv) == 0
+    assert capsys.readouterr().out == "pnxs 1.2.3\n"
+
+
+def test_login_keyboard_interrupt_exits_cleanly_without_a_traceback(
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.setattr(
+        DeveloperClient,
+        "login",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    monkeypatch.setattr(
+        "palonexus.cli.commands.credential_store",
+        lambda **_: CredentialStore(keyring_backend=_MemoryKeyring()),
+    )
+
+    assert main(["login", "--no-browser"]) == 130
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err == "Login canceled.\n"
 
 
 def _registration_response(

@@ -31,6 +31,11 @@ release.
 
 ### Changed
 
+- `pnxs --version` and human-readable `pnxs version` now follow conventional
+  CLI behavior, while `pnxs version --json` preserves the exact automation
+  contract.
+- Canceling device login with Ctrl-C now exits with status 130 and a concise
+  message instead of exposing a Python traceback.
 - Registration commands reject a `pnxs` executable shadowed by the active
   project virtual environment before making changes and point to a standalone
   executable when one is available.

@@ -10,7 +10,15 @@ from . import commands
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="pnxs", allow_abbrev=False)
-    subcommands = parser.add_subparsers(dest="command", required=True)
+    parser.set_defaults(json=False)
+    parser.add_argument(
+        "--version",
+        dest="handler",
+        action="store_const",
+        const=commands.version,
+        help="show the installed pnxs version and exit",
+    )
+    subcommands = parser.add_subparsers(dest="command")
 
     login = subcommands.add_parser("login", allow_abbrev=False)
     login.add_argument("--tenant")
@@ -98,13 +106,16 @@ def build_parser() -> argparse.ArgumentParser:
     logout.set_defaults(handler=commands.logout)
 
     version = subcommands.add_parser("version", allow_abbrev=False)
-    version.add_argument("--json", action="store_true", required=True)
+    version.add_argument("--json", action="store_true")
     version.set_defaults(handler=commands.version)
     return parser
 
 
 def main(argv: Sequence[str] | None = None) -> int:
-    args = build_parser().parse_args(argv)
+    parser = build_parser()
+    args = parser.parse_args(argv)
+    if getattr(args, "handler", None) is None:
+        parser.error("a command is required")
     try:
         return int(args.handler(args))
     except commands.CommandError as error:
