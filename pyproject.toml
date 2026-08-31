@@ -4,14 +4,14 @@ members = ["python"]
 [dependency-groups]
 dev = [
   "hatch-vcs>=0.5.0",
-  "hatchling>=1.31.0",
-  "idna==3.18",
+  "hatchling>=1.32.0",
+  "idna==3.19",
   "jsonschema>=4.26.0",
-  "mypy==2.3.0",
+  "mypy==2.3.1",
   "pytest>=9.1.1",
   "pyyaml==6.0.3",
   "rfc3339-validator>=0.1.4,<0.2",
-  "ruff>=0.16.0",
+  "ruff>=0.16.5",
   "unicodedata2==15.1.0",
 ]
 
