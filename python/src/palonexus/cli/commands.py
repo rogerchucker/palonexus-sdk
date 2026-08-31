@@ -139,6 +139,8 @@ def login(args: Namespace) -> int:
 
     try:
         client.login(store, on_authorization=display)
+    except KeyboardInterrupt as error:
+        raise CommandError("Login canceled.", 130) from error
     except (DeveloperClientError, CredentialStoreUnavailable) as error:
         raise CommandError(f"login failed: {error}") from error
     if getattr(args, "register", False):
@@ -1497,8 +1499,12 @@ def logout(args: Namespace) -> int:
     return 0
 
 
-def version(_args: Namespace) -> int:
-    print(json.dumps(version_metadata(), sort_keys=True, separators=(",", ":")))
+def version(args: Namespace) -> int:
+    metadata = version_metadata()
+    if getattr(args, "json", False):
+        print(json.dumps(metadata, sort_keys=True, separators=(",", ":")))
+    else:
+        print(f"pnxs {metadata['version']}")
     return 0
 
 

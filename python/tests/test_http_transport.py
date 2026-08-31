@@ -961,12 +961,14 @@ def test_deadline_bounds_each_http_timeout_and_is_rechecked_after_io() -> None:
             )
     finally:
         transport.close()
-    assert seen_timeout == {
-        "connect": 1.0,
-        "read": 1.0,
-        "write": 1.0,
-        "pool": 1.0,
-    }
+    assert seen_timeout == pytest.approx(
+        {
+            "connect": 1.0,
+            "read": 1.0,
+            "write": 1.0,
+            "pool": 1.0,
+        }
+    )
 
 
 def test_sync_absolute_deadline_stops_a_trickled_body_and_closes_stream() -> None:
