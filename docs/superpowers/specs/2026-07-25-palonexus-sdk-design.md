@@ -797,6 +797,25 @@ mechanism.
   prove no mutation occurs, and identify an executable outside that
   environment as the remedy.
 
+#### Registration convergence retires stale descriptor continuations
+
+- **Failure mode:** Agent registration succeeds for the current descriptor, but
+  a locally retained authority-request continuation names an older descriptor.
+  The next authority command fails before it can create the current request.
+- **Boundary:** The tenant service owns the confirmed registration while the CLI
+  owns descriptor-bound continuation state used to resume an exact request.
+- **Rule:** After exact registration or reconciliation succeeds, remove a
+  well-formed local authority continuation only when its descriptor digest differs
+  from the confirmed registration. Preserve a matching continuation so retries
+  remain exact, and preserve malformed or incomplete state so corruption still
+  fails closed instead of manufacturing a replacement request.
+- **Review question:** When registration changes or recovers local agent state,
+  which persisted continuations are bound to the prior descriptor, and which
+  matching continuations must remain restart-safe?
+- **Regression proof:** Seed a well-formed request for another descriptor, recover
+  the current server registration, and prove both request fields are removed.
+  Seed the current descriptor and prove the same fields remain byte-for-byte.
+
 ### Credential storage
 
 - macOS uses Keychain.
