@@ -22,6 +22,7 @@ from packaging.version import InvalidVersion, Version
 from palonexus.developer.client import (
     DeveloperClient,
     DeveloperClientError,
+    ProtocolError,
     RequestRejected,
     _origin,
     _registration_authority_profile,
@@ -811,6 +812,7 @@ def agents_register(args: Namespace) -> int:
         result, recovered = _register_with_recovery(
             client, session, agent, descriptor, cli_version
         )
+        _retire_stale_ceiling_request(agent, str(result["descriptor_digest"]))
         agent["agent_id"] = str(result["agent_id"])
         agent["agent_generation"] = str(result["generation"])
         agent["registered_descriptor_digest"] = str(result["descriptor_digest"])
@@ -883,6 +885,23 @@ def register_agent(args: Namespace) -> int:
             f"{descriptor['name']!r}"
         )
     return agents_register(args)
+
+
+def _retire_stale_ceiling_request(
+    agent: dict[str, str], registered_descriptor_digest: str
+) -> None:
+    request_id = agent.get("ceiling_request_id")
+    encoded_body = agent.get("ceiling_request_body")
+    if request_id is None or encoded_body is None:
+        return
+    try:
+        body = decode_strict_json(encoded_body.encode("utf-8"), _CEILING_BODY_FIELDS)
+    except ProtocolError:
+        return
+    if body.get("descriptorDigest") == registered_descriptor_digest:
+        return
+    agent.pop("ceiling_request_id", None)
+    agent.pop("ceiling_request_body", None)
 
 
 def _new_ceiling_request(

@@ -2452,7 +2452,21 @@ def test_agents_register_recovers_an_exact_server_commit_and_saves_local_state(
         "membership_id": "member-1",
         "owner_subject": "okta:tenant-a:robin-singh",
     }
-    agent = {"private_key": "local-secret"}
+    agent = {
+        "private_key": "local-secret",
+        "ceiling_request_id": "stale-request",
+        "ceiling_request_body": json.dumps(
+            {
+                "schemaVersion": "palonexus.ceiling-request/v1",
+                "agentGeneration": 1,
+                "descriptorDigest": "c" * 64,
+                "expiresAt": "2026-08-22T00:00:00Z",
+                "rules": [],
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+    }
     descriptor: dict[str, object] = {
         "name": "release-risk-reviewer",
         "descriptor_digest": "a" * 64,
@@ -2504,10 +2518,37 @@ def test_agents_register_recovers_an_exact_server_commit_and_saves_local_state(
     assert (
         saved["agent:release-risk-reviewer"]["registered_descriptor_digest"] == "a" * 64
     )
+    assert "ceiling_request_id" not in saved["agent:release-risk-reviewer"]
+    assert "ceiling_request_body" not in saved["agent:release-risk-reviewer"]
     captured = capsys.readouterr()
     assert "already completed" in captured.err
     assert json.loads(captured.out) == response
     assert "local-secret" not in captured.out + captured.err
+
+
+def test_registration_preserves_an_exact_authority_request_continuation() -> None:
+    body = json.dumps(
+        {
+            "schemaVersion": "palonexus.ceiling-request/v1",
+            "agentGeneration": 1,
+            "descriptorDigest": "a" * 64,
+            "expiresAt": "2026-08-22T00:00:00Z",
+            "rules": [],
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    agent = {
+        "ceiling_request_id": "current-request",
+        "ceiling_request_body": body,
+    }
+
+    cli_commands._retire_stale_ceiling_request(agent, "a" * 64)
+
+    assert agent == {
+        "ceiling_request_id": "current-request",
+        "ceiling_request_body": body,
+    }
 
 
 def test_agents_register_preserves_the_original_error_when_reconciliation_fails(
