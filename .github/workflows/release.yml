@@ -202,31 +202,28 @@ jobs:
           mkdir -m 700 "$HOME" "$UV_TOOL_DIR" "$UV_TOOL_BIN_DIR" "$UV_CACHE_DIR"
 
           if [ "$EVENT" = "workflow_dispatch" ] && [ "$TARGET" = "testpypi" ]; then
-            package_json="https://test.pypi.org/pypi/palonexus/${EXPECTED_VERSION}/json"
             export UV_INDEX="https://test.pypi.org/simple"
             export UV_DEFAULT_INDEX="https://pypi.org/simple"
           else
-            package_json="https://pypi.org/pypi/palonexus/${EXPECTED_VERSION}/json"
             unset UV_INDEX
             export UV_DEFAULT_INDEX="https://pypi.org/simple"
           fi
 
-          available=0
+          installed=0
           for attempt in 1 2 3 4 5 6; do
-            if curl --fail --silent --show-error --max-time 20 "$package_json" >/dev/null; then
-              available=1
+            if uv tool install --no-config --index-strategy first-index \
+              "palonexus==${EXPECTED_VERSION}"; then
+              installed=1
               break
             fi
             sleep $((attempt * 5))
           done
-          [ "$available" -eq 1 ] || {
-            printf 'published version %s is not visible at %s\n' \
-              "$EXPECTED_VERSION" "$package_json" >&2
+          [ "$installed" -eq 1 ] || {
+            printf 'published version %s could not be installed from the configured index\n' \
+              "$EXPECTED_VERSION" >&2
             exit 1
           }
 
-          uv tool install --no-config --index-strategy first-index \
-            "palonexus==${EXPECTED_VERSION}"
           python scripts/verify_published_developer_workflow.py \
             --expected-version "$EXPECTED_VERSION" \
             --expected-revision "$EXPECTED_REVISION" \

@@ -195,7 +195,6 @@ def test_release_verifies_fresh_exact_install_after_publish() -> None:
         "UV_TOOL_BIN_DIR=",
         "UV_CACHE_DIR=",
         "UV_NO_CONFIG=1",
-        "/pypi/palonexus/${EXPECTED_VERSION}/json",
         "uv tool install",
         "--no-config",
         "--index-strategy first-index",
@@ -205,6 +204,9 @@ def test_release_verifies_fresh_exact_install_after_publish() -> None:
         assert required in run
     assert "https://test.pypi.org/simple" in run
     assert "https://pypi.org/simple" in run
+    assert "if uv tool install" in run
+    assert "published version %s could not be installed" in run
+    assert "/pypi/palonexus/${EXPECTED_VERSION}/json" not in run
 
 
 @pytest.mark.parametrize(
