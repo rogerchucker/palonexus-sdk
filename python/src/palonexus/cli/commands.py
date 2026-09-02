@@ -36,6 +36,11 @@ from palonexus.developer.credentials import (
     CredentialStore,
     CredentialStoreUnavailable,
 )
+from palonexus.developer.evidence import (
+    build_preexchange_evidence,
+    build_runtime_attestation,
+    ensure_runtime_evidence_credential,
+)
 from palonexus.developer.runner import Runner
 from palonexus.developer.scaffold import (
     ScaffoldError,
@@ -1060,6 +1065,23 @@ def _strict_input(path: Path) -> tuple[dict[str, Any], str]:
     return value, hashlib.sha256(canonical_json(value)).hexdigest()
 
 
+def _require_runtime_evidence_expiry(value: object) -> str:
+    if not isinstance(value, str) or not value:
+        raise CommandError("runtime lease is missing its evidence expiry")
+    try:
+        expires = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    except ValueError as error:
+        raise CommandError("runtime lease has an invalid evidence expiry") from error
+    if expires.tzinfo is None or expires <= datetime.now(UTC):
+        raise CommandError("runtime lease has an invalid evidence expiry")
+    return (
+        expires.astimezone(UTC)
+        .replace(microsecond=0)
+        .isoformat()
+        .replace("+00:00", "Z")
+    )
+
+
 def _strict_json_pairs(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
     value: dict[str, Any] = {}
     for key, item in pairs:
@@ -1077,6 +1099,9 @@ def run_agent(args: Namespace) -> int:
     try:
         if guard is None:
             guard = generate_agent_credential()
+        evidence_guard = ensure_runtime_evidence_credential(guard)
+        if evidence_guard != guard:
+            guard = evidence_guard
             store.save("guard:" + str(descriptor["name"]), guard)
         artifact = "sha256:" + descriptor["descriptor_digest"]
         # Enrollment proofs are one-time. Each process start creates a fresh
@@ -1094,6 +1119,29 @@ def run_agent(args: Namespace) -> int:
             guard_version="pnxs/0.1.0",
         )
         runtime = client.redeem_runtime(session, agent, enrollment)
+        registration_profile = _project_registration_profile()
+        created_at = (
+            datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
+        )
+        expires_at = _require_runtime_evidence_expiry(runtime.get("expires_at"))
+        attestation = build_runtime_attestation(
+            tenant_id=str(session["tenant_id"]),
+            agent_id=str(agent["agent_id"]),
+            runtime_id=str(runtime["runtime_id"]),
+            descriptor_digest=str(descriptor["descriptor_digest"]),
+            runtime_profile=registration_profile["runtime_profile"],
+            guard=guard,
+            created_at=created_at,
+            expires_at=expires_at,
+        )
+        client.submit_runtime_attestation(
+            session,
+            agent,
+            guard,
+            runtime,
+            attestation,
+            idempotency_key=str(uuid.uuid4()),
+        )
         run_key = str(uuid.uuid4())
         run = client.create_developer_run(
             session,
@@ -1104,6 +1152,7 @@ def run_agent(args: Namespace) -> int:
             idempotency_key=run_key,
         )
         persisted: dict[str, Any] = {}
+        preexchange_batch: dict[str, Any] = {}
         persisted_spawn: dict[str, Any] = {}
         spawn_runtime = (
             _subagent_runtime(
@@ -1184,6 +1233,34 @@ def run_agent(args: Namespace) -> int:
                     descriptor, envelope["action"], envelope["resource"]
                 )
                 try:
+                    if not preexchange_batch:
+                        occurred_at = (
+                            datetime.now(UTC)
+                            .replace(microsecond=0)
+                            .isoformat()
+                            .replace("+00:00", "Z")
+                        )
+                        preexchange_batch.update(
+                            build_preexchange_evidence(
+                                attestation=attestation,
+                                guard=guard,
+                                run_id=str(run["runId"]),
+                                root_action_id=str(run["rootId"]),
+                                action=str(envelope["action"]),
+                                resource=str(envelope["resource"]),
+                                payload=envelope["payload"],
+                                descriptor_digest=str(descriptor["descriptor_digest"]),
+                                occurred_at=occurred_at,
+                            )
+                        )
+                    client.submit_runtime_evidence(
+                        session,
+                        agent,
+                        guard,
+                        runtime,
+                        preexchange_batch,
+                        idempotency_key=str(preexchange_batch["idempotencyKey"]),
+                    )
                     action = client.create_developer_action(
                         session,
                         agent,

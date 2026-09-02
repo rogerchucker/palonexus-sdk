@@ -1842,6 +1842,115 @@ class DeveloperClient:
             },
         )
 
+    def submit_runtime_attestation(
+        self,
+        session: dict[str, Any],
+        agent: dict[str, Any],
+        guard: dict[str, Any],
+        runtime: dict[str, Any],
+        attestation: dict[str, Any],
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        path = "/v1/developer/runtime-attestations"
+        body = canonical_json(attestation)
+        proof = self.mounted_proof(
+            _decode_private_key(guard.get("private_key")),
+            mode="runtime_proof",
+            tenant_id=_require_string(session.get("tenant_id"), "tenant ID"),
+            agent_id=_require_string(agent.get("agent_id"), "agent ID"),
+            agent_generation=_require_positive_int(
+                int(agent.get("agent_generation", "0")), "agent generation"
+            ),
+            method="POST",
+            path=path,
+            body=body,
+            runtime_id=_require_string(runtime.get("runtime_id"), "runtime ID"),
+        )
+        response = self._request(
+            "POST",
+            path,
+            body=body,
+            headers={
+                "X-Palonexus-Developer-Proof": proof,
+                "Idempotency-Key": idempotency_key,
+            },
+            expected={200, 201},
+            allowed_fields={
+                "attestationId",
+                "runtimeSessionId",
+                "manifestHash",
+                "verificationState",
+                "duplicate",
+            },
+        )
+        if (
+            response.get("attestationId") != attestation.get("attestationId")
+            or response.get("runtimeSessionId") != runtime.get("runtime_id")
+            or response.get("manifestHash") != attestation.get("manifestHash")
+            or response.get("verificationState") != "verified"
+            or type(response.get("duplicate")) is not bool
+        ):
+            raise ProtocolError("runtime attestation acknowledgement is not bound")
+        return response
+
+    def submit_runtime_evidence(
+        self,
+        session: dict[str, Any],
+        agent: dict[str, Any],
+        guard: dict[str, Any],
+        runtime: dict[str, Any],
+        batch: dict[str, Any],
+        *,
+        idempotency_key: str,
+    ) -> dict[str, Any]:
+        path = "/v1/developer/runtime-evidence"
+        body = canonical_json(batch)
+        proof = self.mounted_proof(
+            _decode_private_key(guard.get("private_key")),
+            mode="runtime_proof",
+            tenant_id=_require_string(session.get("tenant_id"), "tenant ID"),
+            agent_id=_require_string(agent.get("agent_id"), "agent ID"),
+            agent_generation=_require_positive_int(
+                int(agent.get("agent_generation", "0")), "agent generation"
+            ),
+            method="POST",
+            path=path,
+            body=body,
+            runtime_id=_require_string(runtime.get("runtime_id"), "runtime ID"),
+        )
+        response = self._request(
+            "POST",
+            path,
+            body=body,
+            headers={
+                "X-Palonexus-Developer-Proof": proof,
+                "Idempotency-Key": idempotency_key,
+            },
+            expected={200, 201},
+            allowed_fields={
+                "batchId",
+                "receiptCount",
+                "finalReceiptHash",
+                "achievedLevel",
+                "deliveryState",
+                "duplicate",
+            },
+        )
+        receipts = batch.get("receipts")
+        if (
+            not isinstance(receipts, list)
+            or not receipts
+            or response.get("batchId") != batch.get("batchId")
+            or response.get("receiptCount") != len(receipts)
+            or response.get("finalReceiptHash") != receipts[-1].get("receiptHash")
+            or type(response.get("duplicate")) is not bool
+            or not isinstance(response.get("achievedLevel"), str)
+            or not isinstance(response.get("deliveryState"), str)
+        ):
+            raise ProtocolError("runtime evidence acknowledgement is not bound")
+        return response
+
     def create_developer_run(
         self,
         session: dict[str, Any],
