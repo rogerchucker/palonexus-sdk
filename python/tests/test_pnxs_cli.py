@@ -470,6 +470,7 @@ expires_at: "2030-08-01T00:00:00Z"
 
     class API(BaseHTTPRequestHandler):
         enrollments = []
+        runtime_guard_key_ids = []
         action_count = 0
         attestation_count = 0
         evidence_count = 0
@@ -508,6 +509,17 @@ expires_at: "2030-08-01T00:00:00Z"
             elif self.path == "/v1/developer/runtime-attestations":
                 API.attestation_count += 1
                 value = json.loads(body)
+                guard_key_id = value["manifest"]["guardWorkloadKey"]["keyId"]
+                if guard_key_id in API.runtime_guard_key_ids:
+                    self._json(
+                        {
+                            "code": "developer_runtime_evidence_invalid",
+                            "message": "runtime guard key is already bound",
+                        },
+                        422,
+                    )
+                    return
+                API.runtime_guard_key_ids.append(guard_key_id)
                 self._json(
                     {
                         "attestationId": value["attestationId"],
@@ -670,6 +682,7 @@ expires_at: "2030-08-01T00:00:00Z"
         and API.enrollments[0][1] != API.enrollments[1][1]
     )
     assert API.attestation_count == 2
+    assert len(set(API.runtime_guard_key_ids)) == 2
     assert API.evidence_count == 2
     wait = subprocess.run(
         [
@@ -734,6 +747,68 @@ expires_at: "2030-08-01T00:00:00Z"
         "run_id": "run-1",
         "status": "completed",
     }
+
+
+def test_subagent_resume_uses_the_original_runtime_scoped_guard(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    runtime_guard = {"private_key": "runtime-a-key"}
+    values = {
+        "subagent:spawn-1": {
+            "schemaVersion": "palonexus.local-subagent-continuation/v1",
+            "run_json": '{"runId":"run-a"}',
+            "runtime_json": '{"runtime_id":"runtime-a"}',
+            "agent": "demo",
+            "descriptor_digest": "a" * 64,
+            "project": str(tmp_path),
+            "spawn_request_id": "spawn-1",
+            "description": "Check the denied parent action",
+            "subagent_type": "evidence-checker",
+            "parent_action_id": "parent-denied",
+        },
+        "runtime-guard:runtime-a": runtime_guard,
+        "guard:demo": {"private_key": "newer-unrelated-key"},
+    }
+    loaded: list[str] = []
+
+    class Store:
+        def load(self, name: str) -> dict[str, object] | None:
+            loaded.append(name)
+            return values.get(name)
+
+    class Governed:
+        def request(self, **kwargs: object) -> dict[str, str]:
+            assert kwargs["parent_action_id"] == "parent-denied"
+            return {"status": "active", "spawn_request_id": "spawn-1"}
+
+    def governed_runtime(**kwargs: object) -> Governed:
+        assert kwargs["guard"] is runtime_guard
+        return Governed()
+
+    monkeypatch.setattr(
+        cli_commands,
+        "_project_client",
+        lambda _args: (
+            object(),
+            Store(),
+            {},
+            {},
+            {"name": "demo", "descriptor_digest": "a" * 64},
+            "agent:demo",
+        ),
+    )
+    monkeypatch.setattr(cli_commands, "_subagent_runtime", governed_runtime)
+
+    assert main(["subagents", "resume", "spawn-1", "--json"]) == 0
+    assert json.loads(capsys.readouterr().out) == {
+        "run_id": "run-a",
+        "spawn_request_id": "spawn-1",
+        "status": "active",
+    }
+    assert loaded == ["subagent:spawn-1", "runtime-guard:runtime-a"]
 
 
 def test_strict_json_rejects_duplicate_unknown_and_oversized_documents() -> None:

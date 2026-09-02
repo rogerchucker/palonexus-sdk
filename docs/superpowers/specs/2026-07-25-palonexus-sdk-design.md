@@ -259,6 +259,22 @@ unverified host assumption.
   fields through both the create and read client methods, then run the published
   package against the deployed workflow.
 
+### Runtime-scoped guard custody
+
+- **Failure mode:** reusing one runtime-guard signing key across separate
+  runtime leases conflicts with the verifier's tenant, agent, and runtime-session
+  binding and causes every later attestation to fail closed.
+- **Boundary:** each `pnxs run` creates a fresh runtime guard credential and
+  persists it under the redeemed runtime-session identifier. The registered
+  agent key remains stable and authorizes each new enrollment.
+- **Continuation rule:** restart-safe subagent state resolves the guard by its
+  recorded runtime session, so concurrent pending runs never overwrite one
+  another's signing custody. A read-only legacy-key fallback supports
+  continuations created by older SDK versions.
+- **Proof:** execute two independent guarded runs for the same registered agent
+  against a verifier that rejects a repeated guard key ID, then resume the first
+  run after the second has started.
+
 ### Action request
 
 An action request identifies an immutable proposed effect. It carries no bearer

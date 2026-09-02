@@ -1095,14 +1095,11 @@ def run_agent(args: Namespace) -> int:
     client, store, session, agent, descriptor, _credential_name = _project_client(args)
     _require_locally_active_agent(agent)
     input_value, input_digest = _strict_input(Path(args.input))
-    guard = store.load("guard:" + str(descriptor["name"]))
     try:
-        if guard is None:
-            guard = generate_agent_credential()
-        evidence_guard = ensure_runtime_evidence_credential(guard)
-        if evidence_guard != guard:
-            guard = evidence_guard
-            store.save("guard:" + str(descriptor["name"]), guard)
+        # A runtime guard key is scoped to one runtime session. Reusing the
+        # key would let evidence from separate leases share one verifier
+        # binding and is therefore rejected by the Agent IdP.
+        guard = ensure_runtime_evidence_credential(generate_agent_credential())
         artifact = "sha256:" + descriptor["descriptor_digest"]
         # Enrollment proofs are one-time. Each process start creates a fresh
         # enrollment/runtime instance rather than retaining a consumed key.
@@ -1119,6 +1116,7 @@ def run_agent(args: Namespace) -> int:
             guard_version="pnxs/0.1.0",
         )
         runtime = client.redeem_runtime(session, agent, enrollment)
+        store.save("runtime-guard:" + str(runtime["runtime_id"]), guard)
         registration_profile = _project_registration_profile()
         created_at = (
             datetime.now(UTC).replace(microsecond=0).isoformat().replace("+00:00", "Z")
@@ -1532,7 +1530,11 @@ def subagents_resume(args: Namespace) -> int:
         runtime = json.loads(reference["runtime_json"])
         if not isinstance(run, dict) or not isinstance(runtime, dict):
             raise ValueError("invalid continuation")
-        guard = store.load("guard:" + str(descriptor["name"]))
+        guard = store.load("runtime-guard:" + str(runtime.get("runtime_id", "")))
+        if guard is None:
+            # Read-only compatibility for continuations created before
+            # runtime-scoped guard custody was introduced.
+            guard = store.load("guard:" + str(descriptor["name"]))
         if guard is None:
             raise ValueError("missing runtime guard")
         governed = _subagent_runtime(
