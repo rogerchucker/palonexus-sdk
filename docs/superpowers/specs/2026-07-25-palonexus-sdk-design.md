@@ -275,6 +275,29 @@ unverified host assumption.
   against a verifier that rejects a repeated guard key ID, then resume the first
   run after the second has started.
 
+### Detached continuations commit on the CLI coordination thread
+
+- **Failure mode:** the cloud commits a pending action or spawn request, but the
+  local guard worker cannot write its restart-safe continuation to an OS
+  credential store. The worker masks the custody failure as an action-contract
+  rejection, so the CLI reports a failed child process and cannot resume the
+  valid server record.
+- **Boundary:** the guard worker owns canonical action exchange; the CLI
+  coordination thread owns local credential custody and the final detached
+  success response.
+- **Rule:** for a detached action or spawn, the worker returns the immutable
+  server identifier and prepares only secret-free continuation data. The CLI
+  coordination thread must commit that continuation before it prints success.
+  A custody failure remains a failed detach and must not be relabeled as a
+  malformed action contract.
+- **Review prompt:** after the server commits a resumable record, which thread
+  owns its local continuation write, and can the CLI prove that write completed
+  before reporting the pending identifier?
+- **Proof:** use a credential-store adapter that rejects non-coordinator-thread
+  writes, create a detached pending action, and require a successful CLI result
+  with a loadable continuation. Repeat the deployed action and subagent resume
+  flows using the exact published package.
+
 ### Action request
 
 An action request identifies an immutable proposed effect. It carries no bearer

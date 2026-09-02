@@ -1152,6 +1152,8 @@ def run_agent(args: Namespace) -> int:
         persisted: dict[str, Any] = {}
         preexchange_batch: dict[str, Any] = {}
         persisted_spawn: dict[str, Any] = {}
+        action_continuation: dict[str, str] = {}
+        spawn_continuation: dict[str, str] = {}
         spawn_runtime = (
             _subagent_runtime(
                 client=client,
@@ -1205,8 +1207,7 @@ def run_agent(args: Namespace) -> int:
                 if outcome["status"] == "spawn_approval_required":
                     request_id = outcome["spawn_request_id"]
                     persisted_spawn.update(outcome)
-                    store.save(
-                        "subagent:" + request_id,
+                    spawn_continuation.update(
                         {
                             "schemaVersion": "palonexus.local-subagent-continuation/v1",
                             "run_json": json.dumps(
@@ -1222,8 +1223,10 @@ def run_agent(args: Namespace) -> int:
                             "description": payload["description"],
                             "subagent_type": subagent_type,
                             "parent_action_id": payload["parent_action_id"],
-                        },
+                        }
                     )
+                    if not args.detach:
+                        store.save("subagent:" + request_id, spawn_continuation)
                     return {"status": "spawn_pending", "spawn_request_id": request_id}
                 return {"status": "spawn_result", "result": outcome}
             if not persisted:
@@ -1278,8 +1281,7 @@ def run_agent(args: Namespace) -> int:
                         "reason": error.reason_code,
                     }
                 persisted.update(action)
-                store.save(
-                    "action:" + persisted["actionId"],
+                action_continuation.update(
                     {
                         "schemaVersion": "palonexus.local-action-continuation/v1",
                         "run_id": run["runId"],
@@ -1295,8 +1297,10 @@ def run_agent(args: Namespace) -> int:
                         "envelope_json": json.dumps(
                             envelope, sort_keys=True, separators=(",", ":")
                         ),
-                    },
+                    }
                 )
+                if not args.detach:
+                    store.save("action:" + persisted["actionId"], action_continuation)
             if args.detach:
                 return {"status": "pending", "action_id": persisted["actionId"]}
             while True:
@@ -1332,26 +1336,38 @@ def run_agent(args: Namespace) -> int:
         )
         if args.detach:
             if result.pending_spawn_request_id is not None:
+                spawn_request_id = result.pending_spawn_request_id
                 if (
                     not persisted_spawn
-                    or result.pending_spawn_request_id
-                    != persisted_spawn["spawn_request_id"]
+                    or spawn_request_id != persisted_spawn["spawn_request_id"]
+                    or not spawn_continuation
                 ):
                     raise RuntimeError("detached spawn was not durably persisted")
+                store.save(
+                    "subagent:" + spawn_request_id,
+                    spawn_continuation,
+                )
                 _print_json(
                     {
                         "run_id": run["runId"],
-                        "spawn_request_id": result.pending_spawn_request_id,
+                        "spawn_request_id": spawn_request_id,
                         "status": "pending",
                     }
                 )
                 return 0
-            if not persisted or result.pending_action_id != persisted["actionId"]:
+            action_id = result.pending_action_id
+            if (
+                action_id is None
+                or not persisted
+                or action_id != persisted["actionId"]
+                or not action_continuation
+            ):
                 raise RuntimeError("detached action was not durably persisted")
+            store.save("action:" + action_id, action_continuation)
             _print_json(
                 {
                     "run_id": run["runId"],
-                    "action_id": result.pending_action_id,
+                    "action_id": action_id,
                     "status": "pending",
                 }
             )
