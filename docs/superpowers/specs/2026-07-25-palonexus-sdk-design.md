@@ -243,6 +243,22 @@ If a host cannot satisfy these conditions, that tool family is excluded from
 the supported coverage matrix. The plugin architecture is not frozen around an
 unverified host assumption.
 
+### Shipped response contract parity
+
+- **Failure mode:** a server can return a newly required, integrity-bearing
+  field while a strict SDK decoder still rejects that field as unknown.
+- **Boundary:** the public producer response and every strict SDK decoder for
+  that response must change in the same release train.
+- **Rule:** when a workflow starts producing mandatory evidence, its create and
+  read response field sets must share one SDK contract and include the complete
+  shipped producer projection. Strict decoding remains fail-closed for fields
+  outside that projection.
+- **Review prompt:** does every strict consumer accept the exact success shape
+  emitted by the deployed producer at each create, poll, and resume seam?
+- **Proof:** replay a producer-shaped response containing the new evidence
+  fields through both the create and read client methods, then run the published
+  package against the deployed workflow.
+
 ### Action request
 
 An action request identifies an immutable proposed effect. It carries no bearer
