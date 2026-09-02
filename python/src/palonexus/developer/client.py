@@ -72,12 +72,16 @@ _DEVELOPER_RECEIPT_GATEWAY_FIELDS = _DEVELOPER_RECEIPT_COMMON_FIELDS | {
 }
 _DEVELOPER_DELIVERY_FIELDS = {
     "state",
+    "receiptRecoveryRequired",
     "attempts",
     "claimedBy",
     "claimToken",
     "claimedAt",
     "claimUntil",
     "capabilityId",
+    "issuanceId",
+    "credentialMode",
+    "credentialExpiresAt",
     "deliveredAt",
 }
 _DEVELOPER_DELIVERY_STATES = {
@@ -469,10 +473,24 @@ def _validate_developer_action_response(response: dict[str, Any]) -> None:
     attempts = delivery.get("attempts")
     if attempts is not None and (type(attempts) is not int or not 0 <= attempts <= 3):
         raise ProtocolError("developer action has invalid delivery attempts")
-    for field in ("claimedBy", "claimToken"):
+    recovery_required = delivery.get("receiptRecoveryRequired")
+    if recovery_required is not None and type(recovery_required) is not bool:
+        raise ProtocolError("developer action has invalid receipt recovery state")
+    for field in ("claimedBy", "claimToken", "issuanceId"):
         if field in delivery and len(_require_string(delivery.get(field), field)) > 256:
             raise ProtocolError(f"invalid {field}")
-    for field in ("claimedAt", "claimUntil", "deliveredAt"):
+    credential_mode = delivery.get("credentialMode")
+    if credential_mode is not None and credential_mode not in {
+        "mutation",
+        "receipt_recovery",
+    }:
+        raise ProtocolError("developer action has invalid credential mode")
+    for field in (
+        "claimedAt",
+        "claimUntil",
+        "credentialExpiresAt",
+        "deliveredAt",
+    ):
         if field in delivery:
             _require_timestamp(delivery.get(field), field)
     delivery_capability_id = delivery.get("capabilityId")
@@ -1009,7 +1027,16 @@ def _validate_ceiling_response(
     _require_timestamp(response.get("expiresAt"), "expiresAt")
     _require_timestamp(response.get("createdAt"), "createdAt")
     status = response.get("status")
-    if status not in {"pending", "approved", "denied", "expired"}:
+    if status not in {
+        "pending",
+        "approved",
+        "denied",
+        "expired",
+        "suspended",
+        "revoked",
+        "superseded",
+        "stale",
+    }:
         raise ProtocolError("ceiling response has an invalid status")
     requested_rules = response.get("requestedRules")
     if not isinstance(requested_rules, list) or not requested_rules:
@@ -1052,13 +1079,13 @@ def _validate_ceiling_response(
             raise ProtocolError("ceiling response has invalid target mapping hash")
         if "endpoint" in target:
             _require_string(target.get("endpoint"), "endpoint")
-    if status == "pending" and "decision" in response:
-        raise ProtocolError("pending ceiling response unexpectedly has a decision")
-    if status in {"approved", "denied"}:
+    if status in {"pending", "stale"} and "decision" in response:
+        raise ProtocolError("undecided ceiling response unexpectedly has a decision")
+    if status in {"approved", "denied", "suspended", "revoked", "superseded"}:
         decision = response.get("decision")
         if not isinstance(decision, dict) or set(decision) != _DECISION_FIELDS:
             raise ProtocolError("terminal ceiling response has an invalid decision")
-        expected_decision = "approve" if status == "approved" else "deny"
+        expected_decision = "deny" if status == "denied" else "approve"
         if (
             decision.get("decision") != expected_decision
             or decision.get("expectedVersion") != response["version"]
@@ -1130,7 +1157,7 @@ class DeveloperClient:
         *,
         tenant_hint: str | None = None,
         transport: httpx.BaseTransport | None = None,
-        timeout: float = 10.0,
+        timeout: float = 30.0,
     ) -> None:
         self.origin = _origin(auth_url)
         if tenant_hint is not None and (
@@ -1156,34 +1183,46 @@ class DeveloperClient:
         headers: dict[str, str] | None = None,
         expected: int | set[int] = 200,
         allowed_fields: set[str],
+        retry_transient: bool = False,
     ) -> dict[str, Any]:
         request_headers = {"Accept": "application/json"}
         if body is not None:
             request_headers["Content-Type"] = "application/json"
         if headers:
             request_headers.update(headers)
-        try:
-            with self.http.stream(
-                method, path, content=body, headers=request_headers
-            ) as response:
-                expected_codes = {expected} if isinstance(expected, int) else expected
-                chunks: list[bytes] = []
-                received = 0
-                for chunk in response.iter_bytes(chunk_size=MAX_RESPONSE_BYTES + 1):
-                    remaining = MAX_RESPONSE_BYTES + 1 - received
-                    chunks.append(chunk[:remaining])
-                    received += min(len(chunk), remaining)
-                    if received > MAX_RESPONSE_BYTES:
-                        raise ProtocolError("response is too large")
-                raw = b"".join(chunks)
-                if response.status_code not in expected_codes:
-                    _raise_closed_command_outcome(response, raw)
-        except (DeveloperClientError, ProtocolError):
-            raise
-        except httpx.HTTPError:
-            raise DeveloperClientError(
-                "developer authorization service unavailable"
-            ) from None
+        expected_codes = {expected} if isinstance(expected, int) else expected
+        raw = b""
+        for attempt in range(2 if retry_transient else 1):
+            try:
+                with self.http.stream(
+                    method, path, content=body, headers=request_headers
+                ) as response:
+                    chunks: list[bytes] = []
+                    received = 0
+                    for chunk in response.iter_bytes(chunk_size=MAX_RESPONSE_BYTES + 1):
+                        remaining = MAX_RESPONSE_BYTES + 1 - received
+                        chunks.append(chunk[:remaining])
+                        received += min(len(chunk), remaining)
+                        if received > MAX_RESPONSE_BYTES:
+                            raise ProtocolError("response is too large")
+                    raw = b"".join(chunks)
+                    if response.status_code not in expected_codes:
+                        if (
+                            retry_transient
+                            and attempt == 0
+                            and response.status_code in {502, 503, 504}
+                        ):
+                            continue
+                        _raise_closed_command_outcome(response, raw)
+            except (DeveloperClientError, ProtocolError):
+                raise
+            except httpx.HTTPError:
+                if retry_transient and attempt == 0:
+                    continue
+                raise DeveloperClientError(
+                    "developer authorization service unavailable"
+                ) from None
+            break
         return decode_strict_json(raw, allowed_fields)
 
     def login(
@@ -1928,6 +1967,7 @@ class DeveloperClient:
                 "Idempotency-Key": idempotency_key,
             },
             expected={200, 201},
+            retry_transient=True,
             allowed_fields={
                 "attestationId",
                 "runtimeSessionId",
@@ -2038,6 +2078,7 @@ class DeveloperClient:
             body=body,
             headers={"X-Palonexus-Developer-Proof": proof},
             expected={200, 201},
+            retry_transient=True,
             allowed_fields={
                 "schemaVersion",
                 "tenantId",
@@ -2109,6 +2150,7 @@ class DeveloperClient:
             body=body,
             headers={"X-Palonexus-Developer-Proof": proof},
             expected={200, 201},
+            retry_transient=True,
             allowed_fields=_DEVELOPER_ACTION_FIELDS,
         )
         _validate_developer_action_response(response)
@@ -2172,6 +2214,7 @@ class DeveloperClient:
                 "Idempotency-Key": idempotency_key,
             },
             expected={200, 201, 202},
+            retry_transient=True,
             allowed_fields=_SUBAGENT_STATUS_FIELDS,
         )
         return _validate_subagent_status(
