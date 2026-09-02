@@ -972,6 +972,34 @@ def test_http_errors_are_secret_free_and_streaming_response_is_closed() -> None:
     assert stream.closed
 
 
+@pytest.mark.parametrize("failure", ["gateway", "transport"])
+def test_idempotent_http_request_retries_one_transient_failure(failure: str) -> None:
+    attempts = 0
+
+    def handler(_: httpx.Request) -> httpx.Response:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            if failure == "gateway":
+                return httpx.Response(502, json={"error": "upstream timeout"})
+            raise httpx.ReadTimeout("upstream timed out")
+        return httpx.Response(200, json={"status": "recovered"})
+
+    client = DeveloperClient(
+        "https://auth.example", transport=httpx.MockTransport(handler)
+    )
+
+    assert client._request(
+        "POST",
+        "/idempotent",
+        body=b"{}",
+        expected=200,
+        allowed_fields={"status"},
+        retry_transient=True,
+    ) == {"status": "recovered"}
+    assert attempts == 2
+
+
 def test_device_proof_matches_independent_fixed_vector() -> None:
     seed = bytes.fromhex(
         "000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f"
@@ -1042,6 +1070,15 @@ def test_device_login_rejects_verification_url_not_exactly_bound_to_user_code(
 def test_developer_client_normalizes_its_exact_https_origin() -> None:
     client = DeveloperClient("https://AUTH.EXAMPLE:443/")
     assert client.origin == "https://auth.example"
+
+
+def test_developer_client_default_timeout_outlives_authority_bridge_budget() -> None:
+    client = DeveloperClient("https://auth.example")
+
+    assert client.http.timeout.connect > 25
+    assert client.http.timeout.read > 25
+    assert client.http.timeout.write > 25
+    assert client.http.timeout.pool > 25
 
 
 def test_device_login_uses_strict_wire_contract_and_keeps_secrets_in_custody(
@@ -3395,6 +3432,61 @@ def test_ceiling_status_rejects_malformed_resolved_rule_or_decision() -> None:
             client.agent_status(session, "release-risk-reviewer", "request-1")
 
 
+@pytest.mark.parametrize("status", ["suspended", "revoked", "superseded"])
+def test_ceiling_status_accepts_approved_lifecycle_states(status: str) -> None:
+    descriptor_digest = "a" * 64
+    response = {
+        **_ceiling_response(descriptor_digest),
+        "status": status,
+        "decision": {
+            "decision": "approve",
+            "expectedVersion": 1,
+            "actor": "member-approver",
+            "reason": "reviewed",
+            "at": "2026-08-12T20:00:00Z",
+        },
+    }
+    client = DeveloperClient(
+        "https://api.palonexus.cloud",
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=response)),
+    )
+
+    assert (
+        client.agent_status(
+            {
+                "session_token": "pnx_dev_session",
+                "tenant_id": "tenant-a",
+                "membership_id": "member-1",
+            },
+            "release-risk-reviewer",
+            "request-1",
+        )["status"]
+        == status
+    )
+
+
+def test_ceiling_status_accepts_stale_without_a_terminal_decision() -> None:
+    descriptor_digest = "a" * 64
+    response = {**_ceiling_response(descriptor_digest), "status": "stale"}
+    client = DeveloperClient(
+        "https://api.palonexus.cloud",
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=response)),
+    )
+
+    assert (
+        client.agent_status(
+            {
+                "session_token": "pnx_dev_session",
+                "tenant_id": "tenant-a",
+                "membership_id": "member-1",
+            },
+            "release-risk-reviewer",
+            "request-1",
+        )["status"]
+        == "stale"
+    )
+
+
 def test_developer_action_payload_and_strict_lifecycle_records() -> None:
     seen: list[dict[str, object]] = []
     payload = {"assessment": {"risk": "low", "score": 0.12}}
@@ -3434,7 +3526,10 @@ def test_developer_action_payload_and_strict_lifecycle_records() -> None:
             "version": 2,
         },
         "approval": {"status": "pending"},
-        "delivery": {"state": "not_ready"},
+        "delivery": {
+            "state": "not_ready",
+            "credentialExpiresAt": "0001-01-01T00:00:00Z",
+        },
         "createdAt": "2026-08-12T12:00:00Z",
     }
 
