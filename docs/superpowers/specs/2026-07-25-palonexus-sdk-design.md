@@ -1137,6 +1137,12 @@ Python publishing uses PyPI Trusted Publishing. GitHub releases are built once
 from a signed tag, and publishing jobs promote the tested artifacts rather than
 rebuilding them.
 
+Post-publish verification retries the exact clean install from the configured
+package index. A metadata endpoint is not a readiness proxy for that index:
+eventual propagation can make metadata visible before the resolver can install
+the release. The verification loop therefore succeeds only when the same `uv`
+install operation used by developers succeeds.
+
 Release verification downloads public artifacts into clean environments and
 runs the documented quickstarts. Release notes record protocol version, source
 commit, toolchain versions, supported host versions, known interception gaps,
