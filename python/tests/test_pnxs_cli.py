@@ -64,6 +64,106 @@ def test_r3_example_declares_denied_attempt_without_requesting_its_authority(
     assert descriptor["subagents"][0]["name"] == "evidence-checker"
 
 
+def test_detached_action_persists_continuation_on_the_cli_thread(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    capsys: pytest.CaptureFixture[str],
+) -> None:
+    monkeypatch.chdir(tmp_path)
+    (tmp_path / "agent.py").write_text(
+        "def run(value, context):\n"
+        "    outcome = context.actions.invoke("
+        "'release.assess', 'release:demo', value)\n"
+        "    return outcome.result\n",
+        encoding="utf-8",
+    )
+    (tmp_path / "input.json").write_text("{}", encoding="utf-8")
+    main_thread = threading.get_ident()
+    saved: dict[str, dict[str, str]] = {}
+
+    class Store:
+        def save(self, name: str, value: dict[str, str]) -> None:
+            if threading.get_ident() != main_thread:
+                raise CredentialStoreUnavailable("credential store requires CLI thread")
+            saved[name] = value
+
+    class Client:
+        def create_runtime_enrollment(
+            self, *args: object, **kwargs: object
+        ) -> dict[str, str]:
+            return {"enrollment": "created"}
+
+        def redeem_runtime(self, *args: object, **kwargs: object) -> dict[str, str]:
+            return {
+                "runtime_id": "runtime-a",
+                "expires_at": "2099-01-01T00:00:00Z",
+            }
+
+        def submit_runtime_attestation(self, *args: object, **kwargs: object) -> None:
+            return None
+
+        def create_developer_run(
+            self, *args: object, **kwargs: object
+        ) -> dict[str, str]:
+            return {"runId": "run-a", "rootId": "root-a"}
+
+        def submit_runtime_evidence(self, *args: object, **kwargs: object) -> None:
+            return None
+
+        def create_developer_action(
+            self, *args: object, **kwargs: object
+        ) -> dict[str, str]:
+            return {"actionId": "action-a"}
+
+    descriptor = {
+        "name": "release-agent",
+        "descriptor_digest": "a" * 64,
+        "module": "agent",
+        "symbol": "run",
+        "input_schema": {"type": "object"},
+        "output_schema": {"type": "object"},
+        "actions": [
+            {
+                "action": "release.assess",
+                "resource": "release:demo",
+                "constraints": {},
+            }
+        ],
+        "subagents": [],
+    }
+    monkeypatch.setattr(
+        cli_commands,
+        "_project_client",
+        lambda _args: (
+            Client(),
+            Store(),
+            {"tenant_id": "tenant-a"},
+            {"agent_id": "release-agent", "agent_generation": "1"},
+            descriptor,
+            "agent:tenant-a:release-agent",
+        ),
+    )
+    monkeypatch.setattr(
+        cli_commands,
+        "_project_registration_profile",
+        lambda: {"runtime_profile": {"kind": "plain-python"}},
+    )
+    monkeypatch.setattr(cli_commands, "build_runtime_attestation", lambda **_: {})
+    monkeypatch.setattr(
+        cli_commands,
+        "build_preexchange_evidence",
+        lambda **_: {"idempotencyKey": "evidence-a"},
+    )
+
+    assert main(["run", "agent.py", "--input", "input.json", "--detach", "--json"]) == 0
+    assert saved["action:action-a"]["runtime_lease_id"] == "runtime-a"
+    assert json.loads(capsys.readouterr().out) == {
+        "action_id": "action-a",
+        "run_id": "run-a",
+        "status": "pending",
+    }
+
+
 class _UnavailableProcessKeyring:
     def get_password(self, service: str, username: str) -> None:
         raise RuntimeError("keyring unavailable")
