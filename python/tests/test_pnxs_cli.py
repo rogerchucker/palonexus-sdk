@@ -430,6 +430,19 @@ actions:
     argumentSchema: *output
 """
     (tmp_path / "palonexus-agent.yaml").write_text(descriptor)
+    (tmp_path / "palonexus-registration.yaml").write_text(
+        """schema_version: palonexus.agent-registration-profile/v1
+descriptor_version: palonexus.agent-descriptor/v1
+runtime_profile:
+  id: plain-python
+  version: 1
+  digest: bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb
+composition_digest: cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc
+harness_adapter_contracts: [palonexus.harness-adapter/v1]
+not_before: "2026-08-01T00:00:00Z"
+expires_at: "2030-08-01T00:00:00Z"
+"""
+    )
     (tmp_path / "agent.py").write_text(
         "def review_release(change, context):\n"
         " outcome = context.actions.invoke(\n"
@@ -458,6 +471,8 @@ actions:
     class API(BaseHTTPRequestHandler):
         enrollments = []
         action_count = 0
+        attestation_count = 0
+        evidence_count = 0
 
         def log_message(self, *_args):
             pass
@@ -482,9 +497,41 @@ actions:
                 )
                 self._json({"enrollment_id": f"enrollment-{len(API.enrollments)}"}, 201)
             elif self.path.endswith("/redeem"):
-                self._json({"runtime_id": "runtime-" + self.path.split("/")[4]})
+                self._json(
+                    {
+                        "runtime_id": "runtime-" + self.path.split("/")[4],
+                        "expires_at": "2030-08-12T13:00:00Z",
+                    }
+                )
             elif self.path == "/v1/developer/runs":
-                self._json({"runId": "run-1"}, 201)
+                self._json({"runId": "run-1", "rootId": "root-1"}, 201)
+            elif self.path == "/v1/developer/runtime-attestations":
+                API.attestation_count += 1
+                value = json.loads(body)
+                self._json(
+                    {
+                        "attestationId": value["attestationId"],
+                        "runtimeSessionId": value["manifest"]["runtimeSessionId"],
+                        "manifestHash": value["manifestHash"],
+                        "verificationState": "verified",
+                        "duplicate": False,
+                    },
+                    201,
+                )
+            elif self.path == "/v1/developer/runtime-evidence":
+                API.evidence_count += 1
+                value = json.loads(body)
+                self._json(
+                    {
+                        "batchId": value["batchId"],
+                        "receiptCount": len(value["receipts"]),
+                        "finalReceiptHash": value["receipts"][-1]["receiptHash"],
+                        "achievedLevel": "A1",
+                        "deliveryState": "unconfirmed",
+                        "duplicate": False,
+                    },
+                    201,
+                )
             elif self.path.endswith("/actions"):
                 API.action_count += 1
                 self._json(
@@ -622,6 +669,8 @@ actions:
         and API.enrollments[0][0] != API.enrollments[1][0]
         and API.enrollments[0][1] != API.enrollments[1][1]
     )
+    assert API.attestation_count == 2
+    assert API.evidence_count == 2
     wait = subprocess.run(
         [
             executable,
