@@ -70,6 +70,49 @@ _DEVELOPER_RECEIPT_GATEWAY_FIELDS = _DEVELOPER_RECEIPT_COMMON_FIELDS | {
     "gatewayDecisionId",
     "gatewayOutcome",
 }
+_DEVELOPER_RECEIPT_CAP3_AUTHORITY_FIELDS = {
+    "grantId",
+    "grantHash",
+    "taskId",
+    "leafDelegationId",
+    "actionClass",
+    "effect",
+    "resource",
+    "targetMappingHash",
+    "issuanceId",
+    "packId",
+    "packVersion",
+    "domainProfileId",
+    "domainProfileVersion",
+    "harnessAdapterId",
+    "harnessAdapterVersion",
+    "targetAdapterId",
+    "targetAdapterVersion",
+    "policyVersion",
+    "policyDigest",
+    "catalogVersion",
+    "catalogDigest",
+    "outcome",
+    "authorityBindingDigest",
+}
+_DEVELOPER_RECEIPT_CAP3_FIELDS = (
+    _DEVELOPER_RECEIPT_CURRENT_FIELDS | _DEVELOPER_RECEIPT_CAP3_AUTHORITY_FIELDS
+)
+_DEVELOPER_RECEIPT_CAP3_SUBAGENT_FIELDS = {
+    "identity_lease_id",
+    "actor_proof_key_thumbprint",
+    "child_grant_id",
+    "child_grant_hash",
+    "parent_agent_id",
+    "parent_agent_generation",
+    "spawn_request_id",
+    "spawn_decision_id",
+    "root_agent_id",
+    "root_agent_generation",
+    "root_run_id",
+    "delegation_depth",
+    "ancestry_digest",
+}
 _DEVELOPER_DELIVERY_FIELDS = {
     "state",
     "receiptRecoveryRequired",
@@ -512,7 +555,11 @@ def _validate_developer_action_response(response: dict[str, Any]) -> None:
     fields = set(receipt)
     current = fields == _DEVELOPER_RECEIPT_CURRENT_FIELDS
     historical = fields == _DEVELOPER_RECEIPT_GATEWAY_FIELDS
-    if not current and not historical:
+    cap3 = fields in (
+        _DEVELOPER_RECEIPT_CAP3_FIELDS,
+        _DEVELOPER_RECEIPT_CAP3_FIELDS | {"subagent"},
+    )
+    if not current and not historical and not cap3:
         raise ProtocolError("developer action receipt has an invalid evidence shape")
     if receipt.get("schemaVersion") != "palonexus.developer-receipt-reference/v1":
         raise ProtocolError("developer action receipt has an invalid schema")
@@ -542,7 +589,7 @@ def _validate_developer_action_response(response: dict[str, Any]) -> None:
         effect_at.replace("Z", "+00:00")
     ) > datetime.fromisoformat(recorded_at.replace("Z", "+00:00")):
         raise ProtocolError("developer action receipt time is invalid")
-    if current:
+    if current or cap3:
         capability_id = _require_string(receipt.get("capabilityId"), "capabilityId")
         if len(capability_id) > 256 or delivery_capability_id != capability_id:
             raise ProtocolError("invalid capabilityId")
@@ -571,6 +618,129 @@ def _validate_developer_action_response(response: dict[str, Any]) -> None:
     }
     if any(receipt.get(field) != value for field, value in correlations.items()):
         raise ProtocolError("developer action receipt is not bound to the action")
+    if cap3:
+        for field in (
+            "grantId",
+            "taskId",
+            "leafDelegationId",
+            "actionClass",
+            "effect",
+            "resource",
+            "packId",
+            "packVersion",
+            "domainProfileId",
+            "domainProfileVersion",
+            "harnessAdapterId",
+            "targetAdapterId",
+            "policyVersion",
+        ):
+            if len(_require_string(receipt.get(field), field)) > 256:
+                raise ProtocolError(f"invalid {field}")
+        for field in (
+            "grantHash",
+            "targetMappingHash",
+            "policyDigest",
+            "catalogDigest",
+            "authorityBindingDigest",
+        ):
+            if re.fullmatch(r"[0-9a-f]{64}", str(receipt.get(field))) is None:
+                raise ProtocolError(f"invalid {field}")
+        for field in (
+            "harnessAdapterVersion",
+            "targetAdapterVersion",
+            "catalogVersion",
+        ):
+            _require_positive_int(receipt.get(field), field)
+        issuance_id = _require_string(receipt.get("issuanceId"), "issuanceId")
+        if re.fullmatch(r"credential-issued:[0-9a-f]{64}", issuance_id) is None:
+            raise ProtocolError("invalid issuanceId")
+        if receipt.get("outcome") != "APPLIED":
+            raise ProtocolError("developer action receipt has an invalid outcome")
+        if (
+            receipt.get("taskId") != response.get("rootId")
+            or receipt.get("leafDelegationId") != response.get("leafDelegationId")
+            or receipt.get("resource") != response.get("resource")
+            or receipt.get("targetMappingHash") != target.get("mappingHash")
+            or receipt.get("targetAdapterId") != target.get("registrationId")
+            or receipt.get("targetAdapterVersion") != target.get("version")
+            or receipt.get("issuanceId") != delivery.get("issuanceId")
+        ):
+            raise ProtocolError("developer action receipt authority is not bound")
+        subagent = receipt.get("subagent")
+        if subagent is not None:
+            if not isinstance(subagent, dict) or set(subagent) != (
+                _DEVELOPER_RECEIPT_CAP3_SUBAGENT_FIELDS
+            ):
+                raise ProtocolError("developer action receipt has an invalid subagent")
+            for field in (
+                "identity_lease_id",
+                "child_grant_id",
+                "parent_agent_id",
+                "spawn_request_id",
+                "spawn_decision_id",
+                "root_agent_id",
+                "root_run_id",
+            ):
+                if len(_require_string(subagent.get(field), field)) > 256:
+                    raise ProtocolError(f"invalid {field}")
+            if (
+                re.fullmatch(
+                    r"[A-Za-z0-9_-]{43}",
+                    str(subagent.get("actor_proof_key_thumbprint")),
+                )
+                is None
+            ):
+                raise ProtocolError("invalid actor_proof_key_thumbprint")
+            for field in ("child_grant_hash", "ancestry_digest"):
+                if re.fullmatch(r"[0-9a-f]{64}", str(subagent.get(field))) is None:
+                    raise ProtocolError(f"invalid {field}")
+            for field in ("parent_agent_generation", "root_agent_generation"):
+                _require_positive_int(subagent.get(field), field)
+            depth = _require_positive_int(
+                subagent.get("delegation_depth"), "delegation_depth"
+            )
+            if depth > 32:
+                raise ProtocolError("invalid delegation_depth")
+            if subagent.get("child_grant_id") != receipt.get("grantId") or subagent.get(
+                "child_grant_hash"
+            ) != receipt.get("grantHash"):
+                raise ProtocolError("developer action receipt child grant is not bound")
+        digest_projection = {
+            "tenant_id": response.get("tenantId"),
+            "agent_id": response.get("agentName"),
+            "action_id": response.get("actionId"),
+            "grant_id": receipt.get("grantId"),
+            "grant_hash": receipt.get("grantHash"),
+            "task_id": receipt.get("taskId"),
+            "leaf_delegation_id": receipt.get("leafDelegationId"),
+            "pack_id": receipt.get("packId"),
+            "pack_version": receipt.get("packVersion"),
+            "domain_profile_id": receipt.get("domainProfileId"),
+            "domain_profile_version": receipt.get("domainProfileVersion"),
+            "harness_adapter_id": receipt.get("harnessAdapterId"),
+            "harness_adapter_version": receipt.get("harnessAdapterVersion"),
+            "target_adapter_id": receipt.get("targetAdapterId"),
+            "target_adapter_version": receipt.get("targetAdapterVersion"),
+            "policy_version": receipt.get("policyVersion"),
+            "policy_digest": receipt.get("policyDigest"),
+            "catalog_version": receipt.get("catalogVersion"),
+            "catalog_digest": receipt.get("catalogDigest"),
+            "issuance_id": receipt.get("issuanceId"),
+            "action_class": receipt.get("actionClass"),
+            "canonical_action": response.get("canonicalAction"),
+            "effect": receipt.get("effect"),
+            "resource": response.get("resource"),
+            "payload_digest": response.get("payloadDigest"),
+            "effect_idempotency_key": response.get("effectIdempotencyKey"),
+            "target_registration_id": receipt.get("targetRegistrationId"),
+            "target_registration_version": receipt.get("targetRegistrationVersion"),
+            "target_mapping_hash": receipt.get("targetMappingHash"),
+        }
+        if subagent is not None:
+            digest_projection["subagent"] = subagent
+        expected_digest = hashlib.sha256(canonical_json(digest_projection)).hexdigest()
+        if receipt.get("authorityBindingDigest") != expected_digest:
+            raise ProtocolError("developer action receipt authority digest is invalid")
 
 
 def _decode_private_key(value: object) -> Ed25519PrivateKey:
