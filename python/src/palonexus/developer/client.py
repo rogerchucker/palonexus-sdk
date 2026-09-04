@@ -546,11 +546,12 @@ def _validate_developer_action_response(response: dict[str, Any]) -> None:
             _require_timestamp(delivery.get(field), field)
     delivery_capability_id = delivery.get("capabilityId")
     if delivery_capability_id is not None:
-        if (
-            state not in {"claimed", "delivered"}
-            or len(_require_string(delivery_capability_id, "delivery capabilityId"))
-            > 256
-        ):
+        failed_safe_recovery = (
+            state == "failed_safe" and recovery_required is True and receipt is None
+        )
+        if (state not in {"claimed", "delivered"} and not failed_safe_recovery) or len(
+            _require_string(delivery_capability_id, "delivery capabilityId")
+        ) > 256:
             raise ProtocolError("developer action has invalid delivery capability")
     delivered = state == "delivered"
     if receipt is None:
