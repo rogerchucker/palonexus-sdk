@@ -64,7 +64,7 @@ subagents:
       effects: [external_record.create]
       resources: [release:2026.08.30]
       target_registration_ids: [change-control-mcp]
-      constraints_digest: 44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a
+      constraints_digest: b548b0bf65677f58d7318643e346acb8f15897f5845c6157bcc6f25dc91fe187
       maximum_token_ttl_seconds: 120
       requires_human_approval: false
     budgetReservation:

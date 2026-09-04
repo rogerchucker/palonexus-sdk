@@ -3775,6 +3775,154 @@ def test_developer_action_receipt_generations_fail_closed(
 
 
 @pytest.mark.parametrize(
+    ("mutation", "accepted"),
+    [
+        (lambda receipt: receipt, True),
+        (lambda receipt: {**receipt, "unknownAuthority": True}, False),
+        (lambda receipt: {**receipt, "outcome": "DENIED"}, False),
+        (lambda receipt: {**receipt, "targetMappingHash": "0" * 64}, False),
+        (lambda receipt: {**receipt, "authorityBindingDigest": "0" * 64}, False),
+    ],
+)
+def test_developer_action_cap3_receipt_projection_is_strict(
+    mutation: object,
+    accepted: bool,
+) -> None:
+    payload = {"release": "2026.09.04"}
+    digest = hashlib.sha256(canonical_json(payload)).hexdigest()
+    issuance_id = "credential-issued:" + "9" * 64
+    receipt = {
+        "schemaVersion": "palonexus.developer-receipt-reference/v1",
+        "receiptId": "receipt:effect-a",
+        "opaqueDigest": "a" * 64,
+        "recordedAt": "2026-09-04T10:04:25Z",
+        "verified": True,
+        "capabilityId": "capability-a",
+        "tenantId": "tenant-a",
+        "runId": "run-a",
+        "rootId": "root-a",
+        "actionId": "action-a",
+        "payloadDigest": digest,
+        "targetRegistrationId": "change-control-mcp",
+        "targetRegistrationVersion": 4,
+        "effectIdempotencyKey": "effect-key",
+        "effectId": "effect-a",
+        "effectCreatedAt": "2026-09-04T10:04:24Z",
+        "grantId": "run-grant:a",
+        "grantHash": "b" * 64,
+        "taskId": "root-a",
+        "leafDelegationId": "leaf-a",
+        "actionClass": "controlled_publish",
+        "effect": "external_record.create",
+        "resource": "release:2026.09.04",
+        "targetMappingHash": "c" * 64,
+        "issuanceId": issuance_id,
+        "packId": "controlled-publisher",
+        "packVersion": "1.2.0",
+        "domainProfileId": "r3-release-risk-reviewer",
+        "domainProfileVersion": "1.2.0",
+        "harnessAdapterId": "hosted-action-proxy",
+        "harnessAdapterVersion": 3,
+        "targetAdapterId": "change-control-mcp",
+        "targetAdapterVersion": 4,
+        "policyVersion": "organizational-authority:v8",
+        "policyDigest": "d" * 64,
+        "catalogVersion": 4,
+        "catalogDigest": "e" * 64,
+        "outcome": "APPLIED",
+    }
+    action = {
+        "schemaVersion": "palonexus.developer-action/v1",
+        "tenantId": "tenant-a",
+        "runId": "run-a",
+        "rootId": "root-a",
+        "actionId": "action-a",
+        "version": 1,
+        "agentName": "release-agent",
+        "requestedBy": "member-a",
+        "agentGeneration": 1,
+        "runtimeLeaseId": "runtime-a",
+        "leafDelegationId": "leaf-a",
+        "canonicalAction": "mcp:change-control-mcp/assess_release/hash",
+        "resource": "release:2026.09.04",
+        "constraints": {},
+        "payload": payload,
+        "payloadDigest": digest,
+        "idempotencyKey": "action-key",
+        "effectIdempotencyKey": "effect-key",
+        "requestHash": "f" * 64,
+        "ceilingRequestId": "ceiling-a",
+        "ceilingVersion": 1,
+        "target": {
+            "registrationId": "change-control-mcp",
+            "version": 4,
+            "mappingHash": "c" * 64,
+        },
+        "approval": {"status": "approved"},
+        "delivery": {
+            "state": "delivered",
+            "capabilityId": "capability-a",
+            "issuanceId": issuance_id,
+        },
+        "createdAt": "2026-09-04T10:02:22Z",
+        "terminalAt": "2026-09-04T10:04:25Z",
+    }
+    digest_projection = {
+        "tenant_id": action["tenantId"],
+        "agent_id": action["agentName"],
+        "action_id": action["actionId"],
+        "grant_id": receipt["grantId"],
+        "grant_hash": receipt["grantHash"],
+        "task_id": receipt["taskId"],
+        "leaf_delegation_id": receipt["leafDelegationId"],
+        "pack_id": receipt["packId"],
+        "pack_version": receipt["packVersion"],
+        "domain_profile_id": receipt["domainProfileId"],
+        "domain_profile_version": receipt["domainProfileVersion"],
+        "harness_adapter_id": receipt["harnessAdapterId"],
+        "harness_adapter_version": receipt["harnessAdapterVersion"],
+        "target_adapter_id": receipt["targetAdapterId"],
+        "target_adapter_version": receipt["targetAdapterVersion"],
+        "policy_version": receipt["policyVersion"],
+        "policy_digest": receipt["policyDigest"],
+        "catalog_version": receipt["catalogVersion"],
+        "catalog_digest": receipt["catalogDigest"],
+        "issuance_id": receipt["issuanceId"],
+        "action_class": receipt["actionClass"],
+        "canonical_action": action["canonicalAction"],
+        "effect": receipt["effect"],
+        "resource": action["resource"],
+        "payload_digest": action["payloadDigest"],
+        "effect_idempotency_key": action["effectIdempotencyKey"],
+        "target_registration_id": receipt["targetRegistrationId"],
+        "target_registration_version": receipt["targetRegistrationVersion"],
+        "target_mapping_hash": receipt["targetMappingHash"],
+    }
+    receipt["authorityBindingDigest"] = hashlib.sha256(
+        canonical_json(digest_projection)
+    ).hexdigest()
+    action["receipt"] = mutation(receipt)  # type: ignore[operator]
+
+    client = DeveloperClient(
+        "https://api.palonexus.cloud",
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=action)),
+    )
+
+    def call() -> dict[str, object]:
+        return client.get_developer_action(
+            {"tenant_id": "tenant-a", "session_token": "session-a"},
+            "run-a",
+            "action-a",
+        )
+
+    if accepted:
+        assert call()["receipt"]["outcome"] == "APPLIED"
+    else:
+        with pytest.raises(ProtocolError):
+            call()
+
+
+@pytest.mark.parametrize(
     "delivery",
     [
         {"state": "delivered", "capabilityId": "capability-b"},
@@ -4057,7 +4205,7 @@ def test_descriptor_binds_governed_subagent_without_action_authority(
                 "resources": ["release:2026.08.30"],
                 "target_registration_ids": ["change-control-mcp"],
                 "constraints_digest": (
-                    "44136fa355b3678a1146ad16f7e8649e94fb4fc21fe77e8310c060f61caaff8a"
+                    "b548b0bf65677f58d7318643e346acb8f15897f5845c6157bcc6f25dc91fe187"
                 ),
                 "maximum_token_ttl_seconds": 120,
                 "requires_human_approval": False,
