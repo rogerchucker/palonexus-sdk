@@ -175,8 +175,8 @@ class GovernedSubagentRuntime:
                 "requestedAuthority": dict(template.requested_authority),
                 "budgetReservation": dict(template.budget_reservation),
                 "capacityReservation": {
-                    "directChildSlots": 1,
-                    "concurrentDescendantSlots": 1,
+                    "direct_child_slots": 1,
+                    "concurrent_descendant_slots": 1,
                 },
             }
             status = self._client.create_developer_subagent_spawn(
