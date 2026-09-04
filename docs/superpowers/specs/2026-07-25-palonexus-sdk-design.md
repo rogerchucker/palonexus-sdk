@@ -259,6 +259,24 @@ unverified host assumption.
   fields through both the create and read client methods, then run the published
   package against the deployed workflow.
 
+For receipt-recovery lifecycle responses:
+
+- **Failure mode:** a strict client rejects the retained capability identifier
+  after delivery fails safely even though the effect may have committed and its
+  receipt must remain recoverable.
+- **Boundary:** the developer-action response validator owns the relationship
+  among delivery state, receipt-recovery intent, capability evidence, and the
+  presence of a receipt.
+- **Rule:** `failed_safe` may retain `capabilityId` without a receipt only when
+  `receiptRecoveryRequired` is exactly `true`. Other non-delivery states,
+  missing or false recovery intent, and a `failed_safe` response that also
+  carries a receipt remain invalid and fail closed.
+- **Review prompt:** does each capability-bearing delivery state prove either a
+  completed receipt or an explicit, receiptless recovery obligation?
+- **Proof:** exercise the accepted recovery tuple and its neighboring false,
+  missing, wrong-state, and receipt-present variants through the public action
+  read client.
+
 ### Runtime-scoped guard custody
 
 - **Failure mode:** reusing one runtime-guard signing key across separate

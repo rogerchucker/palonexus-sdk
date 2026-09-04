@@ -3993,6 +3993,79 @@ def test_developer_action_delivery_capability_fails_closed(
 
 
 @pytest.mark.parametrize(
+    ("delivery", "receipt", "accepted"),
+    [
+        (
+            {
+                "state": "failed_safe",
+                "receiptRecoveryRequired": True,
+                "capabilityId": "capability-a",
+            },
+            None,
+            True,
+        ),
+        (
+            {
+                "state": "failed_safe",
+                "receiptRecoveryRequired": False,
+                "capabilityId": "capability-a",
+            },
+            None,
+            False,
+        ),
+        (
+            {"state": "failed_safe", "capabilityId": "capability-a"},
+            None,
+            False,
+        ),
+        (
+            {
+                "state": "ready",
+                "receiptRecoveryRequired": True,
+                "capabilityId": "capability-a",
+            },
+            None,
+            False,
+        ),
+        (
+            {
+                "state": "failed_safe",
+                "receiptRecoveryRequired": True,
+                "capabilityId": "capability-a",
+            },
+            {},
+            False,
+        ),
+    ],
+)
+def test_developer_action_failed_safe_capability_requires_receipt_recovery(
+    delivery: dict[str, object],
+    receipt: dict[str, object] | None,
+    accepted: bool,
+) -> None:
+    response: dict[str, object] = {"delivery": delivery}
+    if receipt is not None:
+        response["receipt"] = receipt
+    client = DeveloperClient(
+        "https://api.palonexus.cloud",
+        transport=httpx.MockTransport(lambda _: httpx.Response(200, json=response)),
+    )
+
+    def call() -> dict[str, object]:
+        return client.get_developer_action(
+            {"tenant_id": "tenant-a", "session_token": "session-a"},
+            "run-a",
+            "action-a",
+        )
+
+    if accepted:
+        assert call()["delivery"] == delivery
+    else:
+        with pytest.raises(ProtocolError):
+            call()
+
+
+@pytest.mark.parametrize(
     "mutation",
     [
         lambda value: {**value, "private_key": "leaked"},
