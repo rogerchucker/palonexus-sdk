@@ -7,6 +7,12 @@ release.
 
 ## [Unreleased]
 
+### Fixed
+
+- Subagent status and provisioning requests preserve the canonical literal colon in
+  `subagent-spawn:<32 lowercase hex>` identifiers while rejecting every noncanonical
+  identifier before network access.
+
 ### Added
 
 - Initial public repository governance and Python workspace metadata.

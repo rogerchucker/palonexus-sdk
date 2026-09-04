@@ -51,6 +51,12 @@ their purpose, verification, compatibility impact, and security impact.
 
 ## Protocol changes
 
+Route-owned identifiers must be tested with their production grammar. If an identifier
+contains a delimiter that is part of its canonical wire form, validate the complete
+identifier before rendering it and assert the exact raw request path. Generic URL
+quoting and simplified fixture identifiers can otherwise agree locally while a strict
+gateway correctly rejects the resulting noncanonical path.
+
 Files under `protocol/schemas/` and `protocol/test-vectors/` are the
 cross-language source of truth. Protocol changes require an issue, compatibility
 analysis, updated schemas and golden vectors, and approval from the protocol
