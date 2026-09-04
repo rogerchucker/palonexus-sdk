@@ -124,6 +124,10 @@ def test_pending_spawn_is_restart_safe_and_denial_never_reposts(tmp_path: Path) 
         if request.method == "POST":
             body = json.loads(request.content)
             assert "prospectivePublicJwk" in body
+            assert body["capacityReservation"] == {
+                "direct_child_slots": 1,
+                "concurrent_descendant_slots": 1,
+            }
             assert b"private_key" not in request.content
             return httpx.Response(201, json=_status("pending_approval"))
         return httpx.Response(200, json=_status("denied"))
