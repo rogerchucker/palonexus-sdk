@@ -5,9 +5,16 @@ import json
 from pathlib import Path
 
 import httpx
-from palonexus.developer.client import DeveloperClient, generate_agent_credential
+import pytest
+from palonexus.developer.client import (
+    DeveloperClient,
+    ProtocolError,
+    generate_agent_credential,
+)
 from palonexus.developer.credentials import CredentialStore
 from palonexus.developer.subagents import GovernedSubagentRuntime, SubagentTemplate
+
+SPAWN_REQUEST_ID = "subagent-spawn:0123456789abcdef0123456789abcdef"
 
 
 class MemoryKeyring:
@@ -29,7 +36,7 @@ def _status(state: str) -> dict[str, object]:
     return {
         "schemaVersion": "palonexus.authority-subagent-spawn/v1",
         "version": 1,
-        "spawnRequestId": "spawn-a",
+        "spawnRequestId": SPAWN_REQUEST_ID,
         "tenantId": "tenant-a",
         "rootRunId": "run-a",
         "parentAgentId": "agent-a",
@@ -150,10 +157,14 @@ def test_pending_spawn_is_restart_safe_and_denial_never_reposts(tmp_path: Path) 
     assert first["status"] == "spawn_approval_required"
     assert resumed == {
         "status": "spawn_denied",
-        "spawn_request_id": "spawn-a",
+        "spawn_request_id": SPAWN_REQUEST_ID,
         "reason_codes": ["HUMAN_APPROVAL_DENIED"],
     }
     assert [request.method for request in requests] == ["POST", "GET"]
+    assert requests[1].url.raw_path.endswith(
+        f"/subagent-spawns/{SPAWN_REQUEST_ID}".encode()
+    )
+    assert b"%" not in requests[1].url.raw_path
 
 
 def test_allowed_spawn_provisions_and_activates_with_prospective_key(
@@ -165,11 +176,11 @@ def test_allowed_spawn_provisions_and_activates_with_prospective_key(
     def result(status: str, **extra: object) -> dict[str, object]:
         return {
             "schemaVersion": "palonexus.subagent-provision-result/v1",
-            "spawnRequestId": "spawn-a",
+            "spawnRequestId": SPAWN_REQUEST_ID,
             "status": status,
             "authorization": {
                 "schema_version": "palonexus.subagent-provisioning-authorization/v1",
-                "spawn_request_id": "spawn-a",
+                "spawn_request_id": SPAWN_REQUEST_ID,
                 "tenant_id": "tenant-a",
                 "parent_agent_id": "agent-a",
                 "parent_runtime_lease_id": "runtime-a",
@@ -187,11 +198,19 @@ def test_allowed_spawn_provisions_and_activates_with_prospective_key(
                 "prospectiveKeyThumbprint"
             ]
             return httpx.Response(201, json=_status("pending_approval"))
-        if request.url.path.endswith("/subagent-spawns/spawn-a"):
+        if request.url.path.endswith(f"/subagent-spawns/{SPAWN_REQUEST_ID}"):
+            assert request.url.raw_path.endswith(
+                f"/subagent-spawns/{SPAWN_REQUEST_ID}".encode()
+            )
+            assert b"%3A" not in request.url.raw_path
             allowed = _status("allowed")
             allowed.update({"childGrantId": "grant-child", "childGrantHash": "e" * 64})
             return httpx.Response(200, json=allowed)
         body = json.loads(request.content)
+        assert request.url.raw_path.endswith(
+            f"/subagent-spawns/{SPAWN_REQUEST_ID}/provision".encode()
+        )
+        assert b"%" not in request.url.raw_path
         assert "private_key" not in body
         if body["operation"] == "challenge":
             return httpx.Response(200, json=result("proof_required"))
@@ -208,7 +227,7 @@ def test_allowed_spawn_provisions_and_activates_with_prospective_key(
                         "tenant_id": "tenant-a",
                         "subagent_id": "agent-child",
                         "agent_generation": 1,
-                        "spawn_request_id": "spawn-a",
+                        "spawn_request_id": SPAWN_REQUEST_ID,
                         "parent_agent_id": "agent-a",
                         "parent_identity_lease_id": "runtime-a",
                         "key_thumbprint": prospective_thumbprint,
@@ -229,7 +248,7 @@ def test_allowed_spawn_provisions_and_activates_with_prospective_key(
                     "tenant_id": "tenant-a",
                     "subagent_id": "agent-child",
                     "agent_generation": 1,
-                    "spawn_request_id": "spawn-a",
+                    "spawn_request_id": SPAWN_REQUEST_ID,
                     "parent_agent_id": "agent-a",
                     "parent_identity_lease_id": "runtime-a",
                     "key_thumbprint": prospective_thumbprint,
@@ -256,7 +275,7 @@ def test_allowed_spawn_provisions_and_activates_with_prospective_key(
     assert first["status"] == "spawn_approval_required"
     assert resumed == {
         "status": "active",
-        "spawn_request_id": "spawn-a",
+        "spawn_request_id": SPAWN_REQUEST_ID,
         "reason_codes": ["HUMAN_APPROVAL_ALLOWED"],
         "child_agent_id": "agent-child",
         "child_agent_generation": 1,
@@ -270,3 +289,40 @@ def test_allowed_spawn_provisions_and_activates_with_prospective_key(
         "POST",
         "POST",
     ]
+    assert all(b"%" not in request.url.raw_path for request in requests[1:])
+
+
+@pytest.mark.parametrize(
+    "request_id",
+    [
+        "spawn-a",
+        "subagent-spawn:0123456789abcdef0123456789abcde",
+        "subagent-spawn:0123456789abcdef0123456789abcdeg",
+        "subagent-spawn:0123456789ABCDEF0123456789ABCDEF",
+        "subagent-spawn%3A0123456789abcdef0123456789abcdef",
+    ],
+)
+def test_subagent_routes_reject_noncanonical_spawn_ids(request_id: str) -> None:
+    client = DeveloperClient(
+        "https://api.palonexus.cloud",
+        transport=httpx.MockTransport(
+            lambda request: pytest.fail(f"unexpected request: {request.url}")
+        ),
+    )
+    session = {"tenant_id": "tenant-a"}
+    agent = {"agent_id": "agent-a", "agent_generation": "1"}
+    guard = generate_agent_credential()
+    runtime = {"runtime_id": "runtime-a"}
+
+    with pytest.raises(ProtocolError, match="invalid subagent spawn request ID"):
+        client.get_developer_subagent_spawn(session, agent, guard, runtime, request_id)
+    with pytest.raises(ProtocolError, match="invalid subagent spawn request ID"):
+        client.provision_developer_subagent(
+            session,
+            agent,
+            guard,
+            runtime,
+            request_id,
+            command={"operation": "challenge"},
+            prospective_key_thumbprint="thumbprint-a",
+        )

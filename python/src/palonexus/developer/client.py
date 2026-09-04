@@ -35,6 +35,7 @@ _RFC3339 = re.compile(
     r"^[0-9]{4}-[0-9]{2}-[0-9]{2}T[0-9]{2}:[0-9]{2}:[0-9]{2}"
     r"(?:\.[0-9]+)?(?:Z|[+-][0-9]{2}:[0-9]{2})$"
 )
+_SUBAGENT_SPAWN_ID = re.compile(r"subagent-spawn:[0-9a-f]{32}")
 _DEVICE_STATUS_TERMINAL_CODES = {
     "pending": "",
     "approved": "",
@@ -464,6 +465,13 @@ def _require_string(value: object, field: str) -> str:
     if not isinstance(value, str) or not value or value != value.strip():
         raise ProtocolError(f"invalid {field}")
     return value
+
+
+def _developer_subagent_spawn_path(request_id: object) -> str:
+    stable_id = _require_string(request_id, "subagent spawn request ID")
+    if _SUBAGENT_SPAWN_ID.fullmatch(stable_id) is None:
+        raise ProtocolError("invalid subagent spawn request ID")
+    return f"/v1/developer/subagent-spawns/{stable_id}"
 
 
 def _require_timestamp(value: object, field: str) -> str:
@@ -2399,7 +2407,7 @@ class DeveloperClient:
         runtime: dict[str, Any],
         request_id: str,
     ) -> dict[str, Any]:
-        path = f"/v1/developer/subagent-spawns/{quote(request_id, safe='')}"
+        path = _developer_subagent_spawn_path(request_id)
         proof = self.mounted_proof(
             _decode_private_key(guard.get("private_key")),
             mode="runtime_proof",
@@ -2436,7 +2444,7 @@ class DeveloperClient:
         command: dict[str, Any],
         prospective_key_thumbprint: str,
     ) -> dict[str, Any]:
-        path = f"/v1/developer/subagent-spawns/{quote(request_id, safe='')}/provision"
+        path = f"{_developer_subagent_spawn_path(request_id)}/provision"
         body = canonical_json(
             {"schemaVersion": "palonexus.subagent-provision/v1", **command}
         )
